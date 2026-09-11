@@ -2,9 +2,12 @@
 # Raw grep baselines: 50 on NVMe, 20 on ZFS. Random patterns. Record for later research.
 set -u
 
-NVME="/home/john/Documents/KEYSTONE /home/john/Documents/QIHSE /home/john/Documents/Native-AI-Terminal"
-ZFS="/fast/scratch/tgrep_corpus/KEYSTONE /fast/scratch/tgrep_corpus/QIHSE /fast/scratch/tgrep_corpus/Native-AI-Terminal"
-RESULTS="/home/john/tgrep/baseline_results_$(date +%Y%m%d_%H%M%S).csv"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+NVME="${TGREP_NVME_CORPUS:-$HOME/Documents/KEYSTONE $HOME/Documents/QIHSE $HOME/Documents/Native-AI-Terminal}"
+ZFS="${TGREP_ZFS_CORPUS:-/fast/scratch/tgrep_corpus/KEYSTONE /fast/scratch/tgrep_corpus/QIHSE /fast/scratch/tgrep_corpus/Native-AI-Terminal}"
+RESULTS="$REPO_DIR/baseline_results_$(date +%Y%m%d_%H%M%S).csv"
 
 echo "pool,run,pattern,time_ms,matches" > "$RESULTS"
 

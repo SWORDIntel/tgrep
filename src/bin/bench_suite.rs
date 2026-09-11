@@ -190,7 +190,7 @@ fn run_cmd(cmd: &mut Command) -> (u64, String, i32) {
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
             (elapsed, stdout, out.status.code().unwrap_or(-1))
         }
-        Err(e) => (elapsed, String::new(), -1),
+        Err(_) => (elapsed, String::new(), -1),
     }
 }
 
@@ -266,7 +266,7 @@ fn run_pattern(
     let mut rg_times = vec![r_time];
 
     // Remaining trials
-    for trial in 2..=trials {
+    for _trial in 2..=trials {
         let mut tgrep_cmd = Command::new(tgrep_bin);
         tgrep_cmd.env("TGREP_STATE_DIR", state_dir).arg("-l");
         if indexed_only {

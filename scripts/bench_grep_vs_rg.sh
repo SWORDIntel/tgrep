@@ -1,24 +1,27 @@
 #!/bin/bash
 # Benchmark: grep vs rg using history-derived patterns from ARCHITECTURE.md
 # Corpus: KEYSTONE + QIHSE + Native-AI-Terminal source trees
-# Design doc: /home/john/tgrep/ARCHITECTURE.md (lines 278-298)
+# Design doc: ARCHITECTURE.md (lines 278-298)
 
 set -u
 
-CORPUS="/home/john/Documents/KEYSTONE /home/john/Documents/QIHSE /home/john/Documents/Native-AI-Terminal"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+CORPUS="${TGREP_CORPUS:-$HOME/Documents/KEYSTONE $HOME/Documents/QIHSE $HOME/Documents/Native-AI-Terminal}"
 TRIALS=5
 OUTDIR="/tmp/tgrep_bench_$$"
 mkdir -p "$OUTDIR"
 
 echo "=== tgrep benchmark: grep vs rg ==="
-echo "Design: /home/john/tgrep/ARCHITECTURE.md"
+echo "Design: $REPO_DIR/ARCHITECTURE.md"
 echo "Corpus: $CORPUS"
 echo "Trials: $TRIALS per pattern"
 echo ""
 
 # Source bytes in corpus
-SRC_BYTES=$(find /home/john/Documents/KEYSTONE /home/john/Documents/QIHSE /home/john/Documents/Native-AI-Terminal -type f -readable 2>/dev/null | xargs cat 2>/dev/null | wc -c)
-FILE_COUNT=$(find /home/john/Documents/KEYSTONE /home/john/Documents/QIHSE /home/john/Documents/Native-AI-Terminal -type f -readable 2>/dev/null | wc -l)
+SRC_BYTES=$(find $CORPUS -type f -readable 2>/dev/null | xargs cat 2>/dev/null | wc -c)
+FILE_COUNT=$(find $CORPUS -type f -readable 2>/dev/null | wc -l)
 echo "Source files: $FILE_COUNT"
 echo "Source bytes: $SRC_BYTES"
 echo ""

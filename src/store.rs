@@ -758,7 +758,6 @@ fn simple_checksum(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn make_test_doc(id: u32, root_id: u32, path: &str, content_len: u64) -> DocRecord {
         DocRecord {

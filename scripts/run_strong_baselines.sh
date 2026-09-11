@@ -1,13 +1,16 @@
 #!/bin/bash
 # Strong corpus baselines: grep + rg on NVMe (50 runs) and ZFS (20 runs)
-# Corpus: /rpool/scratch/tgrep_corpus (NVMe) / /fast/scratch/tgrep_corpus (ZFS)
+# Corpus: $TGREP_NVME_CORPUS (NVMe) / $TGREP_ZFS_CORPUS (ZFS)
 # 1.75 GB, 26,731 files, real source + synthetic fixtures with known patterns
 
 set -u
 
-NVME="/rpool/scratch/tgrep_corpus"
-ZFS="/fast/scratch/tgrep_corpus"
-RESULTS="/home/john/tgrep/strong_baselines_$(date +%Y%m%d_%H%M%S).csv"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+NVME="${TGREP_NVME_CORPUS:-/rpool/scratch/tgrep_corpus}"
+ZFS="${TGREP_ZFS_CORPUS:-/fast/scratch/tgrep_corpus}"
+RESULTS="$REPO_DIR/strong_baselines_$(date +%Y%m%d_%H%M%S).csv"
 
 echo "pool,tool,run,pattern,time_ms,matches" > "$RESULTS"
 
