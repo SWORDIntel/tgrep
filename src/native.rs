@@ -197,6 +197,35 @@ pub mod ffi {
         pub fn tgrep_optimization_load(db: *mut crate::native::OptimizationDb) -> i32;
         pub fn tgrep_optimization_count(db: *const crate::native::OptimizationDb) -> usize;
         pub fn tgrep_optimization_set_learning(db: *mut crate::native::OptimizationDb, enable: i32);
+
+        // Phase 11: QIHSE search-result cache (table store wrapper)
+        pub fn tgrep_cache_create() -> *mut c_void;
+        pub fn tgrep_cache_destroy(cache: *mut c_void);
+        pub fn tgrep_cache_store_results(
+            cache: *mut c_void,
+            pattern: *const std::ffi::c_char,
+            flags: i32,
+            generation: i64,
+            file_paths: *const *const std::ffi::c_char,
+            num_paths: usize,
+        ) -> i32;
+        pub fn tgrep_cache_lookup(
+            cache: *mut c_void,
+            pattern: *const std::ffi::c_char,
+            flags: i32,
+            generation: i64,
+            out_paths: *mut *mut *mut std::ffi::c_char,
+            out_count: *mut usize,
+        ) -> i32;
+        pub fn tgrep_cache_free_paths(paths: *mut *mut std::ffi::c_char, count: usize);
+        pub fn tgrep_cache_invalidate(
+            cache: *mut c_void,
+            pattern: *const std::ffi::c_char,
+            flags: i32,
+        ) -> i32;
+        pub fn tgrep_cache_count(cache: *mut c_void) -> usize;
+        pub fn tgrep_cache_save(cache: *mut c_void, path: *const std::ffi::c_char) -> i32;
+        pub fn tgrep_cache_load_file(cache: *mut c_void, path: *const std::ffi::c_char) -> i32;
     }
 }
 
@@ -1150,6 +1179,153 @@ pub fn compute_query_signature(grams: &[u32], total_postings: usize) -> DataSign
     DataSignature::new(hash, total_postings, 0, 0.0, 0.0)
 }
 
+// ── Phase 11: QIHSE search-result cache safe wrapper ─────────────────
+
+/// Cache flags (must match C side).
+pub const CACHE_FLAG_CASE_INSENSITIVE: i32 = 0x01;
+pub const CACHE_FLAG_WORD_REGEXP: i32 = 0x02;
+pub const CACHE_FLAG_FIXED_STRINGS: i32 = 0x04;
+
+/// Safe RAII wrapper around the QIHSE table-store-backed search cache.
+///
+/// Caches the file list matching a (pattern, flags, generation) tuple so
+/// repeated identical searches are O(1) instead of re-running the trigram
+/// intersection + verification pipeline. Cache invalidation is automatic:
+/// a new build increments the manifest generation, so old entries don't
+/// match and are ignored on lookup.
+pub struct SearchCache {
+    handle: *mut c_void,
+}
+
+impl SearchCache {
+    /// Create a new empty cache.
+    pub fn create() -> Result<Self, String> {
+        let handle = unsafe { ffi::tgrep_cache_create() };
+        if handle.is_null() {
+            Err("cache_create returned null".into())
+        } else {
+            Ok(SearchCache { handle })
+        }
+    }
+
+    /// Store search results in the cache. One row per matching file path.
+    pub fn store_results(
+        &self,
+        pattern: &str,
+        flags: i32,
+        generation: i64,
+        file_paths: &[String],
+    ) -> i32 {
+        let pattern_c = std::ffi::CString::new(pattern).unwrap();
+        // Build C string array
+        let cstrings: Vec<std::ffi::CString> = file_paths
+            .iter()
+            .map(|s| std::ffi::CString::new(s.as_str()).unwrap())
+            .collect();
+        let ptrs: Vec<*const std::ffi::c_char> = cstrings.iter().map(|s| s.as_ptr()).collect();
+        unsafe {
+            ffi::tgrep_cache_store_results(
+                self.handle,
+                pattern_c.as_ptr(),
+                flags,
+                generation,
+                ptrs.as_ptr(),
+                ptrs.len(),
+            )
+        }
+    }
+
+    /// Look up cached results for a query.
+    /// Returns Some(paths) if the cache has entries for this
+    /// (pattern, flags, generation), or None if no cache hit.
+    pub fn lookup(&self, pattern: &str, flags: i32, generation: i64) -> Option<Vec<String>> {
+        let pattern_c = std::ffi::CString::new(pattern).unwrap();
+        let mut out_paths: *mut *mut std::ffi::c_char = std::ptr::null_mut();
+        let mut out_count: usize = 0;
+        let rc = unsafe {
+            ffi::tgrep_cache_lookup(
+                self.handle,
+                pattern_c.as_ptr(),
+                flags,
+                generation,
+                &mut out_paths,
+                &mut out_count,
+            )
+        };
+        if rc < 0 || out_count == 0 {
+            return None;
+        }
+        let mut paths = Vec::with_capacity(out_count);
+        unsafe {
+            for i in 0..out_count {
+                let ptr = *out_paths.add(i);
+                if !ptr.is_null() {
+                    paths.push(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string());
+                }
+            }
+            ffi::tgrep_cache_free_paths(out_paths, out_count);
+        }
+        Some(paths)
+    }
+
+    /// Invalidate entries for a pattern+flags.
+    /// (Generation-based invalidation makes this largely unnecessary.)
+    pub fn invalidate(&self, pattern: &str, flags: i32) -> i32 {
+        let pattern_c = std::ffi::CString::new(pattern).unwrap();
+        unsafe { ffi::tgrep_cache_invalidate(self.handle, pattern_c.as_ptr(), flags) }
+    }
+
+    /// Number of cached rows.
+    pub fn count(&self) -> usize {
+        unsafe { ffi::tgrep_cache_count(self.handle) }
+    }
+
+    /// Save cache to a .qsc file.
+    pub fn save(&self, path: &str) -> Result<i32, String> {
+        let c_path = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
+        let rc = unsafe { ffi::tgrep_cache_save(self.handle, c_path.as_ptr()) };
+        if rc < 0 {
+            Err(format!("cache_save failed (rc={})", rc))
+        } else {
+            Ok(rc)
+        }
+    }
+
+    /// Load cache from a .qsc file.
+    pub fn load(&self, path: &str) -> Result<i32, String> {
+        let c_path = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
+        let rc = unsafe { ffi::tgrep_cache_load_file(self.handle, c_path.as_ptr()) };
+        if rc < 0 {
+            Err(format!("cache_load failed (rc={})", rc))
+        } else {
+            Ok(rc)
+        }
+    }
+}
+
+impl Drop for SearchCache {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { ffi::tgrep_cache_destroy(self.handle) };
+        }
+    }
+}
+
+/// Compute cache flags from search config.
+pub fn compute_cache_flags(case_insensitive: bool, word_regexp: bool, fixed_strings: bool) -> i32 {
+    let mut flags = 0i32;
+    if case_insensitive {
+        flags |= CACHE_FLAG_CASE_INSENSITIVE;
+    }
+    if word_regexp {
+        flags |= CACHE_FLAG_WORD_REGEXP;
+    }
+    if fixed_strings {
+        flags |= CACHE_FLAG_FIXED_STRINGS;
+    }
+    flags
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1614,5 +1790,134 @@ mod tests {
         // Different input should produce different hash
         let sig3 = compute_query_signature(&grams, 6000);
         assert_ne!(sig.data_hash, sig3.data_hash);
+    }
+
+    // ── Phase 11: Search cache tests ──
+
+    #[test]
+    fn test_cache_create_and_store() {
+        let cache = SearchCache::create().expect("create cache");
+        assert_eq!(cache.count(), 0);
+        let paths = vec!["/foo/bar.rs".to_string(), "/baz/qux.c".to_string()];
+        let n = cache.store_results("Struct", 0, 1, &paths);
+        assert_eq!(n, 2);
+        assert_eq!(cache.count(), 2);
+    }
+
+    #[test]
+    fn test_cache_lookup_hit() {
+        let cache = SearchCache::create().expect("create cache");
+        let paths = vec!["/foo/bar.rs".to_string(), "/baz/qux.c".to_string()];
+        cache.store_results("Struct", 0, 1, &paths);
+        let result = cache.lookup("Struct", 0, 1);
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"/foo/bar.rs".to_string()));
+        assert!(result.contains(&"/baz/qux.c".to_string()));
+    }
+
+    #[test]
+    fn test_cache_lookup_miss_wrong_pattern() {
+        let cache = SearchCache::create().expect("create cache");
+        let paths = vec!["/foo/bar.rs".to_string()];
+        cache.store_results("Struct", 0, 1, &paths);
+        // Different pattern → miss
+        assert!(cache.lookup("Return", 0, 1).is_none());
+    }
+
+    #[test]
+    fn test_cache_lookup_miss_wrong_generation() {
+        let cache = SearchCache::create().expect("create cache");
+        let paths = vec!["/foo/bar.rs".to_string()];
+        cache.store_results("Struct", 0, 1, &paths);
+        // Different generation → miss (cache invalidation)
+        assert!(cache.lookup("Struct", 0, 2).is_none());
+    }
+
+    #[test]
+    fn test_cache_lookup_miss_wrong_flags() {
+        let cache = SearchCache::create().expect("create cache");
+        let paths = vec!["/foo/bar.rs".to_string()];
+        cache.store_results("Struct", 0, 1, &paths);
+        // Different flags → miss
+        assert!(cache.lookup("Struct", CACHE_FLAG_WORD_REGEXP, 1).is_none());
+    }
+
+    #[test]
+    fn test_cache_persistence_round_trip() {
+        let path = format!("/tmp/tgrep_cache_test_{}.qsc", std::process::id());
+        // Store
+        {
+            let cache = SearchCache::create().expect("create cache");
+            let paths = vec![
+                "/foo/bar.rs".to_string(),
+                "/baz/qux.c".to_string(),
+                "/quux/main.rs".to_string(),
+            ];
+            cache.store_results("Fn Main", 0, 42, &paths);
+            assert_eq!(cache.count(), 3);
+            cache.save(&path).expect("save");
+        }
+        // Load into a new cache
+        {
+            let cache = SearchCache::create().expect("create cache 2");
+            assert_eq!(cache.count(), 0);
+            let loaded = cache.load(&path).expect("load");
+            assert_eq!(loaded, 3);
+            assert_eq!(cache.count(), 3);
+            let result = cache.lookup("Fn Main", 0, 42);
+            assert!(result.is_some());
+            let result = result.unwrap();
+            assert_eq!(result.len(), 3);
+            assert!(result.contains(&"/foo/bar.rs".to_string()));
+            assert!(result.contains(&"/baz/qux.c".to_string()));
+            assert!(result.contains(&"/quux/main.rs".to_string()));
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_cache_multiple_patterns() {
+        let cache = SearchCache::create().expect("create cache");
+        cache.store_results("Struct", 0, 1, &["/a.rs".to_string(), "/b.rs".to_string()]);
+        cache.store_results("Return", 0, 1, &["/c.rs".to_string()]);
+        assert_eq!(cache.count(), 3);
+        let r1 = cache.lookup("Struct", 0, 1).unwrap();
+        assert_eq!(r1.len(), 2);
+        let r2 = cache.lookup("Return", 0, 1).unwrap();
+        assert_eq!(r2.len(), 1);
+    }
+
+    #[test]
+    fn test_cache_empty_results() {
+        let cache = SearchCache::create().expect("create cache");
+        // Store empty results (pattern with no matches)
+        let empty: Vec<String> = vec![];
+        let n = cache.store_results("Nonexistent", 0, 1, &empty);
+        assert_eq!(n, 0);
+        // Lookup should return None (no rows stored)
+        assert!(cache.lookup("Nonexistent", 0, 1).is_none());
+    }
+
+    #[test]
+    fn test_compute_cache_flags() {
+        assert_eq!(compute_cache_flags(false, false, false), 0);
+        assert_eq!(
+            compute_cache_flags(true, false, false),
+            CACHE_FLAG_CASE_INSENSITIVE
+        );
+        assert_eq!(
+            compute_cache_flags(false, true, false),
+            CACHE_FLAG_WORD_REGEXP
+        );
+        assert_eq!(
+            compute_cache_flags(false, false, true),
+            CACHE_FLAG_FIXED_STRINGS
+        );
+        assert_eq!(
+            compute_cache_flags(true, true, true),
+            CACHE_FLAG_CASE_INSENSITIVE | CACHE_FLAG_WORD_REGEXP | CACHE_FLAG_FIXED_STRINGS
+        );
     }
 }

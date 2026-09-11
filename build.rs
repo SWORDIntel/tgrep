@@ -6,6 +6,7 @@ fn main() {
         .file("native/qihse_wal_wrapper.c")
         .file("native/qihse_opt_wrapper.c")
         .file("native/hash_wrapper.c")
+        .file("native/qihse_cache_wrapper.c")
         // KEYSTONE trigram source (all tgrep extensions are in this file)
         .file("/home/john/Documents/KEYSTONE/src/keystone_trigram.c")
         // KEYSTONE core + hash index sources
@@ -15,6 +16,7 @@ fn main() {
         .file("/home/john/Documents/KEYSTONE/src/dsmil_hash_indexer.c")
         // QIHSE WAL source
         .file("/home/john/Documents/QIHSE/src/tractable/qihse_wal.c")
+        .file("/home/john/Documents/QIHSE/src/tractable/qihse_table_store.c")
         .include("/home/john/Documents/KEYSTONE/include")
         .include("/home/john/Documents/QIHSE/include")
         .include("/home/john/Documents/QIHSE/persistence")
@@ -29,7 +31,8 @@ fn main() {
     println!("cargo:rerun-if-changed=native/keystone_wrapper.c");
     println!("cargo:rerun-if-changed=native/qihse_wrapper.c");
     println!("cargo:rerun-if-changed=native/qihse_wal_wrapper.c");
-    println!("cargo:rerun-if-changed=native/qihse_opt_wrapper.c");
+    println!("cargo:rerun-if-changed=native/qihse_cache_wrapper.c");
+    println!("cargo:rerun-if-changed=/home/john/Documents/QIHSE/src/tractable/qihse_table_store.c");
     println!("cargo:rerun-if-changed=native/hash_wrapper.c");
     println!("cargo:rerun-if-changed=/home/john/Documents/KEYSTONE/src/keystone_trigram.c");
     println!("cargo:rerun-if-changed=/home/john/Documents/KEYSTONE/src/keystone.c");

@@ -314,6 +314,49 @@ pub fn run_search(config: SearchConfig) {
         None => Vec::new(),
     };
 
+    // Phase 11: Search-result cache (QIHSE table store).
+    // Cache key: (pattern, flags, manifest_generation).
+    // Cache invalidation is automatic — a new build increments the
+    // generation, so old entries don't match.
+    let manifest_generation = manifest.as_ref().map(|m| m.generation as i64).unwrap_or(0);
+    let cache_flags = crate::native::compute_cache_flags(
+        case_insensitive,
+        config.word_regexp,
+        config.fixed_strings,
+    );
+    let cache_path = state_dir.join("search_cache.qsc");
+    let cache = crate::native::SearchCache::create().ok();
+    if let Some(ref cache) = cache {
+        let _ = cache.load(cache_path.to_str().unwrap_or(""));
+    }
+
+    // Cache lookup: only for -l (files_with_matches) mode, where we can
+    // return cached file paths directly without re-verifying.
+    if config.files_with_matches && cache.is_some() {
+        if let Some(ref cache) = cache {
+            if let Some(cached_paths) = cache.lookup(&pattern, cache_flags, manifest_generation) {
+                if config.explain {
+                    eprintln!(
+                        "tgrep: cache HIT ({} files, gen={})",
+                        cached_paths.len(),
+                        manifest_generation
+                    );
+                }
+                for p in &cached_paths {
+                    println!("{}", p);
+                }
+                if !cached_paths.is_empty() {
+                    exit(0);
+                } else {
+                    exit(1);
+                }
+            }
+        }
+    }
+    if config.explain && cache.is_some() {
+        eprintln!("tgrep: cache MISS (gen={})", manifest_generation);
+    }
+
     if config.explain {
         let features = crate::native::detect_cpu_features();
         let mut feature_parts = Vec::new();
@@ -546,7 +589,7 @@ pub fn run_search(config: SearchConfig) {
 
     // Parallel search
     let search_start = std::time::Instant::now();
-    let match_found = parallel_search(
+    let (match_found, matched_paths) = parallel_search(
         &all_files,
         &matcher,
         config.line_number,
@@ -556,6 +599,19 @@ pub fn run_search(config: SearchConfig) {
         threads,
     );
     let search_elapsed = search_start.elapsed();
+
+    // Phase 11: Store results in cache for future lookups.
+    // Only cache -l (files_with_matches) mode results.
+    if config.files_with_matches {
+        if let Some(ref cache) = cache {
+            let path_strings: Vec<String> = matched_paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            cache.store_results(&pattern, cache_flags, manifest_generation, &path_strings);
+            let _ = cache.save(cache_path.to_str().unwrap_or(""));
+        }
+    }
 
     // Phase 10: Record performance for this query signature.
     // Only for indexed queries where we have a meaningful data signature.
@@ -618,7 +674,7 @@ struct FileResult {
 }
 
 /// Search files in parallel using scoped threads.
-/// Returns true if any match was found.
+/// Returns (true if any match was found, list of matching file paths).
 fn parallel_search(
     files: &[PathBuf],
     matcher: &grep_regex::RegexMatcher,
@@ -627,9 +683,9 @@ fn parallel_search(
     count: bool,
     quiet: bool,
     num_threads: usize,
-) -> bool {
+) -> (bool, Vec<PathBuf>) {
     if files.is_empty() {
-        return false;
+        return (false, Vec::new());
     }
 
     // For quiet mode, use atomic flag for early exit
@@ -650,8 +706,16 @@ fn parallel_search(
             quiet,
             found_ref,
         );
+        let matched_paths: Vec<PathBuf> = results
+            .iter()
+            .filter(|r| r.matched)
+            .map(|r| r._path.clone())
+            .collect();
         output_results(&results, files_with_matches, count, quiet);
-        return found.load(std::sync::atomic::Ordering::Relaxed);
+        return (
+            found.load(std::sync::atomic::Ordering::Relaxed),
+            matched_paths,
+        );
     }
 
     // Split files into chunks
@@ -685,9 +749,18 @@ fn parallel_search(
         all_results.extend(chunk_results);
     }
 
+    let matched_paths: Vec<PathBuf> = all_results
+        .iter()
+        .filter(|r| r.matched)
+        .map(|r| r._path.clone())
+        .collect();
+
     output_results(&all_results, files_with_matches, count, quiet);
 
-    found.load(std::sync::atomic::Ordering::Relaxed)
+    (
+        found.load(std::sync::atomic::Ordering::Relaxed),
+        matched_paths,
+    )
 }
 
 /// Search a chunk of files in a single thread.

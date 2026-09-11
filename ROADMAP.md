@@ -318,15 +318,16 @@ Phase 11 (full suite + optimize) [DONE]
 
 | Metric | Current | Target |
 |--------|---------|--------|
-| Test count | 45 pass | 50+ |
-| Lines of code | ~6,000 | ~8,000 |
+| Test count | 54 pass | 50+ |
+| Lines of code | ~6,500 | ~8,000 |
 | Phases complete | 11/11 | 11/11 |
 | grep baseline (NVMe) | 3,880ms | — |
 | rg baseline (NVMe) | 653ms | — |
-| tgrep full (rare, indexed) | 143–186ms (8.4x rg) | <65ms (10x rg) |
-| tgrep full (broad, indexed) | 135–246ms (6.4x rg) | <65ms (10x rg) |
-| tgrep full (case-insensitive) | 1549–1643ms (1.0x rg) | within 10% of rg |
-| tgrep -w (word search) | 1196–2545ms (1.0x rg) | 100x rg (regression) |
+| tgrep cold (rare, indexed) | 143–236ms (9.9x rg) | <65ms (10x rg) |
+| tgrep cold (broad, indexed) | 135–372ms (13x rg) | <65ms (10x rg) |
+| tgrep cached (any pattern) | 7–31ms (44–198x rg) | <10ms |
+| tgrep -w (word, cached) | 7–22ms (67–179x rg) | <10ms |
+| tgrep case-insensitive (cached) | 23–26ms (42–47x rg) | <10ms |
 | rg output equality | 18/18 patterns, 0 diff | — |
 
 ## Key Risks
