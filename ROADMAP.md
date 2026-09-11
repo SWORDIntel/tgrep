@@ -28,6 +28,26 @@
 
 12 pattern variants (34,843 file refs): 136.4 KB total (v1 would be ~4.3 MB)
 
+## Post-Phase 11: QIHSE-Backed Word Index
+
+- [x] Add save/load persistence to QIHSE btree and hash_index (opt-in)
+- [x] Fix btree page overflow with variable-length keys (byte-size tracking)
+- [x] FFI wrapper: native/qihse_hash_wrapper.c (fixed-width 16-byte keys)
+- [x] Rust QihseWordIndex safe wrapper in src/native.rs
+- [x] Build .qwi sidecars alongside .thi during indexing
+- [x] Search prefers .qwi, falls back to .thi for legacy segments
+- [x] 60 tests pass (58 existing + 2 new QIHSE word index tests)
+
+#### QIHSE Word Index vs KEYSTONE Hash Index (26K file corpus, 75 segments)
+
+| Metric | .qwi (QIHSE btree) | .thi (KEYSTONE hash) |
+|--------|-------------------|---------------------|
+| Total size | 260 MB | 339 MB |
+| Reduction | 23% smaller | — |
+| -w "struct" time | ~2.1s | ~2.0s |
+| -w "struct" matches | 124901 | 124901 |
+| Correctness vs rg | identical | identical |
+
 ## Completed
 
 ### KEYSTONE Changes (prerequisite)
