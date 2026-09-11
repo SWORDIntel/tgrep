@@ -425,8 +425,13 @@ fn run_build(
 
             // Tokenize file content and add unique tokens to hash index
             // for O(1) whole-word exact-match queries.
-            add_tokens_to_hash_index(&mut hash_index, &content, doc_id);
-            add_tokens_to_qwi_index(&mut qwi_index, &content, doc_id);
+            // Skip binary files (NUL bytes) — rg skips them during search,
+            // so including them in the word index would produce false positives
+            // when the index-trust optimization skips content verification.
+            if !content.contains(&0u8) {
+                add_tokens_to_hash_index(&mut hash_index, &content, doc_id);
+                add_tokens_to_qwi_index(&mut qwi_index, &content, doc_id);
+            }
 
             // Collect doc record
             let mtime_ns = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();

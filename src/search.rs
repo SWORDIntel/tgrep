@@ -574,10 +574,42 @@ pub fn run_search(config: SearchConfig) {
         .filter(|(p, _)| paths.iter().any(|search_path| p.starts_with(search_path)))
         .collect();
 
-    // Combine all files to search: indexed candidates first, then stream files
-    let all_files: Vec<PathBuf> = indexed_candidates
+    // Index-trust optimization: for -l mode with HashIndex plan,
+    // skip content verification for indexed candidates whose mtime
+    // matches the file list cache (file hasn't changed since indexing).
+    // Changed files still get verified via parallel_search.
+    let trusted_paths: Vec<PathBuf> = if config.files_with_matches
+        && matches!(plan, QueryPlan::HashIndex { .. })
+        && !indexed_candidates.is_empty()
+    {
+        trust_indexed_candidates(&indexed_candidates, &state_dir, config.explain)
+    } else {
+        Vec::new()
+    };
+
+    // Output trusted paths directly (confirmed matches from the index,
+    // no content verification needed). Printed before verified results
+    // to match the existing indexed-candidates-first ordering.
+    if !trusted_paths.is_empty() {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        for p in &trusted_paths {
+            let _ = writeln!(out, "{}", p.display());
+        }
+    }
+
+    // Build the list of files that still need verification:
+    // untrusted indexed candidates + stream files
+    let trusted_set: std::collections::HashSet<&PathBuf> = trusted_paths.iter().collect();
+    let untrusted_indexed: Vec<PathBuf> = indexed_candidates
         .iter()
-        .map(|(p, _)| p.clone())
+        .map(|(p, _)| p)
+        .filter(|p| !trusted_set.contains(p))
+        .cloned()
+        .collect();
+
+    let all_files: Vec<PathBuf> = untrusted_indexed
+        .into_iter()
         .chain(stream_files.into_iter())
         .collect();
 
@@ -594,9 +626,9 @@ pub fn run_search(config: SearchConfig) {
         exit(0);
     }
 
-    // Parallel search
+    // Parallel search (only for files that need verification)
     let search_start = std::time::Instant::now();
-    let (match_found, matched_paths) = parallel_search(
+    let (mut match_found, mut matched_paths) = parallel_search(
         &all_files,
         &matcher,
         config.line_number,
@@ -606,6 +638,16 @@ pub fn run_search(config: SearchConfig) {
         threads,
     );
     let search_elapsed = search_start.elapsed();
+
+    // Merge trusted paths (from index-trust optimization) into results.
+    // Trusted paths were already printed to stdout above; add them to
+    // matched_paths for caching and exit-code correctness.
+    if !trusted_paths.is_empty() {
+        match_found = true;
+        let mut all_matched = trusted_paths.clone();
+        all_matched.extend(matched_paths.drain(..));
+        matched_paths = all_matched;
+    }
 
     // Phase 11: Store results in cache for future lookups.
     // Only cache -l (files_with_matches) mode results.
@@ -1246,6 +1288,121 @@ fn metadata_matches(path: &Path, cached: &CachedFileMeta) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Check if a file's metadata matches the cached metadata AND the file
+/// is not binary (no NUL bytes in the first 8KB). This is the trust
+/// condition for skipping content verification.
+fn can_trust_index(path: &Path, cached: &CachedFileMeta) -> bool {
+    if !metadata_matches(path, cached) {
+        return false;
+    }
+    // Safety net: check for binary files (NUL bytes in first 8KB).
+    // rg skips binary files, so trusting the index for them would
+    // produce false positives. This also covers old indexes built
+    // before the build-time binary skip was added.
+    use std::io::Read;
+    match std::fs::File::open(path) {
+        Ok(mut f) => {
+            let mut buf = [0u8; 8192];
+            match f.read(&mut buf) {
+                Ok(n) => !buf[..n].contains(&0u8),
+                Err(_) => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Check which indexed candidates have unchanged mtime (can trust the index).
+/// Returns the subset of candidates whose file metadata matches the file
+/// list cache, meaning the file hasn't changed since indexing and the
+/// index result is valid without re-reading the file content.
+///
+/// Uses parallel stat() calls (4 threads) to check metadata for large
+/// candidate sets. Each stat() is much cheaper than reading the full
+/// file content, so this is a major win for broad word queries.
+fn trust_indexed_candidates(
+    candidates: &[(PathBuf, u64)],
+    state_dir: &Path,
+    explain: bool,
+) -> Vec<PathBuf> {
+    let cache = match load_file_list_cache(state_dir) {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+
+    // Build a HashMap for O(1) lookup by path string
+    let meta_map: std::collections::HashMap<&str, &CachedFileMeta> = cache
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f))
+        .collect();
+
+    let total = candidates.len();
+
+    // For small candidate sets, check serially (avoids thread overhead)
+    if total <= 256 {
+        let trusted: Vec<PathBuf> = candidates
+            .iter()
+            .filter(|(p, _)| {
+                let path_str = p.to_string_lossy();
+                meta_map
+                    .get(path_str.as_ref())
+                    .map(|cached| can_trust_index(p, cached))
+                    .unwrap_or(false)
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        if explain {
+            eprintln!(
+                "tgrep: index-trust: {}/{} candidates trusted (mtime unchanged)",
+                trusted.len(),
+                total
+            );
+        }
+        return trusted;
+    }
+
+    // Parallel stat() for large candidate sets
+    use std::sync::Mutex;
+    use std::thread;
+
+    let num_threads = 4usize.min(total);
+    let chunk_size = (total + num_threads - 1) / num_threads;
+    let meta_map = &meta_map;
+    let results = Mutex::new(Vec::new());
+
+    thread::scope(|s| {
+        for chunk in candidates.chunks(chunk_size) {
+            let results = &results;
+            let meta_map = meta_map;
+            s.spawn(move || {
+                let mut local = Vec::new();
+                for (p, _) in chunk {
+                    let path_str = p.to_string_lossy();
+                    if meta_map
+                        .get(path_str.as_ref())
+                        .map(|cached| can_trust_index(p, cached))
+                        .unwrap_or(false)
+                    {
+                        local.push(p.clone());
+                    }
+                }
+                results.lock().unwrap().extend(local);
+            });
+        }
+    });
+
+    let trusted = results.into_inner().unwrap();
+    if explain {
+        eprintln!(
+            "tgrep: index-trust: {}/{} candidates trusted (mtime unchanged)",
+            trusted.len(),
+            total
+        );
+    }
+    trusted
 }
 
 /// Try to load the file list cache and verify it's still valid.

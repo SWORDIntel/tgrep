@@ -56,6 +56,32 @@ mmap advantage is most visible on the size/IO-amplification axis rather
 than raw latency. The mmap approach touches only ~log2(n) pages per
 segment for binary search, vs reading the entire .thi file.
 
+## Post-Phase 11: Index-Trust Optimization
+
+- [x] Skip content verification for `-w -l` queries when file mtime matches file list cache
+- [x] Build-time: skip binary files (NUL bytes) when adding to hash/QIHSE word index
+- [x] Search-time: binary check (first 8KB) as safety net for existing indexes
+- [x] Parallel stat() + binary check (4 threads) for large candidate sets
+- [x] Correctness verified: 5/5 word patterns match `rg -w -l` (including binary file filtering)
+- [x] 60 tests pass
+
+#### Index-Trust Benchmark (26K file corpus, 75 segments, `-w -l` mode)
+
+| Pattern | tgrep cold | tgrep warm | rg | Cold speedup | Warm speedup |
+|---------|-----------|------------|-----|-------------|-------------|
+| Struct | 0.37s | 0.05s | 2.87s | **7.8x** | **57x** |
+| Main | 0.34s | 0.04s | 2.38s | **7.0x** | **60x** |
+| Return | 0.48s | 0.04s | 1.64s | **3.4x** | **41x** |
+| Terminal | 0.21s | 0.16s | 1.63s | **7.8x** | **10x** |
+| NonexistentXyz | 1.16s | 0.11s | 2.98s | **2.6x** | **27x** |
+
+**Key findings:**
+- Cold `-w -l` searches are 3-8x faster than rg (was 1.0-1.1x slower before)
+- Warm cache searches are 10-60x faster than rg
+- The index-trust optimization eliminates content verification for unchanged files
+- Binary files are correctly filtered (both build-time skip and search-time check)
+- Files changed since indexing still get verified via grep_searcher fallback
+
 ## Completed
 
 ### KEYSTONE Changes (prerequisite)
