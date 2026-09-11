@@ -142,25 +142,27 @@ pub mod ffi {
         pub fn tgrep_hash_index_save(handle: *mut c_void, path: *const std::ffi::c_char) -> i32;
         pub fn tgrep_hash_index_load(path: *const std::ffi::c_char) -> *mut c_void;
 
-        // QIHSE btree-backed persistent word index
-        pub fn tgrep_qihse_word_index_create() -> *mut c_void;
-        pub fn tgrep_qihse_word_index_destroy(handle: *mut c_void);
-        pub fn tgrep_qihse_word_index_add(
+        // QIHSE btree-backed persistent word index (mmap search path)
+        pub fn tgrep_word_index_create() -> *mut c_void;
+        pub fn tgrep_word_index_destroy(handle: *mut c_void);
+        pub fn tgrep_word_index_add(
             handle: *mut c_void,
             token: *const std::ffi::c_char,
             token_len: usize,
             doc_id: u64,
         ) -> i32;
-        pub fn tgrep_qihse_word_index_search(
+        pub fn tgrep_word_index_save(handle: *mut c_void, path: *const std::ffi::c_char) -> i32;
+        // mmap-based load (returns qwi_mmap_t handle, not a btree)
+        pub fn tgrep_word_index_load(path: *const std::ffi::c_char) -> *mut c_void;
+        pub fn tgrep_word_index_unload(handle: *mut c_void);
+        pub fn tgrep_word_index_search(
             handle: *mut c_void,
             token: *const std::ffi::c_char,
             token_len: usize,
             out_doc_ids: *mut u64,
             max_results: usize,
         ) -> usize;
-        pub fn tgrep_qihse_word_index_save(handle: *const c_void, path: *const std::ffi::c_char) -> i32;
-        pub fn tgrep_qihse_word_index_load(path: *const std::ffi::c_char) -> *mut c_void;
-        pub fn tgrep_qihse_word_index_size(handle: *const c_void) -> usize;
+        pub fn tgrep_word_index_size(handle: *const c_void) -> usize;
 
         // Phase 9: Anchor seeding + batch search
         pub fn tgrep_keystone_anchor_table_create() -> *mut c_void;
@@ -996,25 +998,25 @@ impl Drop for HashIndex {
 
 // ── QIHSE btree-backed persistent word index ──────────────────────
 
-/// Safe RAII wrapper around the QIHSE btree word index.
-/// Maps tokens to doc IDs via prefix scan on a persistent B+ tree.
-pub struct QihseWordIndex {
+/// Build-time wrapper: inserts tokens into a QIHSE btree, then saves
+/// as a flat sorted file for mmap-based search.
+pub struct WordIndexBuilder {
     handle: *mut c_void,
 }
 
-impl QihseWordIndex {
+impl WordIndexBuilder {
     pub fn create() -> Result<Self, String> {
-        let handle = unsafe { ffi::tgrep_qihse_word_index_create() };
+        let handle = unsafe { ffi::tgrep_word_index_create() };
         if handle.is_null() {
-            Err("qihse_word_index_create returned null".into())
+            Err("word_index_create returned null".into())
         } else {
-            Ok(QihseWordIndex { handle })
+            Ok(WordIndexBuilder { handle })
         }
     }
 
     pub fn add(&mut self, token: &[u8], doc_id: u32) -> Result<(), String> {
         let rc = unsafe {
-            ffi::tgrep_qihse_word_index_add(
+            ffi::tgrep_word_index_add(
                 self.handle,
                 token.as_ptr() as *const std::ffi::c_char,
                 token.len(),
@@ -1022,9 +1024,48 @@ impl QihseWordIndex {
             )
         };
         if rc != 0 {
-            Err(format!("qihse_word_index_add failed (rc={})", rc))
+            Err(format!("word_index_add failed (rc={})", rc))
         } else {
             Ok(())
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let path_c = std::ffi::CString::new(path.to_str().ok_or("invalid path")?)
+            .map_err(|e| format!("CString error: {}", e))?;
+        let rc = unsafe { ffi::tgrep_word_index_save(self.handle, path_c.as_ptr()) };
+        if rc != 0 {
+            Err(format!("word_index_save failed (rc={})", rc))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for WordIndexBuilder {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { ffi::tgrep_word_index_destroy(self.handle) };
+        }
+    }
+}
+
+/// Search-time wrapper: mmaps the flat sorted .qwi file and binary searches.
+/// No heap allocation for entries — only the pages touched by the search
+/// are paged in from disk.
+pub struct MmapWordIndex {
+    handle: *mut c_void,
+}
+
+impl MmapWordIndex {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let path_c = std::ffi::CString::new(path.to_str().ok_or("invalid path")?)
+            .map_err(|e| format!("CString error: {}", e))?;
+        let handle = unsafe { ffi::tgrep_word_index_load(path_c.as_ptr()) };
+        if handle.is_null() {
+            Err("word_index_load returned null".into())
+        } else {
+            Ok(MmapWordIndex { handle })
         }
     }
 
@@ -1034,7 +1075,7 @@ impl QihseWordIndex {
         }
         let mut out = vec![0u64; max_results];
         let count = unsafe {
-            ffi::tgrep_qihse_word_index_search(
+            ffi::tgrep_word_index_search(
                 self.handle,
                 token.as_ptr() as *const std::ffi::c_char,
                 token.len(),
@@ -1046,37 +1087,15 @@ impl QihseWordIndex {
         out
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        let path_c = std::ffi::CString::new(path.to_str().ok_or("invalid path")?)
-            .map_err(|e| format!("CString error: {}", e))?;
-        let rc = unsafe { ffi::tgrep_qihse_word_index_save(self.handle, path_c.as_ptr()) };
-        if rc != 0 {
-            Err(format!("qihse_word_index_save failed (rc={})", rc))
-        } else {
-            Ok(())
-        }
-    }
-
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let path_c = std::ffi::CString::new(path.to_str().ok_or("invalid path")?)
-            .map_err(|e| format!("CString error: {}", e))?;
-        let handle = unsafe { ffi::tgrep_qihse_word_index_load(path_c.as_ptr()) };
-        if handle.is_null() {
-            Err("qihse_word_index_load returned null".into())
-        } else {
-            Ok(QihseWordIndex { handle })
-        }
-    }
-
     pub fn size(&self) -> usize {
-        unsafe { ffi::tgrep_qihse_word_index_size(self.handle) }
+        unsafe { ffi::tgrep_word_index_size(self.handle) }
     }
 }
 
-impl Drop for QihseWordIndex {
+impl Drop for MmapWordIndex {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            unsafe { ffi::tgrep_qihse_word_index_destroy(self.handle) };
+            unsafe { ffi::tgrep_word_index_unload(self.handle) };
         }
     }
 }
@@ -1864,20 +1883,24 @@ mod tests {
 
     #[test]
     fn test_qihse_word_index_basic() {
-        let mut idx = QihseWordIndex::create().expect("create");
+        let mut idx = WordIndexBuilder::create().expect("create");
         idx.add(b"alpha", 10).unwrap();
         idx.add(b"beta", 20).unwrap();
         idx.add(b"alpha", 30).unwrap();
         idx.add(b"gamma", 40).unwrap();
-        assert!(idx.size() >= 4);
-        let results = idx.search(b"alpha", 64);
+        let path = std::env::temp_dir().join("tgrep_qwi_basic_test.qwi");
+        idx.save(&path).unwrap();
+        let loaded = MmapWordIndex::load(&path).unwrap();
+        assert!(loaded.size() >= 4);
+        let results = loaded.search(b"alpha", 64);
         assert_eq!(results.len(), 2);
         assert!(results.contains(&10));
         assert!(results.contains(&30));
-        let results = idx.search(b"beta", 64);
+        let results = loaded.search(b"beta", 64);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], 20);
-        assert!(idx.search(b"missing", 64).is_empty());
+        assert!(loaded.search(b"missing", 64).is_empty());
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -1885,14 +1908,14 @@ mod tests {
         let path = std::env::temp_dir().join("tgrep_qwi_test.qwi");
         let _ = std::fs::remove_file(&path);
         {
-            let mut idx = QihseWordIndex::create().expect("create");
+            let mut idx = WordIndexBuilder::create().expect("create");
             idx.add(b"hello", 1).unwrap();
             idx.add(b"world", 2).unwrap();
             idx.add(b"hello", 3).unwrap();
             idx.add(b"foo", 4).unwrap();
             idx.save(&path).unwrap();
         }
-        let loaded = QihseWordIndex::load(&path).unwrap();
+        let loaded = MmapWordIndex::load(&path).unwrap();
         assert!(loaded.size() >= 4);
         let results = loaded.search(b"hello", 64);
         assert_eq!(results.len(), 2);

@@ -7,7 +7,7 @@ fn main() {
         .file("native/qihse_opt_wrapper.c")
         .file("native/hash_wrapper.c")
         .file("native/qihse_cache_wrapper.c")
-        .file("native/qihse_hash_wrapper.c")
+        .file("native/word_index_mmap.c")
         // KEYSTONE trigram source (all tgrep extensions are in this file)
         .file("/home/john/Documents/KEYSTONE/src/keystone_trigram.c")
         // KEYSTONE core + hash index sources
@@ -36,7 +36,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/qihse_wal_wrapper.c");
     println!("cargo:rerun-if-changed=native/qihse_cache_wrapper.c");
     println!("cargo:rerun-if-changed=native/hash_wrapper.c");
-    println!("cargo:rerun-if-changed=native/qihse_hash_wrapper.c");
+    println!("cargo:rerun-if-changed=native/word_index_mmap.c");
     println!("cargo:rerun-if-changed=/home/john/Documents/QIHSE/src/tractable/qihse_table_store.c");
     println!("cargo:rerun-if-changed=/home/john/Documents/QIHSE/src/tractable/qihse_wal.c");
     println!("cargo:rerun-if-changed=/home/john/Documents/QIHSE/src/frieze/qihse_btree.c");

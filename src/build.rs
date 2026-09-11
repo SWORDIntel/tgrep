@@ -320,7 +320,7 @@ fn run_build(
     let mut hash_index = native::HashIndex::create(4096)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    let mut qwi_index = native::QihseWordIndex::create()
+    let mut qwi_index = native::WordIndexBuilder::create()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     let mut doc_records: Vec<DocRecord> = Vec::new();
@@ -598,7 +598,7 @@ fn run_build(
 fn flush_batch(
     keystone: &mut KeystoneIndex,
     hash_index: &mut native::HashIndex,
-    qwi_index: &mut native::QihseWordIndex,
+    qwi_index: &mut native::WordIndexBuilder,
     doc_records: &[DocRecord],
     generation: u64,
     state_dir: &Path,
@@ -651,7 +651,7 @@ fn flush_batch(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // Reset QIHSE word index for next batch
-    *qwi_index = native::QihseWordIndex::create()
+    *qwi_index = native::WordIndexBuilder::create()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     Ok(seg_name)
@@ -696,7 +696,7 @@ fn add_tokens_to_hash_index(hash: &mut native::HashIndex, content: &[u8], doc_id
 /// Tokenize file content and add unique tokens to the QIHSE word index.
 /// Same tokenization as add_tokens_to_hash_index, but inserts into the
 /// persistent B+ tree backed by QIHSE.
-fn add_tokens_to_qwi_index(qwi: &mut native::QihseWordIndex, content: &[u8], doc_id: u32) {
+fn add_tokens_to_qwi_index(qwi: &mut native::WordIndexBuilder, content: &[u8], doc_id: u32) {
     let mut seen = std::collections::HashSet::new();
     let mut start = None;
     for (i, &b) in content.iter().enumerate() {

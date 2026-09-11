@@ -32,21 +32,29 @@
 
 - [x] Add save/load persistence to QIHSE btree and hash_index (opt-in)
 - [x] Fix btree page overflow with variable-length keys (byte-size tracking)
-- [x] FFI wrapper: native/qihse_hash_wrapper.c (fixed-width 16-byte keys)
-- [x] Rust QihseWordIndex safe wrapper in src/native.rs
+- [x] FFI wrapper: native/word_index_mmap.c (flat sorted array + mmap)
+- [x] Rust WordIndexBuilder + MmapWordIndex safe wrappers in src/native.rs
 - [x] Build .qwi sidecars alongside .thi during indexing
-- [x] Search prefers .qwi, falls back to .thi for legacy segments
-- [x] 60 tests pass (58 existing + 2 new QIHSE word index tests)
+- [x] Search prefers .qwi (mmap+binary search), falls back to .thi
+- [x] 60 tests pass (58 existing + 2 new word index tests)
 
 #### QIHSE Word Index vs KEYSTONE Hash Index (26K file corpus, 75 segments)
 
-| Metric | .qwi (QIHSE btree) | .thi (KEYSTONE hash) |
-|--------|-------------------|---------------------|
-| Total size | 260 MB | 339 MB |
-| Reduction | 23% smaller | — |
-| -w "struct" time | ~2.1s | ~2.0s |
-| -w "struct" matches | 124901 | 124901 |
-| Correctness vs rg | identical | identical |
+| Metric | .qwi mmap (flat) | .qwi btree | .thi (KEYSTONE) |
+|--------|------------------|------------|-----------------|
+| Total size | **240 MB** | 260 MB | 339 MB |
+| Reduction vs .thi | **29% smaller** | 23% smaller | — |
+| -w "struct" cold | 5.2s | 4.0s | 3.8s |
+| -w "struct" warm | 3.1s | 4.2s | 2.4s |
+| -w "struct" matches | 124901 | 124901 | 124901 |
+| Absent token cold | 2.5s | — | 2.4s |
+| Correctness vs rg | identical | identical | identical |
+
+The mmap flat format is 29% smaller than .thi. Search performance is
+dominated by file-content verification, not word-index lookup, so the
+mmap advantage is most visible on the size/IO-amplification axis rather
+than raw latency. The mmap approach touches only ~log2(n) pages per
+segment for binary search, vs reading the entire .thi file.
 
 ## Completed
 

@@ -1076,7 +1076,7 @@ fn qihse_word_index_candidates(
             s.spawn(move || {
                 let mut local = Vec::new();
                 for (reader_idx, qwi_path) in chunk {
-                    let qwi = match crate::native::QihseWordIndex::load(qwi_path) {
+                    let qwi = match crate::native::MmapWordIndex::load(qwi_path) {
                         Ok(h) => h,
                         Err(e) => {
                             errors.lock().unwrap().push(e);
