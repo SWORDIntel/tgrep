@@ -289,6 +289,14 @@ pub fn run_search(config: SearchConfig) {
     let plan = plan_query(&pattern, config.fixed_strings, case_insensitive, config.word_regexp);
 
     if config.explain {
+        let features = crate::native::detect_cpu_features();
+        let mut feature_parts = Vec::new();
+        if features & 0x01 != 0 { feature_parts.push("SSE4.2"); }
+        if features & 0x02 != 0 { feature_parts.push("AVX2"); }
+        if features & 0x04 != 0 { feature_parts.push("AVX512"); }
+        let feature_str = if feature_parts.is_empty() { "scalar".to_string() } else { feature_parts.join(" ") };
+        eprintln!("tgrep: cpu_features = {}", feature_str);
+        eprintln!("tgrep: backend = auto ({} preferred)", if features & 0x01 != 0 { "SSE4.2" } else { "scalar" });
         match &plan {
             QueryPlan::Indexed { grams } => {
                 eprintln!("tgrep: plan = indexed ({} trigrams)", grams.len());

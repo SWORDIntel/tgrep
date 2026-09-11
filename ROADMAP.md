@@ -1,9 +1,9 @@
 # tgrep Roadmap
 
-## Status: Phase 8 of 11 complete
+## Status: Phase 9 of 11 complete
 
 ```
-[████████████████████████████████████░░░░░░░░░░░░░░] 73%
+[██████████████████████████████████████░░░░░░░░░░░░] 82%
 ```
 
 ## Completed
@@ -186,9 +186,15 @@
 - Binary files are correctly filtered by regex verification (matching rg behavior)
 
 ### Phase 9: Anchor Seeding + Batch Search
-- [ ] `keystone_anchor_seed_batch` after segment flush
-- [ ] `keystone_search_batch_auto` for parallel multi-trigram intersection
-- [ ] Auto-backend router (scalar/SSE4.2/OpenMP)
+- [x] `keystone_anchor_seed_batch` FFI wrapper (`tgrep_keystone_anchor_seed_batch`)
+- [x] `keystone_search_batch_auto` FFI wrapper with auto-backend router
+- [x] `AnchorTable` RAII wrapper (create, seed_batch, destroy)
+- [x] `batch_search_auto` — batch lookup with auto-backend (scalar/SSE4.2/OpenMP)
+- [x] `detect_cpu_features` — CPU SIMD detection for backend selection
+- [x] CPU features + backend selection in `--explain` output
+- [x] 4 new tests (anchor table, batch search, batch with anchors, CPU features)
+- [x] 40 tests pass (36 existing + 4 new Phase 9 tests)
+- [x] Correctness verified: 10/10 patterns match rg
 
 ### Phase 10: QIHSE Optimization DB
 - [ ] `qihse_optimization_init` with storage path
@@ -238,6 +244,9 @@ Phase 7 (file list cache)   [DONE]
 Phase 8 (hash index)        [DONE]
     │
     ▼
+Phase 9 (anchor + batch)    [DONE]
+    │
+    ▼
 Phase 10 (optimization DB)
     │
     ▼
@@ -248,9 +257,9 @@ Phase 11 (full suite + optimize)
 
 | Metric | Current | Target |
 |--------|---------|--------|
-| Test count | 36 pass | 50+ |
-| Lines of code | ~4,800 | ~8,000 |
-| Phases complete | 8/11 | 11/11 |
+| Test count | 40 pass | 50+ |
+| Lines of code | ~5,000 | ~8,000 |
+| Phases complete | 9/11 | 11/11 |
 | grep baseline (NVMe) | 3,880ms | — |
 | rg baseline (NVMe) | 653ms | — |
 | tgrep full (absent, indexed) | 114ms (5.5x rg) | <65ms (10x rg) |

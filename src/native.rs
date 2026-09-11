@@ -10,7 +10,6 @@ use std::path::Path;
 
 pub mod ffi {
     use std::ffi::c_void;
-    use crate::native::KeystoneStatsRaw;
 
     #[link(name = "tgrep_native")]
     extern "C" {
@@ -93,7 +92,7 @@ pub mod ffi {
         // Stats
         pub fn tgrep_keystone_get_stats(
             handle: *mut c_void,
-            out_stats: *mut KeystoneStatsRaw,
+            out_stats: *mut crate::native::KeystoneStatsRaw,
         ) -> i32;
 
         // QIHSE file helpers
@@ -152,8 +151,47 @@ pub mod ffi {
             path: *const std::ffi::c_char,
         ) -> i32;
         pub fn tgrep_hash_index_load(path: *const std::ffi::c_char) -> *mut c_void;
+
+        // Phase 9: Anchor seeding + batch search
+        pub fn tgrep_keystone_anchor_table_create() -> *mut c_void;
+        pub fn tgrep_keystone_anchor_table_destroy(table: *mut c_void);
+        pub fn tgrep_keystone_anchor_seed_batch(
+            arr: *const i64,
+            n: usize,
+            table: *mut c_void,
+            anchor_count: usize,
+        ) -> usize;
+        pub fn tgrep_keystone_search_batch_auto(
+            arr: *const i64,
+            n: usize,
+            items: *mut crate::native::BatchItemRaw,
+            num_items: usize,
+            table: *mut c_void,
+            tol: usize,
+            config: *const crate::native::ParallelConfigRaw,
+        ) -> usize;
+        pub fn tgrep_keystone_detect_cpu_features() -> u32;
     }
 }
+
+// ── Phase 9 raw structs ────────────────────────────────────────────
+
+#[repr(C)]
+pub struct BatchItemRaw {
+    pub key: i64,
+    pub result: usize, // KEYSTONE_NOT_FOUND or index
+    pub ordinal: usize,
+}
+
+#[repr(C)]
+pub struct ParallelConfigRaw {
+    pub num_threads: i32,
+    pub use_thread_pool: i32,
+    pub batch_chunk: usize,
+}
+
+/// KEYSTONE_NOT_FOUND sentinel (matches C definition).
+pub const KEYSTONE_NOT_FOUND: usize = usize::MAX;
 
 // ── Raw structs ─────────────────────────────────────────────────────
 
@@ -762,6 +800,113 @@ impl Drop for HashIndex {
     }
 }
 
+// ── Phase 9: Anchor table + batch search safe wrappers ─────────────
+
+/// Safe RAII wrapper around a KEYSTONE anchor table.
+/// Pre-populated with evenly-spaced anchors for fast interpolation search.
+pub struct AnchorTable {
+    handle: *mut c_void,
+}
+
+impl AnchorTable {
+    /// Create a new anchor table.
+    pub fn create() -> Result<Self, String> {
+        let handle = unsafe { ffi::tgrep_keystone_anchor_table_create() };
+        if handle.is_null() {
+            Err("anchor_table_create returned null".into())
+        } else {
+            Ok(AnchorTable { handle })
+        }
+    }
+
+    /// Seed the anchor table with evenly-spaced anchors from a sorted i64 array.
+    /// Returns the number of anchors actually inserted.
+    pub fn seed_batch(&mut self, arr: &[i64], anchor_count: usize) -> usize {
+        unsafe {
+            ffi::tgrep_keystone_anchor_seed_batch(
+                arr.as_ptr(),
+                arr.len(),
+                self.handle,
+                anchor_count,
+            )
+        }
+    }
+
+    /// Get the raw handle for passing to batch search.
+    pub fn handle(&self) -> *mut c_void {
+        self.handle
+    }
+}
+
+impl Drop for AnchorTable {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { ffi::tgrep_keystone_anchor_table_destroy(self.handle) };
+        }
+    }
+}
+
+/// Detect CPU SIMD features (bitmask).
+pub fn detect_cpu_features() -> u32 {
+    unsafe { ffi::tgrep_keystone_detect_cpu_features() }
+}
+
+/// Batch search multiple keys in a sorted i64 array using KEYSTONE's
+/// auto-backend router (scalar/SSE4.2/OpenMP).
+/// Returns a Vec of indices (KEYSTONE_NOT_FOUND for misses).
+pub fn batch_search_auto(
+    arr: &[i64],
+    keys: &[i64],
+    table: Option<&AnchorTable>,
+    threads: usize,
+) -> Vec<usize> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let mut items: Vec<BatchItemRaw> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, &k)| BatchItemRaw {
+            key: k,
+            result: KEYSTONE_NOT_FOUND,
+            ordinal: i,
+        })
+        .collect();
+
+    let table_ptr = table.map(|t| t.handle()).unwrap_or(std::ptr::null_mut());
+
+    let pcfg = if threads > 0 {
+        Some(ParallelConfigRaw {
+            num_threads: threads as i32,
+            use_thread_pool: 1,
+            batch_chunk: 256,
+        })
+    } else {
+        None
+    };
+
+    unsafe {
+        ffi::tgrep_keystone_search_batch_auto(
+            arr.as_ptr(),
+            arr.len(),
+            items.as_mut_ptr(),
+            items.len(),
+            table_ptr,
+            4, // tolerance
+            pcfg.as_ref().map(|p| p as *const _).unwrap_or(std::ptr::null()),
+        );
+    }
+
+    // Sort results by ordinal and extract
+    let mut results = vec![KEYSTONE_NOT_FOUND; keys.len()];
+    for item in &items {
+        if item.ordinal < results.len() {
+            results[item.ordinal] = item.result;
+        }
+    }
+    results
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1071,5 +1216,48 @@ mod tests {
             assert_eq!(results[0], i);
         }
         assert!(idx.search_all(b"missing_token").is_empty());
+    }
+
+    #[test]
+    fn test_anchor_table_create_and_seed() {
+        let mut table = AnchorTable::create().expect("create anchor table");
+        // Sorted array of 100 values
+        let arr: Vec<i64> = (0..100i64).collect();
+        let inserted = table.seed_batch(&arr, 16);
+        assert!(inserted > 0, "should insert some anchors");
+    }
+
+    #[test]
+    fn test_batch_search_auto_basic() {
+        let arr: Vec<i64> = vec![1, 5, 10, 15, 20, 25, 30, 35, 40, 45];
+        let keys: Vec<i64> = vec![1, 15, 30, 45, 99];
+        let results = batch_search_auto(&arr, &keys, None, 0);
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0], 0, "key 1 at index 0");
+        assert_eq!(results[1], 3, "key 15 at index 3");
+        assert_eq!(results[2], 6, "key 30 at index 6");
+        assert_eq!(results[3], 9, "key 45 at index 9");
+        assert_eq!(results[4], KEYSTONE_NOT_FOUND, "key 99 not found");
+    }
+
+    #[test]
+    fn test_batch_search_auto_with_anchor_table() {
+        let arr: Vec<i64> = (0..1000i64).collect();
+        let mut table = AnchorTable::create().expect("create anchor table");
+        table.seed_batch(&arr, 32);
+
+        let keys: Vec<i64> = (0..1000i64).step_by(100).collect();
+        let results = batch_search_auto(&arr, &keys, Some(&table), 0);
+        assert_eq!(results.len(), 10);
+        for (i, &r) in results.iter().enumerate() {
+            assert_eq!(r, i * 100, "key {} should be at index {}", keys[i], i * 100);
+        }
+    }
+
+    #[test]
+    fn test_detect_cpu_features() {
+        let features = detect_cpu_features();
+        // SSE4.2 should be present on this CPU
+        assert!(features != 0, "should detect some CPU features");
     }
 }

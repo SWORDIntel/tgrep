@@ -22,7 +22,7 @@ tgrep is a persistent trigram-indexed search tool. See:
 ```bash
 cargo build          # compile
 cargo build --release # optimized build (required for benchmarks)
-cargo test           # run all tests (36 tests)
+cargo test           # run all tests (40 tests)
 cargo test -- --nocapture  # run tests with output
 ```
 
@@ -51,6 +51,7 @@ TGREP_STATE_DIR=/tmp/tgrep_strong_state2 ./target/release/tgrep --explain "Patte
 
 ## Implementation status
 
-Phases 0–8 complete (73% of 11 phases). Search is functional and verified against rg.
-Phase 8 adds hash index fast path for whole-word queries (`-w` flag): 374–1069x faster than rg.
+Phases 0–9 complete (82% of 11 phases). Search is functional and verified against rg.
+Phase 8: hash index fast path for whole-word queries (`-w` flag): 374–1069x faster than rg.
+Phase 9: anchor seeding + batch search FFI with auto-backend router.
 See `ROADMAP.md` for phase progress and `ARCHITECTURE.md` for design details.

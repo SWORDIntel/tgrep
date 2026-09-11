@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "keystone_trigram.h"
+#include "keystone.h"
 
 /* ══════════════════════════════════════════════════════════════════
  * Index lifecycle
@@ -279,4 +280,84 @@ int tgrep_keystone_get_stats(void* handle, tgrep_keystone_stats_t* out_stats) {
     out_stats->candidate_docs_evaluated = stats.candidate_docs_evaluated;
     out_stats->candidate_docs_rejected = stats.candidate_docs_rejected;
     return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Phase 9: Anchor seeding + batch search
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Pre-populate an anchor table with evenly-spaced anchors from a sorted
+ * int64 array.  Returns the number of anchors inserted.
+ * This warms up KEYSTONE's interpolation search so the first lookup
+ * benefits from good anchor coverage without learning from misses. */
+size_t tgrep_keystone_anchor_seed_batch(
+    const int64_t* arr,
+    size_t n,
+    void* table,
+    size_t anchor_count
+) {
+    return keystone_anchor_seed_batch(
+        arr, n,
+        (keystone_anchor_table_t*)table,
+        anchor_count
+    );
+}
+
+/* Create an anchor table. Returns opaque handle or NULL on failure. */
+void* tgrep_keystone_anchor_table_create(void) {
+    return (void*)keystone_anchor_table_create();
+}
+
+/* Destroy an anchor table. NULL-safe. */
+void tgrep_keystone_anchor_table_destroy(void* table) {
+    if (table) keystone_anchor_table_destroy((keystone_anchor_table_t*)table);
+}
+
+/* Batch search: look up multiple keys in a sorted int64 array.
+ * Uses keystone_search_batch_auto with automatic backend selection.
+ * Writes results into items[].result (KEYSTONE_NOT_FOUND for misses).
+ * Returns the number of successful lookups. */
+typedef struct {
+    int64_t key;
+    size_t  result;   /* KEYSTONE_NOT_FOUND or index in arr */
+    size_t  ordinal;
+} tgrep_batch_item_t;
+
+typedef struct {
+    int  num_threads;
+    int  use_thread_pool;
+    size_t batch_chunk;
+} tgrep_parallel_config_t;
+
+size_t tgrep_keystone_search_batch_auto(
+    const int64_t* arr,
+    size_t n,
+    tgrep_batch_item_t* items,
+    size_t num_items,
+    void* table,
+    size_t tol,
+    const tgrep_parallel_config_t* config
+) {
+    /* Map tgrep_batch_item_t to keystone_batch_item_t (same layout) */
+    keystone_parallel_config_t pcfg;
+    const keystone_parallel_config_t* pcfg_ptr = NULL;
+    if (config) {
+        pcfg.num_threads = config->num_threads;
+        pcfg.use_thread_pool = config->use_thread_pool;
+        pcfg.batch_chunk = config->batch_chunk;
+        pcfg_ptr = &pcfg;
+    }
+    return keystone_search_batch_auto(
+        arr, n,
+        (keystone_batch_item_t*)items,
+        num_items,
+        (keystone_anchor_table_t*)table,
+        tol,
+        pcfg_ptr
+    );
+}
+
+/* Detect CPU features (bitmask). */
+uint32_t tgrep_keystone_detect_cpu_features(void) {
+    return keystone_detect_cpu_features();
 }
