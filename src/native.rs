@@ -142,6 +142,26 @@ pub mod ffi {
         pub fn tgrep_hash_index_save(handle: *mut c_void, path: *const std::ffi::c_char) -> i32;
         pub fn tgrep_hash_index_load(path: *const std::ffi::c_char) -> *mut c_void;
 
+        // QIHSE btree-backed persistent word index
+        pub fn tgrep_qihse_word_index_create() -> *mut c_void;
+        pub fn tgrep_qihse_word_index_destroy(handle: *mut c_void);
+        pub fn tgrep_qihse_word_index_add(
+            handle: *mut c_void,
+            token: *const std::ffi::c_char,
+            token_len: usize,
+            doc_id: u64,
+        ) -> i32;
+        pub fn tgrep_qihse_word_index_search(
+            handle: *mut c_void,
+            token: *const std::ffi::c_char,
+            token_len: usize,
+            out_doc_ids: *mut u64,
+            max_results: usize,
+        ) -> usize;
+        pub fn tgrep_qihse_word_index_save(handle: *const c_void, path: *const std::ffi::c_char) -> i32;
+        pub fn tgrep_qihse_word_index_load(path: *const std::ffi::c_char) -> *mut c_void;
+        pub fn tgrep_qihse_word_index_size(handle: *const c_void) -> usize;
+
         // Phase 9: Anchor seeding + batch search
         pub fn tgrep_keystone_anchor_table_create() -> *mut c_void;
         pub fn tgrep_keystone_anchor_table_destroy(table: *mut c_void);
@@ -974,6 +994,93 @@ impl Drop for HashIndex {
     }
 }
 
+// ── QIHSE btree-backed persistent word index ──────────────────────
+
+/// Safe RAII wrapper around the QIHSE btree word index.
+/// Maps tokens to doc IDs via prefix scan on a persistent B+ tree.
+pub struct QihseWordIndex {
+    handle: *mut c_void,
+}
+
+impl QihseWordIndex {
+    pub fn create() -> Result<Self, String> {
+        let handle = unsafe { ffi::tgrep_qihse_word_index_create() };
+        if handle.is_null() {
+            Err("qihse_word_index_create returned null".into())
+        } else {
+            Ok(QihseWordIndex { handle })
+        }
+    }
+
+    pub fn add(&mut self, token: &[u8], doc_id: u32) -> Result<(), String> {
+        let rc = unsafe {
+            ffi::tgrep_qihse_word_index_add(
+                self.handle,
+                token.as_ptr() as *const std::ffi::c_char,
+                token.len(),
+                doc_id as u64,
+            )
+        };
+        if rc != 0 {
+            Err(format!("qihse_word_index_add failed (rc={})", rc))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn search(&self, token: &[u8], max_results: usize) -> Vec<u64> {
+        if token.is_empty() || max_results == 0 {
+            return Vec::new();
+        }
+        let mut out = vec![0u64; max_results];
+        let count = unsafe {
+            ffi::tgrep_qihse_word_index_search(
+                self.handle,
+                token.as_ptr() as *const std::ffi::c_char,
+                token.len(),
+                out.as_mut_ptr(),
+                max_results,
+            )
+        };
+        out.truncate(count);
+        out
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let path_c = std::ffi::CString::new(path.to_str().ok_or("invalid path")?)
+            .map_err(|e| format!("CString error: {}", e))?;
+        let rc = unsafe { ffi::tgrep_qihse_word_index_save(self.handle, path_c.as_ptr()) };
+        if rc != 0 {
+            Err(format!("qihse_word_index_save failed (rc={})", rc))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let path_c = std::ffi::CString::new(path.to_str().ok_or("invalid path")?)
+            .map_err(|e| format!("CString error: {}", e))?;
+        let handle = unsafe { ffi::tgrep_qihse_word_index_load(path_c.as_ptr()) };
+        if handle.is_null() {
+            Err("qihse_word_index_load returned null".into())
+        } else {
+            Ok(QihseWordIndex { handle })
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        unsafe { ffi::tgrep_qihse_word_index_size(self.handle) }
+    }
+}
+
+impl Drop for QihseWordIndex {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { ffi::tgrep_qihse_word_index_destroy(self.handle) };
+        }
+    }
+}
+
 // ── Phase 9: Anchor table + batch search safe wrappers ─────────────
 
 /// Safe RAII wrapper around a KEYSTONE anchor table.
@@ -1752,6 +1859,49 @@ mod tests {
         let results = loaded.search_all(b"beta");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], 20);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_qihse_word_index_basic() {
+        let mut idx = QihseWordIndex::create().expect("create");
+        idx.add(b"alpha", 10).unwrap();
+        idx.add(b"beta", 20).unwrap();
+        idx.add(b"alpha", 30).unwrap();
+        idx.add(b"gamma", 40).unwrap();
+        assert!(idx.size() >= 4);
+        let results = idx.search(b"alpha", 64);
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&10));
+        assert!(results.contains(&30));
+        let results = idx.search(b"beta", 64);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], 20);
+        assert!(idx.search(b"missing", 64).is_empty());
+    }
+
+    #[test]
+    fn test_qihse_word_index_save_load() {
+        let path = std::env::temp_dir().join("tgrep_qwi_test.qwi");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut idx = QihseWordIndex::create().expect("create");
+            idx.add(b"hello", 1).unwrap();
+            idx.add(b"world", 2).unwrap();
+            idx.add(b"hello", 3).unwrap();
+            idx.add(b"foo", 4).unwrap();
+            idx.save(&path).unwrap();
+        }
+        let loaded = QihseWordIndex::load(&path).unwrap();
+        assert!(loaded.size() >= 4);
+        let results = loaded.search(b"hello", 64);
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&1));
+        assert!(results.contains(&3));
+        let results = loaded.search(b"world", 64);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], 2);
+        assert!(loaded.search(b"missing", 64).is_empty());
         std::fs::remove_file(&path).unwrap();
     }
 

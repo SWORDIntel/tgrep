@@ -515,7 +515,14 @@ pub fn run_search(config: SearchConfig) {
     let indexed_candidates: Vec<(PathBuf, u64)> = match &plan {
         QueryPlan::Indexed { grams } => intersect_postings(&readers, grams, &indexed_roots),
         QueryPlan::HashIndex { token } => {
-            hash_index_candidates(&readers, &segments_dir, token, &indexed_roots)
+            // Prefer QIHSE-backed B+ tree index (.qwi) when available;
+            // fall back to KEYSTONE hash index (.thi) for legacy segments.
+            let qwi = qihse_word_index_candidates(&readers, &segments_dir, token, &indexed_roots);
+            if !qwi.is_empty() {
+                qwi
+            } else {
+                hash_index_candidates(&readers, &segments_dir, token, &indexed_roots)
+            }
         }
         QueryPlan::Streaming => Vec::new(),
     };
@@ -1003,6 +1010,112 @@ fn hash_index_candidates(
 
     for e in errors.into_inner().unwrap() {
         eprintln!("tgrep: warning: hash index load failed: {}", e);
+    }
+
+    results.into_inner().unwrap()
+}
+
+/// Look up whole-token candidates via the per-segment QIHSE B+ tree indexes.
+/// Each segment has a sidecar `.qwi` file containing the persistent B+ tree.
+/// Returns (path, byte_length) pairs for files containing the token.
+///
+/// This is the QIHSE-backed alternative to the KEYSTONE `.thi` hash index.
+/// It is preferred when `.qwi` files are present because the B+ tree format
+/// is more compact and supports prefix scans natively.
+fn qihse_word_index_candidates(
+    readers: &[SegmentReader],
+    segments_dir: &Path,
+    token: &[u8],
+    indexed_roots: &[String],
+) -> Vec<(PathBuf, u64)> {
+    if readers.is_empty() || token.is_empty() {
+        return Vec::new();
+    }
+
+    use std::sync::Mutex;
+    use std::thread;
+
+    let token_owned = token.to_vec();
+    let segments_dir = segments_dir.to_path_buf();
+    let indexed_roots: Vec<String> = indexed_roots.to_vec();
+
+    // Collect (reader_index, qwi_path) pairs that have QIHSE word index sidecars
+    let work: Vec<(usize, std::path::PathBuf)> = readers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, reader)| {
+            let seg_name = reader.segment_name();
+            let qwi_path = segments_dir.join(format!("{}.qwi", seg_name));
+            if qwi_path.exists() {
+                Some((i, qwi_path))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if work.is_empty() {
+        return Vec::new();
+    }
+
+    let num_threads = 4usize.min(work.len());
+    let chunk_size = (work.len() + num_threads - 1) / num_threads;
+    let chunks: Vec<Vec<(usize, std::path::PathBuf)>> =
+        work.chunks(chunk_size).map(|c| c.to_vec()).collect();
+
+    let results = Mutex::new(Vec::new());
+    let errors = Mutex::new(Vec::new());
+
+    thread::scope(|s| {
+        for chunk in &chunks {
+            let results = &results;
+            let errors = &errors;
+            let readers = readers;
+            let indexed_roots = &indexed_roots;
+            let token_owned = &token_owned;
+            s.spawn(move || {
+                let mut local = Vec::new();
+                for (reader_idx, qwi_path) in chunk {
+                    let qwi = match crate::native::QihseWordIndex::load(qwi_path) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            errors.lock().unwrap().push(e);
+                            continue;
+                        }
+                    };
+                    // Cap results per segment to avoid unbounded allocation
+                    let max_results = qwi.size().max(1024);
+                    let doc_ids_u64 = qwi.search(token_owned, max_results);
+                    if doc_ids_u64.is_empty() {
+                        continue;
+                    }
+                    let doc_ids: Vec<u32> = doc_ids_u64
+                        .into_iter()
+                        .map(|d| d as u32)
+                        .collect();
+                    let reader = &readers[*reader_idx];
+                    let docs = reader.get_docs_bulk(&doc_ids);
+                    for doc in docs.into_iter().flatten() {
+                        let root_idx = doc.root_id as usize;
+                        if root_idx < indexed_roots.len() {
+                            let root = PathBuf::from(&indexed_roots[root_idx]);
+                            let rel = String::from_utf8_lossy(&doc.path);
+                            let full_path = root.join(rel.as_ref());
+                            local.push((full_path, doc.byte_length));
+                        } else {
+                            let path =
+                                PathBuf::from(String::from_utf8_lossy(&doc.path).to_string());
+                            local.push((path, doc.byte_length));
+                        }
+                    }
+                }
+                results.lock().unwrap().extend(local);
+            });
+        }
+    });
+
+    for e in errors.into_inner().unwrap() {
+        eprintln!("tgrep: warning: qihse word index load failed: {}", e);
     }
 
     results.into_inner().unwrap()

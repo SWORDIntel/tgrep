@@ -320,6 +320,9 @@ fn run_build(
     let mut hash_index = native::HashIndex::create(4096)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
+    let mut qwi_index = native::QihseWordIndex::create()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
     let mut doc_records: Vec<DocRecord> = Vec::new();
     let mut batch_source_bytes: u64 = 0;
     let mut batch_start = Instant::now();
@@ -423,6 +426,7 @@ fn run_build(
             // Tokenize file content and add unique tokens to hash index
             // for O(1) whole-word exact-match queries.
             add_tokens_to_hash_index(&mut hash_index, &content, doc_id);
+            add_tokens_to_qwi_index(&mut qwi_index, &content, doc_id);
 
             // Collect doc record
             let mtime_ns = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
@@ -467,6 +471,7 @@ fn run_build(
                 let flush_result = flush_batch(
                     &mut keystone,
                     &mut hash_index,
+                    &mut qwi_index,
                     &doc_records,
                     generation,
                     state_dir,
@@ -529,6 +534,7 @@ fn run_build(
         let flush_result = flush_batch(
             &mut keystone,
             &mut hash_index,
+            &mut qwi_index,
             &doc_records,
             generation,
             state_dir,
@@ -592,6 +598,7 @@ fn run_build(
 fn flush_batch(
     keystone: &mut KeystoneIndex,
     hash_index: &mut native::HashIndex,
+    qwi_index: &mut native::QihseWordIndex,
     doc_records: &[DocRecord],
     generation: u64,
     state_dir: &Path,
@@ -628,6 +635,12 @@ fn flush_batch(
         }
     }
 
+    // Save QIHSE btree word index alongside the segment
+    let qwi_path = segments_dir.join(format!("seg_{:08}.qwi", generation));
+    if let Err(e) = qwi_index.save(&qwi_path) {
+        eprintln!("tgrep: warning: qihse word index save failed: {}", e);
+    }
+
     // Reset KEYSTONE for next batch
     // (We create a new index since KEYSTONE doesn't have a reset API)
     *keystone =
@@ -635,6 +648,10 @@ fn flush_batch(
 
     // Reset hash index for next batch
     *hash_index = native::HashIndex::create(4096)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    // Reset QIHSE word index for next batch
+    *qwi_index = native::QihseWordIndex::create()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     Ok(seg_name)
@@ -672,6 +689,34 @@ fn add_tokens_to_hash_index(hash: &mut native::HashIndex, content: &[u8], doc_id
         let token = &content[s..];
         if token.len() >= 2 && seen.insert(token.to_vec()) {
             let _ = hash.add(token, doc_id);
+        }
+    }
+}
+
+/// Tokenize file content and add unique tokens to the QIHSE word index.
+/// Same tokenization as add_tokens_to_hash_index, but inserts into the
+/// persistent B+ tree backed by QIHSE.
+fn add_tokens_to_qwi_index(qwi: &mut native::QihseWordIndex, content: &[u8], doc_id: u32) {
+    let mut seen = std::collections::HashSet::new();
+    let mut start = None;
+    for (i, &b) in content.iter().enumerate() {
+        let is_word = b.is_ascii_alphanumeric() || b == b'_';
+        if is_word {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start {
+            let token = &content[s..i];
+            if token.len() >= 2 && seen.insert(token.to_vec()) {
+                let _ = qwi.add(token, doc_id);
+            }
+            start = None;
+        }
+    }
+    if let Some(s) = start {
+        let token = &content[s..];
+        if token.len() >= 2 && seen.insert(token.to_vec()) {
+            let _ = qwi.add(token, doc_id);
         }
     }
 }
