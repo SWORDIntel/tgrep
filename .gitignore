@@ -1,0 +1,8 @@
+/target
+*.csv
+*.tgs
+*.thi
+*.tmp
+*.swp
+*~
+.DS_Store
