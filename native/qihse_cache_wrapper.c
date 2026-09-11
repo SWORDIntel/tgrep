@@ -239,6 +239,122 @@ size_t tgrep_cache_count(tgrep_cache_t* cache) {
     return qihse_table_row_count(cache->table);
 }
 
+/* ── Cache stats: enumerate unique patterns ────────────────────────── */
+
+typedef struct {
+    char**  patterns;
+    int32_t* flags_arr;
+    int64_t* generations;
+    size_t*  counts;
+    size_t  unique_count;
+    size_t  cap;
+} pattern_enumerate_ctx_t;
+
+static bool cache_enum_cb(const qihse_col_value_t* values, size_t num_cols, void* ctx) {
+    pattern_enumerate_ctx_t* c = (pattern_enumerate_ctx_t*)ctx;
+    if (num_cols < 5) return true;
+
+    if (values[0].type != QIHSE_TS_STRING || !values[0].v.str) return true;
+    if (values[1].type != QIHSE_TS_INT32) return true;
+    if (values[2].type != QIHSE_TS_INT64) return true;
+
+    const char* pat = values[0].v.str;
+    int32_t fl = values[1].v.i32;
+    int64_t gen = values[2].v.i64;
+
+    /* Check if this pattern+flags+gen is already in our list */
+    for (size_t i = 0; i < c->unique_count; i++) {
+        if (strcmp(c->patterns[i], pat) == 0
+            && c->flags_arr[i] == fl
+            && c->generations[i] == gen) {
+            c->counts[i]++;
+            return true;
+        }
+    }
+
+    /* Add new unique entry */
+    if (c->unique_count >= c->cap) {
+        size_t new_cap = c->cap == 0 ? 64 : c->cap * 2;
+        char** np = realloc(c->patterns, new_cap * sizeof(char*));
+        if (!np) return false;
+        c->patterns = np;
+        int32_t* nf = realloc(c->flags_arr, new_cap * sizeof(int32_t));
+        if (!nf) return false;
+        c->flags_arr = nf;
+        int64_t* ng = realloc(c->generations, new_cap * sizeof(int64_t));
+        if (!ng) return false;
+        c->generations = ng;
+        size_t* nc = realloc(c->counts, new_cap * sizeof(size_t));
+        if (!nc) return false;
+        c->counts = nc;
+        c->cap = new_cap;
+    }
+
+    c->patterns[c->unique_count] = strdup(pat);
+    if (!c->patterns[c->unique_count]) return false;
+    c->flags_arr[c->unique_count] = fl;
+    c->generations[c->unique_count] = gen;
+    c->counts[c->unique_count] = 1;
+    c->unique_count++;
+    return true;
+}
+
+typedef struct {
+    char* pattern;
+    int32_t flags;
+    int64_t generation;
+    size_t file_count;
+} tgrep_cache_entry_info_t;
+
+int tgrep_cache_get_entries(
+    tgrep_cache_t* cache,
+    tgrep_cache_entry_info_t* out_entries,
+    size_t max_entries,
+    size_t* out_count
+) {
+    if (!cache || !out_count) return -1;
+    *out_count = 0;
+    if (!out_entries || max_entries == 0) return -1;
+
+    pthread_mutex_lock(&cache->lock);
+
+    pattern_enumerate_ctx_t ctx = {
+        .patterns = NULL, .flags_arr = NULL, .generations = NULL,
+        .counts = NULL, .unique_count = 0, .cap = 0,
+    };
+    qihse_table_scan(cache->table, cache_enum_cb, &ctx);
+
+    pthread_mutex_unlock(&cache->lock);
+
+    size_t n = ctx.unique_count < max_entries ? ctx.unique_count : max_entries;
+    for (size_t i = 0; i < n; i++) {
+        out_entries[i].pattern = ctx.patterns[i];
+        out_entries[i].flags = ctx.flags_arr[i];
+        out_entries[i].generation = ctx.generations[i];
+        out_entries[i].file_count = ctx.counts[i];
+    }
+
+    /* Free strings that we didn't transfer to out_entries */
+    for (size_t i = n; i < ctx.unique_count; i++) {
+        free(ctx.patterns[i]);
+    }
+    free(ctx.patterns);
+    free(ctx.flags_arr);
+    free(ctx.generations);
+    free(ctx.counts);
+
+    *out_count = n;
+    return (int)n;
+}
+
+void tgrep_cache_free_entries(tgrep_cache_entry_info_t* entries, size_t count) {
+    if (!entries) return;
+    for (size_t i = 0; i < count; i++) {
+        free(entries[i].pattern);
+        entries[i].pattern = NULL;
+    }
+}
+
 /* ── Persistence ───────────────────────────────────────────────────── */
 
 /* Save callback context */

@@ -226,10 +226,59 @@ pub mod ffi {
         pub fn tgrep_cache_count(cache: *mut c_void) -> usize;
         pub fn tgrep_cache_save(cache: *mut c_void, path: *const std::ffi::c_char) -> i32;
         pub fn tgrep_cache_load_file(cache: *mut c_void, path: *const std::ffi::c_char) -> i32;
+        pub fn tgrep_cache_get_entries(
+            cache: *mut c_void,
+            out_entries: *mut super::CacheEntryInfo,
+            max_entries: usize,
+            out_count: *mut usize,
+        ) -> i32;
+        pub fn tgrep_cache_free_entries(entries: *mut super::CacheEntryInfo, count: usize);
+
+        // KEYSTONE performance stats
+        pub fn keystone_get_performance_stats(stats: *mut super::KeystonePerformanceStats) -> i32;
+        pub fn keystone_reset_performance_stats();
+        pub fn keystone_set_performance_tracking(enabled: i32);
+        pub fn keystone_detect_cpu_features() -> u32;
     }
 }
 
 // ── Phase 9 raw structs ────────────────────────────────────────────
+
+// ── KEYSTONE performance stats (from keystone.h) ───────────────────
+
+#[repr(C)]
+#[derive(Default, Debug)]
+pub struct KeystonePerformanceStats {
+    pub total_time_ns: u64,
+    pub search_time_ns: u64,
+    pub total_searches: u64,
+    pub successful_searches: u64,
+    pub avg_search_time_ns: f64,
+    pub search_success_rate: f64,
+    pub speedup_vs_binary: f64,
+    pub peak_memory_usage: usize,
+    pub avg_memory_usage: usize,
+    pub anchors_learned: u64,
+    pub anchors_pruned: u64,
+    pub cpu_features_used: u32,
+    pub vectorization_efficiency: f64,
+    pub memory_allocation_failures: u64,
+    pub archive_bytes_read: u64,
+    pub archive_decompress_time_ns: u64,
+    pub archive_parse_time_ns: u64,
+    pub archive_members_searched: u64,
+}
+
+// ── Cache entry info (from qihse_cache_wrapper.c) ──────────────────
+
+#[repr(C)]
+#[derive(Clone, Default)]
+pub struct CacheEntryInfo {
+    pub pattern: *mut std::ffi::c_char,
+    pub flags: i32,
+    pub generation: i64,
+    pub file_count: usize,
+}
 
 #[repr(C)]
 pub struct BatchItemRaw {
@@ -1186,6 +1235,15 @@ pub const CACHE_FLAG_CASE_INSENSITIVE: i32 = 0x01;
 pub const CACHE_FLAG_WORD_REGEXP: i32 = 0x02;
 pub const CACHE_FLAG_FIXED_STRINGS: i32 = 0x04;
 
+/// A unique cache entry (pattern + flags + generation → file count).
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    pub pattern: String,
+    pub flags: i32,
+    pub generation: i64,
+    pub file_count: usize,
+}
+
 /// Safe RAII wrapper around the QIHSE table-store-backed search cache.
 ///
 /// Caches the file list matching a (pattern, flags, generation) tuple so
@@ -1280,6 +1338,54 @@ impl SearchCache {
         unsafe { ffi::tgrep_cache_count(self.handle) }
     }
 
+    /// Get unique cache entries (pattern, flags, generation, file_count).
+    pub fn get_entries(&self, max_entries: usize) -> Vec<CacheEntry> {
+        if max_entries == 0 {
+            return Vec::new();
+        }
+        let mut entries: Vec<CacheEntryInfo> = Vec::with_capacity(max_entries);
+        // Safety: CacheEntryInfo is repr(C) and we allocate zeroed entries
+        entries.resize(max_entries, CacheEntryInfo {
+            pattern: std::ptr::null_mut(),
+            flags: 0,
+            generation: 0,
+            file_count: 0,
+        });
+        let mut out_count: usize = 0;
+        let rc = unsafe {
+            ffi::tgrep_cache_get_entries(
+                self.handle,
+                entries.as_mut_ptr(),
+                max_entries,
+                &mut out_count,
+            )
+        };
+        if rc < 0 {
+            return Vec::new();
+        }
+        let mut result = Vec::with_capacity(out_count);
+        for i in 0..out_count {
+            let e = &entries[i];
+            let pattern = if e.pattern.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(e.pattern) }
+                    .to_string_lossy()
+                    .to_string()
+            };
+            result.push(CacheEntry {
+                pattern,
+                flags: e.flags,
+                generation: e.generation,
+                file_count: e.file_count,
+            });
+        }
+        unsafe {
+            ffi::tgrep_cache_free_entries(entries.as_mut_ptr(), out_count);
+        }
+        result
+    }
+
     /// Save cache to a .qsc file.
     pub fn save(&self, path: &str) -> Result<i32, String> {
         let c_path = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
@@ -1324,6 +1430,29 @@ pub fn compute_cache_flags(case_insensitive: bool, word_regexp: bool, fixed_stri
         flags |= CACHE_FLAG_FIXED_STRINGS;
     }
     flags
+}
+
+// ── KEYSTONE performance stats safe wrapper ─────────────────────────
+
+/// Get KEYSTONE global performance statistics.
+pub fn get_keystone_performance_stats() -> Option<KeystonePerformanceStats> {
+    let mut stats = KeystonePerformanceStats::default();
+    let rc = unsafe { ffi::keystone_get_performance_stats(&mut stats) };
+    if rc == 0 {
+        Some(stats)
+    } else {
+        None
+    }
+}
+
+/// Reset KEYSTONE performance statistics.
+pub fn reset_keystone_performance_stats() {
+    unsafe { ffi::keystone_reset_performance_stats() };
+}
+
+/// Enable or disable KEYSTONE performance tracking.
+pub fn set_keystone_performance_tracking(enabled: bool) {
+    unsafe { ffi::keystone_set_performance_tracking(if enabled { 1 } else { 0 }) };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

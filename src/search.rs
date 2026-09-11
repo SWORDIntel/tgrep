@@ -314,7 +314,7 @@ pub fn run_search(config: SearchConfig) {
         None => Vec::new(),
     };
 
-    // Phase 11: Search-result cache (QIHSE table store).
+    // Phase 11: Search-result cache (v2: grouped entries with file IDs).
     // Cache key: (pattern, flags, manifest_generation).
     // Cache invalidation is automatic — a new build increments the
     // generation, so old entries don't match.
@@ -325,8 +325,8 @@ pub fn run_search(config: SearchConfig) {
         config.fixed_strings,
     );
     let cache_path = state_dir.join("search_cache.qsc");
-    let cache = crate::native::SearchCache::create().ok();
-    if let Some(ref cache) = cache {
+    let mut cache = crate::cache_v2::SearchCacheV2::create().ok();
+    if let Some(ref mut cache) = cache {
         let _ = cache.load(cache_path.to_str().unwrap_or(""));
     }
 
@@ -603,7 +603,7 @@ pub fn run_search(config: SearchConfig) {
     // Phase 11: Store results in cache for future lookups.
     // Only cache -l (files_with_matches) mode results.
     if config.files_with_matches {
-        if let Some(ref cache) = cache {
+        if let Some(ref mut cache) = cache {
             let path_strings: Vec<String> = matched_paths
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())

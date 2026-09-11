@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+use tgrep::cache::CacheSubcommands;
 use tgrep::index::IndexCommand;
 use tgrep::search::SearchConfig;
 
@@ -76,6 +77,11 @@ enum Commands {
         #[command(subcommand)]
         action: IndexSubcommands,
     },
+    /// Manage the search-result cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheSubcommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -132,6 +138,9 @@ fn main() {
                 IndexSubcommands::Rebuild => IndexCommand::Rebuild,
             };
             tgrep::index::run_index_command(cmd);
+        }
+        Some(Commands::Cache { action }) => {
+            tgrep::cache::run_cache_command(action);
         }
         None => {
             if cli.pattern.is_none() {
