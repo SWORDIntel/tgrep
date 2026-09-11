@@ -82,6 +82,25 @@ segment for binary search, vs reading the entire .thi file.
 - Binary files are correctly filtered (both build-time skip and search-time check)
 - Files changed since indexing still get verified via grep_searcher fallback
 
+## Post-Phase 11: Comprehensive Benchmark Suite
+
+- [x] `benchmarks/run_benchmarks.sh` — 19 patterns, 10 trials, cold + warm cache
+- [x] `benchmarks/make_graphs.py` — generates 5 PNG graphs from CSV data
+- [x] Graphs: cold_vs_warm, speedup_by_category, speedup_per_pattern, latency_scatter, trial_distribution
+- [x] Updated BENCHMARKS.md with comprehensive results table and graph references
+- [x] All 19 patterns produce identical file lists to `rg`
+
+#### Comprehensive Benchmark Results (10 trials, 19 patterns)
+
+| Category | Cold avg speedup | Warm avg speedup | Patterns |
+|----------|-----------------|-----------------|----------|
+| Rare | **8.9x** | **31.7x** | 8 |
+| Broad | **5.8x** | **35.3x** | 4 |
+| Word | **5.7x** | **33.7x** | 5 |
+| Case-insensitive | 0.9x | **32.5x** | 2 |
+
+See `BENCHMARKS.md` for the full results table and `benchmarks/graphs/` for visualizations.
+
 ## Completed
 
 ### KEYSTONE Changes (prerequisite)

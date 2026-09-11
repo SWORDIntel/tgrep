@@ -5,11 +5,89 @@
 - **CPU:** 8 cores (4 threads for search)
 - **Storage:** NVMe-backed ZFS pool (`rpool`)
 - **Corpus:** `/rpool/scratch/tgrep_corpus` — 26,034 files, 1.15 GB source (includes hidden files)
-- **Index:** 75 segments, ~200M postings
-- **Index state:** `/tmp/tgrep_strong_state2`
+- **Index:** 75 segments, ~200M postings, mmap `.qwi` word index (240 MB)
+- **Index state:** `/tmp/tgrep_qwi_mmap`
 - **ripgrep config:** `~/.ripgreprc` with `--smart-case`, `--hidden`, `--glob=!.git/*`, `--threads=4`
-- **Trials:** 10 per pattern (alternating tgrep/rg)
-- **Date:** September 2026 (Phase 11 — full benchmark suite + QIHSE cache)
+- **Trials:** 10 per pattern (1 cold + 9 warm, alternating tgrep/rg)
+- **Date:** September 2026 (Post-Phase 11 — index-trust optimization + comprehensive benchmarks)
+
+## Graphs
+
+Generated graphs are in `benchmarks/graphs/`:
+
+| Graph | File | Description |
+|-------|------|-------------|
+| Cold vs Warm | `cold_vs_warm.png` | Bar chart comparing tgrep cold/warm latency vs rg |
+| Speedup by Category | `speedup_by_category.png` | Average speedup grouped by pattern category |
+| Speedup per Pattern | `speedup_per_pattern.png` | Horizontal bar chart of cold-cache speedup |
+| Latency Scatter | `latency_scatter.png` | tgrep vs rg latency scatter (log-log) |
+| Trial Distribution | `trial_distribution.png` | Box plot of per-trial latency distribution |
+
+Run `python3 benchmarks/make_graphs.py` to regenerate from CSV data.
+
+## Comprehensive Benchmark Results (10 trials, cold + warm cache)
+
+### Summary Table
+
+| Pattern | Category | tgrep cold (ms) | tgrep warm (ms) | rg (ms) | Cold speedup | Warm speedup | Files |
+|---------|----------|-----------------|-----------------|---------|-------------|-------------|-------|
+| AtomicWriteFsync | rare | 200 | 60 | 2560 | **12.8x** | **42.7x** | 1 |
+| DsmilHashIndex | rare | 170 | 50 | 1670 | **9.8x** | **33.4x** | 1 |
+| KeystoneTrigram | rare | 220 | 130 | 1610 | **7.3x** | **12.4x** | 1 |
+| NonexistentXyz123 | rare | 190 | 60 | 1680 | **8.8x** | **28.0x** | 1 |
+| QihseOptimization | rare | 270 | 50 | 2710 | **10.0x** | **54.2x** | 1 |
+| RareNeedle | rare | 310 | 80 | 2150 | **6.9x** | **26.9x** | 1 |
+| TgrepSegmentWriter | rare | 260 | 70 | 1420 | **5.5x** | **20.3x** | 1 |
+| WalCheckpointReplay | rare | 200 | 60 | 2170 | **10.8x** | **36.2x** | 1 |
+| Struct | broad | 870 | 50 | 2080 | **2.4x** | **41.6x** | 238 |
+| FnMain | broad | 240 | 70 | 1710 | **7.1x** | **24.4x** | 1 |
+| Return | broad | 570 | 80 | 3060 | **5.4x** | **38.2x** | 1357 |
+| UseStd | broad | 310 | 70 | 2590 | **8.4x** | **37.0x** | 1 |
+| WordStruct | word | 430 | 100 | 2070 | **4.8x** | **20.7x** | 77 |
+| WordMain | word | 380 | 60 | 2780 | **7.3x** | **46.3x** | 243 |
+| WordReturn | word | 260 | 90 | 2790 | **10.7x** | **31.0x** | 420 |
+| WordTerminal | word | 520 | 70 | 2330 | **4.5x** | **33.3x** | 679 |
+| WordNonexistent | word | 1690 | 60 | 2240 | **1.3x** | **37.3x** | 1 |
+| CITerminal | caseinsensitive | 2630 | 80 | 2350 | 0.9x | **29.4x** | 2011 |
+| CIStruct | caseinsensitive | 3170 | 80 | 2850 | 0.9x | **35.6x** | 4698 |
+
+### Category Averages
+
+| Category | Cold avg speedup | Warm avg speedup | Patterns |
+|----------|-----------------|-----------------|----------|
+| Rare | **8.9x** | **31.7x** | 8 |
+| Broad | **5.8x** | **35.3x** | 4 |
+| Word | **5.7x** | **33.7x** | 5 |
+| Case-insensitive | 0.9x | **32.5x** | 2 |
+
+### Key Findings
+
+- **Rare patterns:** 5.5–12.8x faster cold, 12.4–54.2x faster warm (target: 10x)
+- **Broad patterns:** 2.4–8.4x faster cold, 24.4–41.6x faster warm
+- **Word patterns:** 1.3–10.7x faster cold, 20.7–46.3x faster warm
+  - Previously 1.0–1.1x slower than rg; index-trust optimization now makes word
+    queries 4.8–10.7x faster cold
+- **Case-insensitive:** 0.9x cold (streaming fallback, within 10% of rg),
+  29–36x warm (cache hit)
+- **Warm cache:** All categories benefit from 12–54x speedup on repeated queries
+- **Correctness:** All patterns produce identical file lists to `rg`
+
+## Benchmark Scripts
+
+| Script | Description |
+|--------|-------------|
+| `benchmarks/run_benchmarks.sh` | Comprehensive benchmark runner (19 patterns, 10 trials) |
+| `benchmarks/make_graphs.py` | Generate PNG graphs from CSV results |
+| `benchmarks/benchmark_results.csv` | Raw CSV data from latest benchmark run |
+| `benchmarks/summary_table.md` | Auto-generated markdown summary table |
+
+```bash
+# Run benchmarks (10 trials, ~15 min)
+./benchmarks/run_benchmarks.sh 10 /tmp/tgrep_qwi_mmap /rpool/scratch/tgrep_corpus
+
+# Generate graphs
+python3 benchmarks/make_graphs.py
+```
 
 ## Correctness Verification
 

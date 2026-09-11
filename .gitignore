@@ -6,3 +6,7 @@
 *.swp
 *~
 .DS_Store
+
+# Keep benchmark results and graphs
+!benchmarks/*.csv
+!benchmarks/graphs/*.png
