@@ -1,10 +1,32 @@
 # tgrep Roadmap
 
-## Status: Phase 11 of 11 complete
+## Status: Phase 11 of 11 complete + v2 cache optimization
 
 ```
 [██████████████████████████████████████████████████████] 100%
 ```
+
+## Post-Phase 11: v2 Cache Optimization
+
+- [x] v2 cache format: grouped entries with u32 file IDs (102x smaller: 1.9 MB -> 18.4 KB)
+- [x] Hash index for O(1) lookup (no table scan)
+- [x] Generation compaction (tgrep cache compact)
+- [x] v1 backward compat (auto-detects and migrates v1 .qsc files)
+- [x] Terminal dashboard (tgrep cache dashboard) - live cache + KEYSTONE telemetry
+- [x] Cache subcommands: status, precache, clear, compact, keystone-stats, dashboard
+- [x] Precache progress file for dashboard monitoring
+- [x] 58 tests pass (54 existing + 4 new v2 cache tests)
+
+#### v2 Cache Benchmark (warm cache vs rg, 26K file corpus)
+
+| Pattern | tgrep warm | rg | Speedup | Cache size |
+|---------|-----------|-----|---------|-----------|
+| struct (-i) | 64ms | 1153ms | 18x | 18.4 KB |
+| main (-i) | 72ms | 753ms | 10x | - |
+| return (-i) | 67ms | 1181ms | 18x | - |
+| terminal (-i) | 89ms | 1454ms | 16x | - |
+
+12 pattern variants (34,843 file refs): 136.4 KB total (v1 would be ~4.3 MB)
 
 ## Completed
 
