@@ -122,20 +122,25 @@ impl SegmentWriter {
         let header_size = 4 + 2 + 8 + 8 + 4 + 8 * 6; // magic(4), version(2), gen(8), hash(8), doc_count(4), 6 offsets(48) = 74
 
         // File table
-        let file_table_size: u64 = self.docs.iter().map(|d| {
-            4 + 4 + 4 + d.path.len() as u64 + 8 + 8 + 8 + 8 + 8 // id, root_id, path_len, path, byte_len, dev, ino, mtime, ctime
-        }).sum();
+        let file_table_size: u64 = self
+            .docs
+            .iter()
+            .map(|d| {
+                4 + 4 + 4 + d.path.len() as u64 + 8 + 8 + 8 + 8 + 8 // id, root_id, path_len, path, byte_len, dev, ino, mtime, ctime
+            })
+            .sum();
 
         // Path index: sorted by (root_id, path), each entry: root_id(4) + path_len(4) + path(var) + file_index(4)
-        let mut path_index_entries: Vec<(u32, &[u8], u32)> = self.docs.iter()
+        let mut path_index_entries: Vec<(u32, &[u8], u32)> = self
+            .docs
+            .iter()
             .map(|d| (d.root_id, d.path.as_slice(), d.local_id))
             .collect();
-        path_index_entries.sort_by(|a, b| {
-            a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1))
-        });
-        let path_index_size: u64 = path_index_entries.iter().map(|(_rid, path, _)| {
-            4 + 4 + path.len() as u64 + 4
-        }).sum();
+        path_index_entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        let path_index_size: u64 = path_index_entries
+            .iter()
+            .map(|(_rid, path, _)| 4 + 4 + path.len() as u64 + 4)
+            .sum();
 
         // Dictionary: gram(4) + doc_freq(4) + posting_offset(8) per entry
         let dict_size: u64 = (self.postings.len() as u64) * (4 + 4 + 8);
@@ -266,9 +271,11 @@ impl SegmentWriter {
                 if offset + 12 > block_data.len() {
                     break;
                 }
-                let max_id = u32::from_le_bytes(block_data[offset..offset+4].try_into().unwrap());
-                let enc_len = u32::from_le_bytes(block_data[offset+4..offset+8].try_into().unwrap());
-                let block_checksum = u32::from_le_bytes(block_data[offset+8..offset+12].try_into().unwrap());
+                let max_id = u32::from_le_bytes(block_data[offset..offset + 4].try_into().unwrap());
+                let enc_len =
+                    u32::from_le_bytes(block_data[offset + 4..offset + 8].try_into().unwrap());
+                let block_checksum =
+                    u32::from_le_bytes(block_data[offset + 8..offset + 12].try_into().unwrap());
 
                 block_index_buf.extend_from_slice(&max_id.to_le_bytes());
                 block_index_buf.extend_from_slice(&enc_len.to_le_bytes());
@@ -361,13 +368,21 @@ impl SegmentReader {
         // Verify footer
         let footer_start = header.footer_offset as usize;
         if footer_start + 16 > data.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "segment too short for footer"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment too short for footer",
+            ));
         }
         let footer_magic = u32::from_le_bytes(
-            data[footer_start + 8..footer_start + 12].try_into().unwrap()
+            data[footer_start + 8..footer_start + 12]
+                .try_into()
+                .unwrap(),
         );
         if footer_magic != FOOTER_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid footer magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid footer magic",
+            ));
         }
 
         Ok(Self { data, header })
@@ -380,15 +395,24 @@ impl SegmentReader {
 
     fn parse_header(data: &[u8]) -> io::Result<ParsedHeader> {
         if data.len() < 74 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "segment too short for header"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment too short for header",
+            ));
         }
         let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
         if magic != SEGMENT_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid segment magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid segment magic",
+            ));
         }
         let version = u16::from_le_bytes(data[4..6].try_into().unwrap());
         if version != FORMAT_VERSION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unsupported version {}", version)));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported version {}", version),
+            ));
         }
         Ok(ParsedHeader {
             generation: u64::from_le_bytes(data[6..14].try_into().unwrap()),
@@ -403,8 +427,12 @@ impl SegmentReader {
         })
     }
 
-    pub fn generation(&self) -> u64 { self.header.generation }
-    pub fn doc_count(&self) -> u32 { self.header.doc_count }
+    pub fn generation(&self) -> u64 {
+        self.header.generation
+    }
+    pub fn doc_count(&self) -> u32 {
+        self.header.doc_count
+    }
 
     /// Iterate over all document records in order. O(n) total.
     pub fn iter_docs(&self) -> impl Iterator<Item = ParsedDocRecord> + '_ {
@@ -414,14 +442,15 @@ impl SegmentReader {
             if offset + 12 > data.len() {
                 return None;
             }
-            let id = u32::from_le_bytes(data[offset..offset+4].try_into().unwrap());
-            let root_id = u32::from_le_bytes(data[offset+4..offset+8].try_into().unwrap());
-            let path_len = u32::from_le_bytes(data[offset+8..offset+12].try_into().unwrap()) as usize;
+            let id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            let root_id = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
+            let path_len =
+                u32::from_le_bytes(data[offset + 8..offset + 12].try_into().unwrap()) as usize;
             if offset + 12 + path_len + 40 > data.len() {
                 return None;
             }
-            let path = data[offset+12..offset+12+path_len].to_vec();
-            let rest = &data[offset+12+path_len..];
+            let path = data[offset + 12..offset + 12 + path_len].to_vec();
+            let rest = &data[offset + 12 + path_len..];
             let byte_length = u64::from_le_bytes(rest[0..8].try_into().unwrap());
             let device = u64::from_le_bytes(rest[8..16].try_into().unwrap());
             let inode = u64::from_le_bytes(rest[16..24].try_into().unwrap());
@@ -431,7 +460,14 @@ impl SegmentReader {
             offset += 12 + path_len + 40;
 
             Some(ParsedDocRecord {
-                local_id: id, root_id, path, byte_length, device, inode, mtime_ns, ctime_ns,
+                local_id: id,
+                root_id,
+                path,
+                byte_length,
+                device,
+                inode,
+                mtime_ns,
+                ctime_ns,
             })
         })
     }
@@ -474,7 +510,10 @@ impl SegmentReader {
         while lo <= hi {
             let mid = (lo + hi) / 2;
             let entry = self.read_path_index_entry(mid as u32)?;
-            let cmp = entry.0.cmp(&root_id).then_with(|| entry.1.as_slice().cmp(path));
+            let cmp = entry
+                .0
+                .cmp(&root_id)
+                .then_with(|| entry.1.as_slice().cmp(path));
             match cmp {
                 std::cmp::Ordering::Equal => return Some(entry.2),
                 std::cmp::Ordering::Less => lo = mid + 1,
@@ -493,20 +532,24 @@ impl SegmentReader {
             if offset + 8 > self.data.len() {
                 return None;
             }
-            let path_len = u32::from_le_bytes(self.data[offset+4..offset+8].try_into().unwrap()) as usize;
+            let path_len =
+                u32::from_le_bytes(self.data[offset + 4..offset + 8].try_into().unwrap()) as usize;
             offset += 8 + path_len + 4;
         }
         if offset + 8 > self.data.len() {
             return None;
         }
-        let root_id = u32::from_le_bytes(self.data[offset..offset+4].try_into().unwrap());
-        let path_len = u32::from_le_bytes(self.data[offset+4..offset+8].try_into().unwrap()) as usize;
+        let root_id = u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap());
+        let path_len =
+            u32::from_le_bytes(self.data[offset + 4..offset + 8].try_into().unwrap()) as usize;
         if offset + 8 + path_len + 4 > self.data.len() {
             return None;
         }
-        let path = self.data[offset+8..offset+8+path_len].to_vec();
+        let path = self.data[offset + 8..offset + 8 + path_len].to_vec();
         let file_index = u32::from_le_bytes(
-            self.data[offset+8+path_len..offset+8+path_len+4].try_into().unwrap()
+            self.data[offset + 8 + path_len..offset + 8 + path_len + 4]
+                .try_into()
+                .unwrap(),
         );
         Some((root_id, path, file_index))
     }
@@ -517,8 +560,8 @@ impl SegmentReader {
         let dict_start = self.header.dictionary_offset as usize;
         let dict_entry_size = 16; // gram(4) + doc_freq(4) + posting_offset(8)
         let _num_entries = self.header.doc_count; // upper bound, not exact
-        // Actually, we don't know the exact number of dictionary entries without
-        // computing (postings_offset - dictionary_offset) / entry_size.
+                                                  // Actually, we don't know the exact number of dictionary entries without
+                                                  // computing (postings_offset - dictionary_offset) / entry_size.
         let dict_end = self.header.postings_offset as usize;
         let dict_len = dict_end.saturating_sub(dict_start);
         let actual_entries = dict_len / dict_entry_size;
@@ -529,15 +572,21 @@ impl SegmentReader {
             let mid = (lo + hi) / 2;
             let entry_offset = dict_start + (mid as usize) * dict_entry_size;
             let entry_gram = u32::from_le_bytes(
-                self.data[entry_offset..entry_offset+4].try_into().unwrap()
+                self.data[entry_offset..entry_offset + 4]
+                    .try_into()
+                    .unwrap(),
             );
             match entry_gram.cmp(&gram) {
                 std::cmp::Ordering::Equal => {
                     let doc_freq = u32::from_le_bytes(
-                        self.data[entry_offset+4..entry_offset+8].try_into().unwrap()
+                        self.data[entry_offset + 4..entry_offset + 8]
+                            .try_into()
+                            .unwrap(),
                     );
                     let posting_offset = u64::from_le_bytes(
-                        self.data[entry_offset+8..entry_offset+16].try_into().unwrap()
+                        self.data[entry_offset + 8..entry_offset + 16]
+                            .try_into()
+                            .unwrap(),
                     );
                     return self.decode_postings(posting_offset, doc_freq);
                 }
@@ -554,16 +603,18 @@ impl SegmentReader {
         let mut remaining = doc_freq as usize;
 
         while remaining > 0 && offset + 12 <= self.data.len() {
-            let _max_id = u32::from_le_bytes(self.data[offset..offset+4].try_into().unwrap());
-            let enc_len = u32::from_le_bytes(self.data[offset+4..offset+8].try_into().unwrap()) as usize;
-            let _checksum = u32::from_le_bytes(self.data[offset+8..offset+12].try_into().unwrap());
+            let _max_id = u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap());
+            let enc_len =
+                u32::from_le_bytes(self.data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let _checksum =
+                u32::from_le_bytes(self.data[offset + 8..offset + 12].try_into().unwrap());
 
             if offset + 12 + enc_len > self.data.len() {
                 break;
             }
 
             // Decode varint deltas
-            let encoded = &self.data[offset+12..offset+12+enc_len];
+            let encoded = &self.data[offset + 12..offset + 12 + enc_len];
             let mut pos = 0;
             let mut prev: u32 = 0;
             let mut first = true;
@@ -604,13 +655,19 @@ impl SegmentReader {
         for i in 0..num_entries {
             let entry_offset = dict_start + i * dict_entry_size;
             let gram = u32::from_le_bytes(
-                self.data[entry_offset..entry_offset+4].try_into().unwrap()
+                self.data[entry_offset..entry_offset + 4]
+                    .try_into()
+                    .unwrap(),
             );
             let doc_freq = u32::from_le_bytes(
-                self.data[entry_offset+4..entry_offset+8].try_into().unwrap()
+                self.data[entry_offset + 4..entry_offset + 8]
+                    .try_into()
+                    .unwrap(),
             );
             let posting_offset = u64::from_le_bytes(
-                self.data[entry_offset+8..entry_offset+16].try_into().unwrap()
+                self.data[entry_offset + 8..entry_offset + 16]
+                    .try_into()
+                    .unwrap(),
             );
             let doc_ids = self.decode_postings(posting_offset, doc_freq);
             result.push((gram, doc_ids));
@@ -621,11 +678,7 @@ impl SegmentReader {
 
 // ── Manifest ────────────────────────────────────────────────────────
 
-pub fn publish_manifest(
-    state_dir: &Path,
-    segments: &[String],
-    generation: u64,
-) -> io::Result<()> {
+pub fn publish_manifest(state_dir: &Path, segments: &[String], generation: u64) -> io::Result<()> {
     let manifest = Manifest {
         generation,
         segments: segments.to_vec(),
@@ -687,14 +740,14 @@ fn simple_checksum(data: &[u8]) -> u64 {
     let mut checksum: u64 = 0;
     let mut i = 0;
     while i + 8 <= data.len() {
-        let chunk = u64::from_le_bytes(data[i..i+8].try_into().unwrap());
+        let chunk = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
         checksum ^= chunk;
         i += 8;
     }
     // Handle remaining bytes
     if i < data.len() {
         let mut last: [u8; 8] = [0; 8];
-        last[..data.len()-i].copy_from_slice(&data[i..]);
+        last[..data.len() - i].copy_from_slice(&data[i..]);
         checksum ^= u64::from_le_bytes(last);
     }
     checksum
@@ -730,15 +783,24 @@ mod tests {
         let mut writer = SegmentWriter::new(seg_path.clone(), 42);
 
         // Doc 0: "hello world" — trigrams: hel, ell, llo, lo , o w, wo, or, rl, ld
-        let grams0 = vec![0x68656C, 0x656C6C, 0x6C6C6F, 0x6C6F20, 0x6F2077, 0x20776F, 0x776F72, 0x6F726C, 0x726C64];
+        let grams0 = vec![
+            0x68656C, 0x656C6C, 0x6C6C6F, 0x6C6F20, 0x6F2077, 0x20776F, 0x776F72, 0x6F726C,
+            0x726C64,
+        ];
         writer.add_document(make_test_doc(0, 0, "src/main.c", 11), &grams0);
 
         // Doc 1: "hello there" — trigrams: hel, ell, llo, lo , o t, th, her, ere
-        let grams1 = vec![0x68656C, 0x656C6C, 0x6C6C6F, 0x6C6F20, 0x6F2074, 0x207468, 0x746865, 0x686572, 0x657265];
+        let grams1 = vec![
+            0x68656C, 0x656C6C, 0x6C6C6F, 0x6C6F20, 0x6F2074, 0x207468, 0x746865, 0x686572,
+            0x657265,
+        ];
         writer.add_document(make_test_doc(1, 0, "src/lib.c", 12), &grams1);
 
         // Doc 2: "world peace" — trigrams: wor, orl, rl, ld, d , p, pe, ea, ac, ce
-        let grams2 = vec![0x776F72, 0x6F726C, 0x726C64, 0x6C6420, 0x642070, 0x207065, 0x706561, 0x656163, 0x616365];
+        let grams2 = vec![
+            0x776F72, 0x6F726C, 0x726C64, 0x6C6420, 0x642070, 0x207065, 0x706561, 0x656163,
+            0x616365,
+        ];
         writer.add_document(make_test_doc(2, 1, "include/world.h", 11), &grams2);
 
         assert_eq!(writer.doc_count(), 3);
@@ -813,7 +875,20 @@ mod tests {
 
     #[test]
     fn test_varint_round_trip() {
-        let values = vec![0u32, 1, 127, 128, 255, 256, 16383, 16384, 65535, 65536, 1000000, u32::MAX];
+        let values = vec![
+            0u32,
+            1,
+            127,
+            128,
+            255,
+            256,
+            16383,
+            16384,
+            65535,
+            65536,
+            1000000,
+            u32::MAX,
+        ];
         for val in values {
             let mut buf = Vec::new();
             encode_varint_u32(val, &mut buf);

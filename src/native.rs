@@ -25,15 +25,8 @@ pub mod ffi {
             handle: *mut c_void,
             name: *const std::ffi::c_char,
         ) -> *mut c_void;
-        pub fn tgrep_keystone_feed_bytes(
-            stream: *mut c_void,
-            data: *const u8,
-            len: usize,
-        ) -> i32;
-        pub fn tgrep_keystone_end_document(
-            stream: *mut c_void,
-            out_doc_id: *mut u32,
-        ) -> i32;
+        pub fn tgrep_keystone_feed_bytes(stream: *mut c_void, data: *const u8, len: usize) -> i32;
+        pub fn tgrep_keystone_end_document(stream: *mut c_void, out_doc_id: *mut u32) -> i32;
         pub fn tgrep_keystone_cancel_document(stream: *mut c_void);
 
         // Trigram extraction and frequency
@@ -146,10 +139,7 @@ pub mod ffi {
             out_doc_ids: *mut u64,
             max_results: usize,
         ) -> usize;
-        pub fn tgrep_hash_index_save(
-            handle: *mut c_void,
-            path: *const std::ffi::c_char,
-        ) -> i32;
+        pub fn tgrep_hash_index_save(handle: *mut c_void, path: *const std::ffi::c_char) -> i32;
         pub fn tgrep_hash_index_load(path: *const std::ffi::c_char) -> *mut c_void;
 
         // Phase 9: Anchor seeding + batch search
@@ -171,6 +161,42 @@ pub mod ffi {
             config: *const crate::native::ParallelConfigRaw,
         ) -> usize;
         pub fn tgrep_keystone_detect_cpu_features() -> u32;
+
+        // Phase 10: QIHSE optimization DB
+        pub fn tgrep_optimization_init(
+            db: *mut crate::native::OptimizationDb,
+            max_entries: usize,
+            storage_path: *const std::ffi::c_char,
+        ) -> i32;
+        pub fn tgrep_optimization_destroy(db: *mut crate::native::OptimizationDb);
+        pub fn tgrep_optimization_record(
+            db: *mut crate::native::OptimizationDb,
+            sig: *const crate::native::DataSignature,
+            pipeline: i32,
+            dimensions: usize,
+            speedup: f64,
+            confidence: f64,
+            threads: i32,
+            backend: i32,
+        );
+        pub fn tgrep_optimization_get_config(
+            db: *mut crate::native::OptimizationDb,
+            sig: *const crate::native::DataSignature,
+            min_samples: usize,
+            out: *mut crate::native::OptimizedConfig,
+        ) -> i32;
+        pub fn tgrep_optimization_record_anchor(
+            db: *mut crate::native::OptimizationDb,
+            sig: *const crate::native::DataSignature,
+            anchor_count: usize,
+            hit_rate: f64,
+            speedup: f64,
+            workload_type: i32,
+        );
+        pub fn tgrep_optimization_save(db: *mut crate::native::OptimizationDb) -> i32;
+        pub fn tgrep_optimization_load(db: *mut crate::native::OptimizationDb) -> i32;
+        pub fn tgrep_optimization_count(db: *const crate::native::OptimizationDb) -> usize;
+        pub fn tgrep_optimization_set_learning(db: *mut crate::native::OptimizationDb, enable: i32);
     }
 }
 
@@ -192,6 +218,82 @@ pub struct ParallelConfigRaw {
 
 /// KEYSTONE_NOT_FOUND sentinel (matches C definition).
 pub const KEYSTONE_NOT_FOUND: usize = usize::MAX;
+
+// ── Phase 10: QIHSE optimization DB structs ─────────────────────────
+
+/// Data signature for optimization DB lookup.
+/// Identifies a class of data (e.g. a trigram posting list) by its
+/// statistical properties so that past performance can guide future config.
+/// NOTE: The `_pad` field ensures the struct layout matches the C side
+/// exactly, including padding between `data_type` and `entropy`.
+#[repr(C)]
+pub struct DataSignature {
+    pub data_hash: u64,
+    pub array_size: usize,
+    pub data_type: i32,
+    _pad: u32,
+    pub entropy: f64,
+    pub gap_variance: f64,
+}
+
+impl DataSignature {
+    pub fn new(
+        data_hash: u64,
+        array_size: usize,
+        data_type: i32,
+        entropy: f64,
+        gap_variance: f64,
+    ) -> Self {
+        Self {
+            data_hash,
+            array_size,
+            data_type,
+            _pad: 0,
+            entropy,
+            gap_variance,
+        }
+    }
+}
+
+/// Opaque optimization DB handle. The C side defines the actual layout
+/// (80 bytes on x86-64). We reserve enough space so the C code can write
+/// into it without overwriting adjacent Rust memory.
+#[repr(C, align(8))]
+pub struct OptimizationDb {
+    _opaque: [u8; 80],
+}
+
+/// Result of an optimized config lookup.
+#[repr(C)]
+pub struct OptimizedConfig {
+    pub found: i32,
+    pub best_pipeline: i32,
+    pub optimal_dimensions: usize,
+    pub avg_speedup: f64,
+    pub avg_confidence: f64,
+    pub samples: usize,
+    pub use_anchor_search: i32,
+    pub optimal_anchor_count: usize,
+    pub optimal_threads: i32,
+    pub optimal_backend: i32,
+}
+
+impl Default for OptimizedConfig {
+    fn default() -> Self {
+        Self {
+            found: 0,
+            best_pipeline: 0,
+            optimal_dimensions: 0,
+            avg_speedup: 0.0,
+            avg_confidence: 0.0,
+            samples: 0,
+            use_anchor_search: 0,
+            optimal_anchor_count: 0,
+            optimal_threads: 0,
+            optimal_backend: 0,
+        }
+    }
+}
 
 // ── Raw structs ─────────────────────────────────────────────────────
 
@@ -267,9 +369,11 @@ impl KeystoneIndex {
     /// Begin a streaming document for chunked ingestion.
     pub fn begin_document(&mut self, name: Option<&str>) -> Result<DocumentStream, String> {
         let name_c = name.map(|n| std::ffi::CString::new(n).unwrap());
-        let name_ptr = name_c.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null());
-        let stream =
-            unsafe { ffi::tgrep_keystone_begin_document(self.handle, name_ptr) };
+        let name_ptr = name_c
+            .as_ref()
+            .map(|s| s.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let stream = unsafe { ffi::tgrep_keystone_begin_document(self.handle, name_ptr) };
         if stream.is_null() {
             Err("failed to begin document".into())
         } else {
@@ -420,9 +524,7 @@ pub struct DocumentStream {
 impl DocumentStream {
     /// Feed bytes to the current document.
     pub fn feed(&mut self, data: &[u8]) -> Result<(), String> {
-        let rc = unsafe {
-            ffi::tgrep_keystone_feed_bytes(self.stream, data.as_ptr(), data.len())
-        };
+        let rc = unsafe { ffi::tgrep_keystone_feed_bytes(self.stream, data.as_ptr(), data.len()) };
         if rc != KS_OK {
             Err(ks_err_str(rc).into())
         } else {
@@ -516,15 +618,9 @@ impl Drop for CandidateIter {
 
 /// Atomically write data to a file (tmp + fsync + rename + dir fsync).
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
-    let c_path = std::ffi::CString::new(path.to_str().ok_or("invalid path")?)
-        .map_err(|e| e.to_string())?;
-    let rc = unsafe {
-        ffi::tgrep_qihse_atomic_write(
-            c_path.as_ptr(),
-            data.as_ptr(),
-            data.len(),
-        )
-    };
+    let c_path =
+        std::ffi::CString::new(path.to_str().ok_or("invalid path")?).map_err(|e| e.to_string())?;
+    let rc = unsafe { ffi::tgrep_qihse_atomic_write(c_path.as_ptr(), data.as_ptr(), data.len()) };
     if rc != 0 {
         Err(format!("atomic_write failed (rc={})", rc))
     } else {
@@ -544,8 +640,8 @@ pub fn file_sync(fd: i32) -> Result<(), String> {
 
 /// Open a directory and fsync it.
 pub fn dir_sync(path: &Path) -> Result<(), String> {
-    let c_path = std::ffi::CString::new(path.to_str().ok_or("invalid path")?)
-        .map_err(|e| e.to_string())?;
+    let c_path =
+        std::ffi::CString::new(path.to_str().ok_or("invalid path")?).map_err(|e| e.to_string())?;
     let rc = unsafe { ffi::tgrep_qihse_dir_sync(c_path.as_ptr()) };
     if rc != 0 {
         Err(format!("dir_sync failed (rc={})", rc))
@@ -893,7 +989,9 @@ pub fn batch_search_auto(
             items.len(),
             table_ptr,
             4, // tolerance
-            pcfg.as_ref().map(|p| p as *const _).unwrap_or(std::ptr::null()),
+            pcfg.as_ref()
+                .map(|p| p as *const _)
+                .unwrap_or(std::ptr::null()),
         );
     }
 
@@ -905,6 +1003,151 @@ pub fn batch_search_auto(
         }
     }
     results
+}
+
+// ── Phase 10: QIHSE optimization DB safe wrapper ────────────────────
+
+/// Safe RAII wrapper around the QIHSE optimization database.
+///
+/// Records per-data-signature performance and recommends the best-known
+/// configuration (pipeline, dimensions, threads, backend, anchor count)
+/// for future searches with similar data signatures.
+///
+/// Persisted as a binary file at the given storage path.
+/// Thread-safe (single mutex on the C side).
+pub struct OptimizationDatabase {
+    db: OptimizationDb,
+}
+
+impl OptimizationDatabase {
+    /// Create a new optimization DB with the given capacity and optional
+    /// storage path. If a storage path is given and the file exists, entries
+    /// are loaded automatically.
+    pub fn create(max_entries: usize, storage_path: Option<&str>) -> Result<Self, String> {
+        let mut db = OptimizationDb { _opaque: [0; 80] };
+        let c_path = storage_path.map(|s| std::ffi::CString::new(s).unwrap());
+        let path_ptr = c_path
+            .as_ref()
+            .map(|s| s.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let rc = unsafe { ffi::tgrep_optimization_init(&mut db, max_entries, path_ptr) };
+        if rc != 0 {
+            return Err(format!("optimization_init failed with code {}", rc));
+        }
+        Ok(OptimizationDatabase { db })
+    }
+
+    /// Record performance for a data signature.
+    pub fn record(
+        &mut self,
+        sig: &DataSignature,
+        pipeline: i32,
+        dimensions: usize,
+        speedup: f64,
+        confidence: f64,
+        threads: i32,
+        backend: i32,
+    ) {
+        unsafe {
+            ffi::tgrep_optimization_record(
+                &mut self.db,
+                sig,
+                pipeline,
+                dimensions,
+                speedup,
+                confidence,
+                threads,
+                backend,
+            );
+        }
+    }
+
+    /// Record anchor performance for a data signature.
+    pub fn record_anchor(
+        &mut self,
+        sig: &DataSignature,
+        anchor_count: usize,
+        hit_rate: f64,
+        speedup: f64,
+        workload_type: i32,
+    ) {
+        unsafe {
+            ffi::tgrep_optimization_record_anchor(
+                &mut self.db,
+                sig,
+                anchor_count,
+                hit_rate,
+                speedup,
+                workload_type,
+            );
+        }
+    }
+
+    /// Get the optimized config for a data signature.
+    /// Returns Some(config) if a matching entry with enough samples exists.
+    pub fn get_config(
+        &mut self,
+        sig: &DataSignature,
+        min_samples: usize,
+    ) -> Option<OptimizedConfig> {
+        let mut out = OptimizedConfig::default();
+        let found =
+            unsafe { ffi::tgrep_optimization_get_config(&mut self.db, sig, min_samples, &mut out) };
+        if found != 0 {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Save the DB to disk.
+    pub fn save(&mut self) -> Result<(), String> {
+        let rc = unsafe { ffi::tgrep_optimization_save(&mut self.db) };
+        if rc != 0 {
+            Err(format!("optimization_save failed with code {}", rc))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Load the DB from disk.
+    pub fn load(&mut self) -> Result<(), String> {
+        let rc = unsafe { ffi::tgrep_optimization_load(&mut self.db) };
+        if rc != 0 {
+            Err(format!("optimization_load failed with code {}", rc))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Number of entries in the DB.
+    pub fn count(&self) -> usize {
+        unsafe { ffi::tgrep_optimization_count(&self.db) }
+    }
+
+    /// Enable or disable learning.
+    pub fn set_learning(&mut self, enable: bool) {
+        unsafe { ffi::tgrep_optimization_set_learning(&mut self.db, if enable { 1 } else { 0 }) };
+    }
+}
+
+impl Drop for OptimizationDatabase {
+    fn drop(&mut self) {
+        unsafe { ffi::tgrep_optimization_destroy(&mut self.db) };
+    }
+}
+
+/// Compute a data signature for a trigram query.
+/// The hash is based on the trigram keys and the total posting-list size.
+pub fn compute_query_signature(grams: &[u32], total_postings: usize) -> DataSignature {
+    let mut hash: u64 = 0xCBF29CE484222325; // FNV-1a offset basis
+    for &g in grams {
+        hash ^= g as u64;
+        hash = hash.wrapping_mul(0x100000001B3); // FNV-1a prime
+    }
+    hash ^= total_postings as u64;
+    hash = hash.wrapping_mul(0x100000001B3);
+    DataSignature::new(hash, total_postings, 0, 0.0, 0.0)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1104,7 +1347,11 @@ mod tests {
         {
             let wal = Wal::create(&wal_dir).unwrap();
             let records = wal.replay().unwrap();
-            assert_eq!(records.len(), 0, "uncommitted segment should not be replayed");
+            assert_eq!(
+                records.len(),
+                0,
+                "uncommitted segment should not be replayed"
+            );
         }
 
         std::fs::remove_dir_all(&wal_dir).unwrap();
@@ -1140,7 +1387,11 @@ mod tests {
         {
             let wal = Wal::create(&wal_dir).unwrap();
             let records = wal.replay().unwrap();
-            assert_eq!(records.len(), 2, "should replay only 2 committed transactions");
+            assert_eq!(
+                records.len(),
+                2,
+                "should replay only 2 committed transactions"
+            );
             assert!(records.iter().any(|r| r.key == b"seg_00000001.tgs"));
             assert!(records.iter().any(|r| r.key == b"seg_00000002.tgs"));
             assert!(!records.iter().any(|r| r.key == b"seg_00000003.tgs"));
@@ -1259,5 +1510,109 @@ mod tests {
         let features = detect_cpu_features();
         // SSE4.2 should be present on this CPU
         assert!(features != 0, "should detect some CPU features");
+    }
+
+    // ── Phase 10: Optimization DB tests ──
+
+    #[test]
+    fn test_optimization_db_create_and_record() {
+        let mut db = OptimizationDatabase::create(100, None).expect("create opt db");
+        assert_eq!(db.count(), 0);
+        let sig = DataSignature::new(42, 1000, 0, 0.5, 0.1);
+        db.record(&sig, 1, 64, 2.5, 0.9, 4, 1);
+        assert_eq!(db.count(), 1);
+        // Not enough samples yet (min_samples=5)
+        assert!(db.get_config(&sig, 5).is_none());
+    }
+
+    #[test]
+    fn test_optimization_db_get_config_after_samples() {
+        let mut db = OptimizationDatabase::create(100, None).expect("create opt db");
+        let sig = DataSignature::new(99, 5000, 0, 0.7, 0.2);
+        // Record 6 samples
+        for _ in 0..6 {
+            db.record(&sig, 2, 128, 3.0, 0.95, 4, 1);
+        }
+        let cfg = db.get_config(&sig, 5).expect("should have config");
+        assert_eq!(cfg.found, 1);
+        assert_eq!(cfg.best_pipeline, 2);
+        assert_eq!(cfg.optimal_dimensions, 128);
+        assert!(cfg.avg_speedup > 0.0);
+        assert_eq!(cfg.optimal_threads, 4);
+        assert_eq!(cfg.optimal_backend, 1);
+    }
+
+    #[test]
+    fn test_optimization_db_persistence() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let tmp = std::env::temp_dir().join(format!(
+            "tgrep_opt_test_{}_{:?}.qdb",
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        {
+            let mut db = OptimizationDatabase::create(100, Some(tmp.to_str().unwrap()))
+                .expect("create opt db with path");
+            let sig = DataSignature::new(123, 10000, 0, 0.8, 0.3);
+            for _ in 0..6 {
+                db.record(&sig, 1, 256, 4.0, 0.92, 8, 2);
+            }
+            assert_eq!(db.count(), 1, "should have 1 entry before save");
+            db.save().expect("save");
+            assert!(
+                std::fs::exists(&tmp).unwrap_or(false),
+                "file should exist after save"
+            );
+            let file_size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+            assert!(
+                file_size > 0,
+                "file should not be empty, size={}",
+                file_size
+            );
+        }
+        // Load into a new DB
+        let mut db2 =
+            OptimizationDatabase::create(100, Some(tmp.to_str().unwrap())).expect("load opt db");
+        assert_eq!(db2.count(), 1, "should have 1 entry after load");
+        let sig = DataSignature::new(123, 10000, 0, 0.8, 0.3);
+        let cfg = db2
+            .get_config(&sig, 5)
+            .expect("should have config after load");
+        assert_eq!(cfg.found, 1);
+        assert_eq!(cfg.best_pipeline, 1);
+        assert_eq!(cfg.optimal_dimensions, 256);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_optimization_db_anchor_recording() {
+        let mut db = OptimizationDatabase::create(100, None).expect("create opt db");
+        let sig = DataSignature::new(55, 2000, 0, 0.6, 0.15);
+        db.record_anchor(&sig, 32, 0.85, 1.5, 0);
+        assert_eq!(db.count(), 1);
+        // record_anchor increments samples, but we need 5 for get_config
+        for _ in 0..5 {
+            db.record_anchor(&sig, 32, 0.85, 1.5, 0);
+        }
+        let cfg = db.get_config(&sig, 5).expect("should have config");
+        assert_eq!(cfg.use_anchor_search, 1);
+        assert_eq!(cfg.optimal_anchor_count, 32);
+    }
+
+    #[test]
+    fn test_compute_query_signature() {
+        let grams = vec![0x68656C, 0x656C6C, 0x6C6C6F]; // "hel", "ell", "llo"
+        let sig = compute_query_signature(&grams, 5000);
+        assert_eq!(sig.array_size, 5000);
+        assert_ne!(sig.data_hash, 0);
+        // Same input should produce same hash
+        let sig2 = compute_query_signature(&grams, 5000);
+        assert_eq!(sig.data_hash, sig2.data_hash);
+        // Different input should produce different hash
+        let sig3 = compute_query_signature(&grams, 6000);
+        assert_ne!(sig.data_hash, sig3.data_hash);
     }
 }

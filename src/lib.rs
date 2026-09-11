@@ -1,5 +1,5 @@
-pub mod search;
-pub mod index;
 pub mod build;
-pub mod store;
+pub mod index;
 pub mod native;
+pub mod search;
+pub mod store;

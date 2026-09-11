@@ -84,11 +84,7 @@ fn run_benchmark(
     let t_count = count_matches(&t_out);
 
     let mut rg_cmd = Command::new("rg");
-    rg_cmd
-        .arg("--threads=4")
-        .arg("-l")
-        .arg(pattern)
-        .arg(path);
+    rg_cmd.arg("--threads=4").arg("-l").arg(pattern).arg(path);
     let (r_time, r_out, _r_err, _r_code) = run_command(&mut rg_cmd);
     let r_count = count_matches(&r_out);
 
@@ -161,17 +157,10 @@ fn run_benchmark(
 
         // Run rg
         let mut rg_cmd = Command::new("rg");
-        rg_cmd
-            .arg("--threads=4")
-            .arg("-l")
-            .arg(pattern)
-            .arg(path);
+        rg_cmd.arg("--threads=4").arg("-l").arg(pattern).arg(path);
         let (r_time, _, _, _) = run_command(&mut rg_cmd);
 
-        eprintln!(
-            "  trial {}: tgrep={}ms rg={}ms",
-            trial, t_time, r_time
-        );
+        eprintln!("  trial {}: tgrep={}ms rg={}ms", trial, t_time, r_time);
 
         results.push(BenchmarkResult {
             tool: "tgrep".into(),
@@ -214,8 +203,14 @@ fn compute_stats(times: &[u64]) -> (u64, u64, u64, u64, f64) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <pattern> <path> [trials] [-- extra-args...]", args[0]);
-        eprintln!("Example: {} \"struct\" /rpool/scratch/tgrep_corpus 10", args[0]);
+        eprintln!(
+            "Usage: {} <pattern> <path> [trials] [-- extra-args...]",
+            args[0]
+        );
+        eprintln!(
+            "Example: {} \"struct\" /rpool/scratch/tgrep_corpus 10",
+            args[0]
+        );
         eprintln!("  Pass --indexed-only as an extra arg to benchmark indexed-only mode.");
         std::process::exit(2);
     }
@@ -269,7 +264,15 @@ fn main() {
     }
     eprintln!();
 
-    let results = run_benchmark(pattern, path, trials, &tgrep_bin, &state_dir, &extra_args, indexed_only);
+    let results = run_benchmark(
+        pattern,
+        path,
+        trials,
+        &tgrep_bin,
+        &state_dir,
+        &extra_args,
+        indexed_only,
+    );
 
     // Split results by tool
     let mut tgrep_times: Vec<u64> = Vec::new();
@@ -287,9 +290,18 @@ fn main() {
 
     eprintln!();
     eprintln!("=== Summary: '{}'{} ===", pattern, label);
-    eprintln!("  {:<10} {:>8} {:>8} {:>8} {:>8} {:>8}", "tool", "min", "median", "p95", "max", "mean");
-    eprintln!("  {:<10} {:>7}ms {:>7}ms {:>7}ms {:>7}ms {:>7.1}ms", "tgrep", t_min, t_med, t_p95, t_max, t_mean);
-    eprintln!("  {:<10} {:>7}ms {:>7}ms {:>7}ms {:>7}ms {:>7.1}ms", "rg", r_min, r_med, r_p95, r_max, r_mean);
+    eprintln!(
+        "  {:<10} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "tool", "min", "median", "p95", "max", "mean"
+    );
+    eprintln!(
+        "  {:<10} {:>7}ms {:>7}ms {:>7}ms {:>7}ms {:>7.1}ms",
+        "tgrep", t_min, t_med, t_p95, t_max, t_mean
+    );
+    eprintln!(
+        "  {:<10} {:>7}ms {:>7}ms {:>7}ms {:>7}ms {:>7.1}ms",
+        "rg", r_min, r_med, r_p95, r_max, r_mean
+    );
 
     if r_med > 0 {
         let speedup = t_med as f64 / r_med as f64;

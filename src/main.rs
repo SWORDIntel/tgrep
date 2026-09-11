@@ -4,7 +4,10 @@ use tgrep::index::IndexCommand;
 use tgrep::search::SearchConfig;
 
 #[derive(Parser)]
-#[command(name = "tgrep", about = "Persistent trigram index for repeated searches")]
+#[command(
+    name = "tgrep",
+    about = "Persistent trigram index for repeated searches"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -109,9 +112,17 @@ fn main() {
     match cli.command {
         Some(Commands::Index { action }) => {
             let cmd = match action {
-                IndexSubcommands::Build { roots, threads, max_memory, io_limit } => {
-                    IndexCommand::Build { roots, threads, max_memory, io_limit }
-                }
+                IndexSubcommands::Build {
+                    roots,
+                    threads,
+                    max_memory,
+                    io_limit,
+                } => IndexCommand::Build {
+                    roots,
+                    threads,
+                    max_memory,
+                    io_limit,
+                },
                 IndexSubcommands::Status => IndexCommand::Status,
                 IndexSubcommands::Recover => IndexCommand::Recover,
                 IndexSubcommands::Pause => IndexCommand::Pause,
@@ -129,7 +140,11 @@ fn main() {
             }
             let config = SearchConfig {
                 pattern: cli.pattern.unwrap(),
-                paths: cli.paths.iter().map(|s| std::path::PathBuf::from(s)).collect(),
+                paths: cli
+                    .paths
+                    .iter()
+                    .map(|s| std::path::PathBuf::from(s))
+                    .collect(),
                 fixed_strings: cli.fixed_strings,
                 smart_case: cli.smart_case,
                 ignore_case: cli.ignore_case,

@@ -128,7 +128,12 @@ pub enum QueryPlan {
 ///
 /// If `case_insensitive` is true, we always use streaming because the
 /// trigram index is case-sensitive.
-pub fn plan_query(pattern: &str, fixed: bool, case_insensitive: bool, word_regexp: bool) -> QueryPlan {
+pub fn plan_query(
+    pattern: &str,
+    fixed: bool,
+    case_insensitive: bool,
+    word_regexp: bool,
+) -> QueryPlan {
     if case_insensitive {
         return QueryPlan::Streaming;
     }
@@ -145,7 +150,9 @@ pub fn plan_query(pattern: &str, fixed: bool, case_insensitive: bool, word_regex
     // Hash index fast path: if --word-regexp is set and the pattern is a
     // single word (all word characters), use the hash index for O(1) lookup.
     if word_regexp && is_single_word(&literal) && literal.len() >= 2 {
-        return QueryPlan::HashIndex { token: literal.into_bytes() };
+        return QueryPlan::HashIndex {
+            token: literal.into_bytes(),
+        };
     }
 
     if literal.len() < 3 {
@@ -229,9 +236,7 @@ pub fn extract_unique_trigrams(data: &[u8]) -> Vec<u32> {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
     for window in data.windows(3) {
-        let gram = ((window[0] as u32) << 16)
-            | ((window[1] as u32) << 8)
-            | (window[2] as u32);
+        let gram = ((window[0] as u32) << 16) | ((window[1] as u32) << 8) | (window[2] as u32);
         if seen.insert(gram) {
             result.push(gram);
         }
@@ -282,30 +287,100 @@ pub fn run_search(config: SearchConfig) {
 
     // Determine if the search is effectively case-insensitive.
     // Smart-case: case-insensitive when pattern is all lowercase ASCII.
-    let case_insensitive = ignore_case
-        || (smart_case && is_all_lowercase_ascii(&pattern));
+    let case_insensitive = ignore_case || (smart_case && is_all_lowercase_ascii(&pattern));
 
     // Plan the query
-    let plan = plan_query(&pattern, config.fixed_strings, case_insensitive, config.word_regexp);
+    let plan = plan_query(
+        &pattern,
+        config.fixed_strings,
+        case_insensitive,
+        config.word_regexp,
+    );
+
+    // Load the manifest and open segments
+    let state_dir = default_state_dir();
+    let manifest = store::load_manifest(&state_dir);
+    let segments_dir = state_dir.join("segments");
+
+    let readers: Vec<SegmentReader> = match &manifest {
+        Some(m) => m
+            .segments
+            .iter()
+            .filter_map(|name| {
+                let path = segments_dir.join(name);
+                SegmentReader::open(&path).ok()
+            })
+            .collect(),
+        None => Vec::new(),
+    };
 
     if config.explain {
         let features = crate::native::detect_cpu_features();
         let mut feature_parts = Vec::new();
-        if features & 0x01 != 0 { feature_parts.push("SSE4.2"); }
-        if features & 0x02 != 0 { feature_parts.push("AVX2"); }
-        if features & 0x04 != 0 { feature_parts.push("AVX512"); }
-        let feature_str = if feature_parts.is_empty() { "scalar".to_string() } else { feature_parts.join(" ") };
+        if features & 0x01 != 0 {
+            feature_parts.push("SSE4.2");
+        }
+        if features & 0x02 != 0 {
+            feature_parts.push("AVX2");
+        }
+        if features & 0x04 != 0 {
+            feature_parts.push("AVX512");
+        }
+        let feature_str = if feature_parts.is_empty() {
+            "scalar".to_string()
+        } else {
+            feature_parts.join(" ")
+        };
         eprintln!("tgrep: cpu_features = {}", feature_str);
-        eprintln!("tgrep: backend = auto ({} preferred)", if features & 0x01 != 0 { "SSE4.2" } else { "scalar" });
+        eprintln!(
+            "tgrep: backend = auto ({} preferred)",
+            if features & 0x01 != 0 {
+                "SSE4.2"
+            } else {
+                "scalar"
+            }
+        );
         match &plan {
             QueryPlan::Indexed { grams } => {
                 eprintln!("tgrep: plan = indexed ({} trigrams)", grams.len());
                 for g in grams {
                     eprintln!("  {:06x}", g);
                 }
+                // Phase 10: Show optimization DB status in explain mode
+                let opt_db_path = state_dir.join("optimization.qdb");
+                let mut opt_db = crate::native::OptimizationDatabase::create(
+                    1000,
+                    Some(opt_db_path.to_str().unwrap_or("")),
+                )
+                .unwrap_or_else(|_| {
+                    crate::native::OptimizationDatabase::create(1000, None).unwrap()
+                });
+                let total_postings: usize = readers
+                    .iter()
+                    .map(|r| {
+                        grams
+                            .iter()
+                            .map(|g| r.read_postings(*g).len())
+                            .sum::<usize>()
+                    })
+                    .sum();
+                let sig = crate::native::compute_query_signature(grams, total_postings);
+                if let Some(cfg) = opt_db.get_config(&sig, 5) {
+                    eprintln!("tgrep: optimization = threads={} backend={} pipeline={} dims={} speedup={:.2}x samples={}",
+                        cfg.optimal_threads, cfg.optimal_backend, cfg.best_pipeline,
+                        cfg.optimal_dimensions, cfg.avg_speedup, cfg.samples);
+                } else {
+                    eprintln!(
+                        "tgrep: optimization = no recommendation yet (learning, {} entries)",
+                        opt_db.count()
+                    );
+                }
             }
             QueryPlan::HashIndex { token } => {
-                eprintln!("tgrep: plan = hash_index (token: {})", String::from_utf8_lossy(token));
+                eprintln!(
+                    "tgrep: plan = hash_index (token: {})",
+                    String::from_utf8_lossy(token)
+                );
             }
             QueryPlan::Streaming => {
                 if case_insensitive {
@@ -335,22 +410,47 @@ pub fn run_search(config: SearchConfig) {
         }
     };
 
-    // Load the manifest and open segments
-    let state_dir = default_state_dir();
-    let manifest = store::load_manifest(&state_dir);
-    let segments_dir = state_dir.join("segments");
+    // Phase 10: Initialize the QIHSE optimization DB.
+    // Records per-query performance and recommends optimal thread/backend
+    // config for future searches with similar data signatures.
+    let opt_db_path = state_dir.join("optimization.qdb");
+    // Ensure the state directory exists so save() can write the file.
+    let _ = std::fs::create_dir_all(&state_dir);
+    let mut opt_db =
+        crate::native::OptimizationDatabase::create(1000, Some(opt_db_path.to_str().unwrap_or("")))
+            .unwrap_or_else(|e| {
+                if config.explain {
+                    eprintln!("tgrep: warning: optimization DB init failed: {}", e);
+                }
+                crate::native::OptimizationDatabase::create(1000, None).unwrap()
+            });
 
-    let readers: Vec<SegmentReader> = match &manifest {
-        Some(m) => m
-            .segments
+    // Phase 10: Consult the optimization DB for recommended config.
+    let opt_config = if let QueryPlan::Indexed { grams } = &plan {
+        let total_postings: usize = readers
             .iter()
-            .filter_map(|name| {
-                let path = segments_dir.join(name);
-                SegmentReader::open(&path).ok()
+            .map(|r| {
+                grams
+                    .iter()
+                    .map(|g| r.read_postings(*g).len())
+                    .sum::<usize>()
             })
-            .collect(),
-        None => Vec::new(),
+            .sum();
+        let sig = crate::native::compute_query_signature(grams, total_postings);
+        opt_db.get_config(&sig, 5)
+    } else {
+        None
     };
+
+    if config.explain {
+        if let Some(ref cfg) = opt_config {
+            eprintln!("tgrep: optimization = threads={} backend={} pipeline={} dims={} speedup={:.2}x samples={}",
+                cfg.optimal_threads, cfg.optimal_backend, cfg.best_pipeline,
+                cfg.optimal_dimensions, cfg.avg_speedup, cfg.samples);
+        } else {
+            eprintln!("tgrep: optimization = no recommendation yet (learning)");
+        }
+    }
 
     // Determine which roots were indexed (stored in build.json).
     let indexed_roots: Vec<String> = {
@@ -359,22 +459,18 @@ pub fn run_search(config: SearchConfig) {
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .and_then(|v| {
-                v.get("roots")
-                    .and_then(|r| r.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect()
-                    })
+                v.get("roots").and_then(|r| r.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
             })
             .unwrap_or_default()
     };
 
     // Compute the candidate set from indexed segments
     let indexed_candidates: Vec<(PathBuf, u64)> = match &plan {
-        QueryPlan::Indexed { grams } => {
-            intersect_postings(&readers, grams, &indexed_roots)
-        }
+        QueryPlan::Indexed { grams } => intersect_postings(&readers, grams, &indexed_roots),
         QueryPlan::HashIndex { token } => {
             hash_index_candidates(&readers, &segments_dir, token, &indexed_roots)
         }
@@ -386,7 +482,8 @@ pub fn run_search(config: SearchConfig) {
     // don't contain all trigrams, so they can't match the pattern.
     // Only needed for indexed plan with streaming fallback.
     let need_indexed_paths = !config.indexed_only
-        && (matches!(plan, QueryPlan::Indexed { .. }) || matches!(plan, QueryPlan::HashIndex { .. }))
+        && (matches!(plan, QueryPlan::Indexed { .. })
+            || matches!(plan, QueryPlan::HashIndex { .. }))
         && !readers.is_empty()
         && !indexed_roots.is_empty();
 
@@ -409,7 +506,12 @@ pub fn run_search(config: SearchConfig) {
             QueryPlan::Streaming => collect_all_files(&paths, walk_hidden, &globs, threads),
             QueryPlan::Indexed { .. } | QueryPlan::HashIndex { .. } => {
                 collect_unindexed_files_fast(
-                    &paths, &indexed_paths, walk_hidden, &globs, threads, &state_dir,
+                    &paths,
+                    &indexed_paths,
+                    walk_hidden,
+                    &globs,
+                    threads,
+                    &state_dir,
                 )
             }
         }
@@ -419,9 +521,7 @@ pub fn run_search(config: SearchConfig) {
     // This is needed when searching a subdirectory of an indexed root.
     let indexed_candidates: Vec<(PathBuf, u64)> = indexed_candidates
         .into_iter()
-        .filter(|(p, _)| {
-            paths.iter().any(|search_path| p.starts_with(search_path))
-        })
+        .filter(|(p, _)| paths.iter().any(|search_path| p.starts_with(search_path)))
         .collect();
 
     // Combine all files to search: indexed candidates first, then stream files
@@ -436,11 +536,16 @@ pub fn run_search(config: SearchConfig) {
         for f in &all_files {
             println!("{}", f.display());
         }
-        eprintln!("Total: {} files ({} indexed candidates)", all_files.len(), indexed_candidates.len());
+        eprintln!(
+            "Total: {} files ({} indexed candidates)",
+            all_files.len(),
+            indexed_candidates.len()
+        );
         exit(0);
     }
 
     // Parallel search
+    let search_start = std::time::Instant::now();
     let match_found = parallel_search(
         &all_files,
         &matcher,
@@ -450,6 +555,52 @@ pub fn run_search(config: SearchConfig) {
         config.quiet,
         threads,
     );
+    let search_elapsed = search_start.elapsed();
+
+    // Phase 10: Record performance for this query signature.
+    // Only for indexed queries where we have a meaningful data signature.
+    if let QueryPlan::Indexed { grams } = &plan {
+        let total_postings: usize = readers
+            .iter()
+            .map(|r| {
+                grams
+                    .iter()
+                    .map(|g| r.read_postings(*g).len())
+                    .sum::<usize>()
+            })
+            .sum();
+        let sig = crate::native::compute_query_signature(grams, total_postings);
+        // Speedup vs baseline (rough heuristic: indexed search vs full scan).
+        // Confidence is 1.0 for exact-match verification.
+        let speedup = if !all_files.is_empty() && !indexed_candidates.is_empty() {
+            (all_files.len() as f64) / (indexed_candidates.len().max(1) as f64)
+        } else {
+            1.0
+        };
+        let backend = if crate::native::detect_cpu_features() & 0x01 != 0 {
+            1
+        } else {
+            0
+        };
+        opt_db.record(
+            &sig,
+            1, // pipeline: balanced
+            grams.len(),
+            speedup,
+            1.0, // confidence
+            threads as i32,
+            backend,
+        );
+        // Save the DB so future searches benefit
+        let _ = opt_db.save();
+    }
+
+    if config.explain {
+        eprintln!(
+            "tgrep: search took {:.3}ms",
+            search_elapsed.as_secs_f64() * 1000.0
+        );
+    }
 
     // Match ripgrep exit codes: 0 = match found, 1 = no match, 2 = error
     if match_found {
@@ -490,7 +641,15 @@ fn parallel_search(
 
     if nthreads == 1 {
         // Single-threaded fast path
-        let results = search_chunk(files, matcher, line_number, files_with_matches, count, quiet, found_ref);
+        let results = search_chunk(
+            files,
+            matcher,
+            line_number,
+            files_with_matches,
+            count,
+            quiet,
+            found_ref,
+        );
         output_results(&results, files_with_matches, count, quiet);
         return found.load(std::sync::atomic::Ordering::Relaxed);
     }
@@ -504,7 +663,15 @@ fn parallel_search(
             .iter()
             .map(|chunk| {
                 s.spawn(move || {
-                    search_chunk(chunk, matcher, line_number, files_with_matches, count, quiet, found_ref)
+                    search_chunk(
+                        chunk,
+                        matcher,
+                        line_number,
+                        files_with_matches,
+                        count,
+                        quiet,
+                        found_ref,
+                    )
                 })
             })
             .collect();
@@ -580,8 +747,7 @@ fn search_chunk(
             }
         } else {
             // Use Standard printer writing to a buffer
-            let mut printer = grep_printer::StandardBuilder::new()
-                .build_no_color(&mut output_buf);
+            let mut printer = grep_printer::StandardBuilder::new().build_no_color(&mut output_buf);
 
             let mut sink = printer.sink_with_path(matcher, path);
             if searcher.search_path(matcher, path, &mut sink).is_ok() {
@@ -638,10 +804,7 @@ fn intersect_postings(
 
     for reader in readers {
         // Get posting lists for all grams in this segment
-        let posting_lists: Vec<Vec<u32>> = grams
-            .iter()
-            .map(|&g| reader.read_postings(g))
-            .collect();
+        let posting_lists: Vec<Vec<u32>> = grams.iter().map(|&g| reader.read_postings(g)).collect();
 
         // If any trigram has zero postings in this segment, no candidates here
         if posting_lists.iter().any(|p| p.is_empty()) {
@@ -686,48 +849,90 @@ fn hash_index_candidates(
         return Vec::new();
     }
 
-    let mut candidates: Vec<(PathBuf, u64)> = Vec::new();
+    // Parallel load + search across segments to avoid serial I/O bottleneck.
+    // Each segment's .thi file is loaded and searched independently.
+    use std::sync::Mutex;
+    use std::thread;
 
-    for reader in readers {
-        // Hash index sidecar path: seg_XXXXXXXX.thi next to seg_XXXXXXXX.tgs
-        let seg_name = reader.segment_name();
-        let hash_path = segments_dir.join(format!("{}.thi", seg_name));
+    let token_owned = token.to_vec();
+    let segments_dir = segments_dir.to_path_buf();
+    let indexed_roots: Vec<String> = indexed_roots.to_vec();
 
-        if !hash_path.exists() {
-            // No hash index for this segment — fall back to trigram path
-            // by returning empty (caller will stream-scan if needed).
-            continue;
-        }
-
-        let hash_index = match crate::native::HashIndex::load(&hash_path) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("tgrep: warning: hash index load failed for {}: {}", seg_name, e);
-                continue;
-            }
-        };
-
-        let doc_ids = hash_index.search_all(token);
-        if doc_ids.is_empty() {
-            continue;
-        }
-
-        let docs = reader.get_docs_bulk(&doc_ids);
-        for doc in docs.into_iter().flatten() {
-            let root_idx = doc.root_id as usize;
-            if root_idx < indexed_roots.len() {
-                let root = PathBuf::from(&indexed_roots[root_idx]);
-                let rel = String::from_utf8_lossy(&doc.path);
-                let full_path = root.join(rel.as_ref());
-                candidates.push((full_path, doc.byte_length));
+    // Collect (reader_index, hash_path) pairs that have hash index sidecars
+    let work: Vec<(usize, std::path::PathBuf)> = readers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, reader)| {
+            let seg_name = reader.segment_name();
+            let hash_path = segments_dir.join(format!("{}.thi", seg_name));
+            if hash_path.exists() {
+                Some((i, hash_path))
             } else {
-                let path = PathBuf::from(String::from_utf8_lossy(&doc.path).to_string());
-                candidates.push((path, doc.byte_length));
+                None
             }
-        }
+        })
+        .collect();
+
+    if work.is_empty() {
+        return Vec::new();
     }
 
-    candidates
+    // Chunk work across threads (4 threads, like the search itself)
+    let num_threads = 4usize.min(work.len());
+    let chunk_size = (work.len() + num_threads - 1) / num_threads;
+    let chunks: Vec<Vec<(usize, std::path::PathBuf)>> =
+        work.chunks(chunk_size).map(|c| c.to_vec()).collect();
+
+    let results = Mutex::new(Vec::new());
+    let errors = Mutex::new(Vec::new());
+
+    thread::scope(|s| {
+        for chunk in &chunks {
+            let results = &results;
+            let errors = &errors;
+            let readers = readers;
+            let indexed_roots = &indexed_roots;
+            let token_owned = &token_owned;
+            s.spawn(move || {
+                let mut local = Vec::new();
+                for (reader_idx, hash_path) in chunk {
+                    let hash_index = match crate::native::HashIndex::load(hash_path) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            errors.lock().unwrap().push(e);
+                            continue;
+                        }
+                    };
+                    let doc_ids = hash_index.search_all(token_owned);
+                    if doc_ids.is_empty() {
+                        continue;
+                    }
+                    let reader = &readers[*reader_idx];
+                    let docs = reader.get_docs_bulk(&doc_ids);
+                    for doc in docs.into_iter().flatten() {
+                        let root_idx = doc.root_id as usize;
+                        if root_idx < indexed_roots.len() {
+                            let root = PathBuf::from(&indexed_roots[root_idx]);
+                            let rel = String::from_utf8_lossy(&doc.path);
+                            let full_path = root.join(rel.as_ref());
+                            local.push((full_path, doc.byte_length));
+                        } else {
+                            let path =
+                                PathBuf::from(String::from_utf8_lossy(&doc.path).to_string());
+                            local.push((path, doc.byte_length));
+                        }
+                    }
+                }
+                results.lock().unwrap().extend(local);
+            });
+        }
+    });
+
+    for e in errors.into_inner().unwrap() {
+        eprintln!("tgrep: warning: hash index load failed: {}", e);
+    }
+
+    results.into_inner().unwrap()
 }
 
 /// Intersect multiple sorted vectors, returning the intersection.
@@ -851,9 +1056,7 @@ fn metadata_matches(path: &Path, cached: &CachedFileMeta) -> bool {
         Ok(meta) => {
             use std::os::unix::fs::MetadataExt;
             let mtime_ns = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
-            meta.len() == cached.size
-                && meta.ino() == cached.inode
-                && mtime_ns == cached.mtime_ns
+            meta.len() == cached.size && meta.ino() == cached.inode && mtime_ns == cached.mtime_ns
         }
         Err(_) => false,
     }
@@ -876,9 +1079,9 @@ fn try_load_file_cache(
     // Check that the cache roots overlap with the search paths
     let cache_roots: Vec<PathBuf> = cache.roots.iter().map(PathBuf::from).collect();
     let search_matches_cache = search_paths.iter().any(|sp| {
-        cache_roots.iter().any(|cr| {
-            sp == cr || sp.starts_with(cr) || cr.starts_with(sp)
-        })
+        cache_roots
+            .iter()
+            .any(|cr| sp == cr || sp.starts_with(cr) || cr.starts_with(sp))
     });
     if !search_matches_cache {
         return None;
@@ -886,18 +1089,21 @@ fn try_load_file_cache(
 
     // If search paths are subdirectories of cache roots, filter the cache
     // to only include files under the search paths.
-    let filtered: Vec<&CachedFileMeta> = if search_paths.len() == 1
-        && cache_roots.contains(&search_paths[0])
-    {
-        // Exact root match — use all cached files
-        cache.files.iter().collect()
-    } else {
-        // Filter to files under any search path
-        cache.files.iter().filter(|f| {
-            let p = PathBuf::from(&f.path);
-            search_paths.iter().any(|sp| p.starts_with(sp) || p == *sp)
-        }).collect()
-    };
+    let filtered: Vec<&CachedFileMeta> =
+        if search_paths.len() == 1 && cache_roots.contains(&search_paths[0]) {
+            // Exact root match — use all cached files
+            cache.files.iter().collect()
+        } else {
+            // Filter to files under any search path
+            cache
+                .files
+                .iter()
+                .filter(|f| {
+                    let p = PathBuf::from(&f.path);
+                    search_paths.iter().any(|sp| p.starts_with(sp) || p == *sp)
+                })
+                .collect()
+        };
 
     if filtered.is_empty() {
         return None;

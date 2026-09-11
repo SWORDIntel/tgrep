@@ -12,7 +12,7 @@ use crate::store::{self, DocRecord, SegmentWriter};
 /// Metadata for a single file, stored in the file list cache.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct CachedFileMeta {
-    pub path: String,       // absolute path
+    pub path: String, // absolute path
     pub size: u64,
     pub mtime_ns: i64,
     pub inode: u64,
@@ -26,15 +26,12 @@ pub struct CachedFileMeta {
 pub struct FileListCache {
     pub roots: Vec<String>,
     pub files: Vec<CachedFileMeta>,
-    pub built_at: u64,  // unix timestamp
-    pub hidden: bool,   // whether hidden files were included
+    pub built_at: u64, // unix timestamp
+    pub hidden: bool,  // whether hidden files were included
 }
 
 /// Save the file list cache to the state directory.
-pub fn save_file_list_cache(
-    state_dir: &Path,
-    cache: &FileListCache,
-) -> std::io::Result<()> {
+pub fn save_file_list_cache(state_dir: &Path, cache: &FileListCache) -> std::io::Result<()> {
     let json = serde_json::to_string(cache)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let path = state_dir.join("file_list_cache.json");
@@ -197,7 +194,10 @@ impl WriterLock {
                 "another build/compaction is running (writer.lock held)",
             ));
         }
-        Ok(WriterLock { _file: file, _path: lock_path })
+        Ok(WriterLock {
+            _file: file,
+            _path: lock_path,
+        })
     }
 }
 
@@ -250,12 +250,7 @@ fn write_build_state(state_dir: &Path, bs: &BuildState) -> std::io::Result<()> {
 
 // ── Build pipeline ───────────────────────────────────────────────────
 
-pub fn start_build(
-    roots: &[String],
-    threads: usize,
-    max_memory: &str,
-    io_limit: &str,
-) {
+pub fn start_build(roots: &[String], threads: usize, max_memory: &str, io_limit: &str) {
     let state_dir = default_state_dir();
     if let Err(e) = run_build(roots, threads, max_memory, io_limit, &state_dir) {
         eprintln!("tgrep: build failed: {}", e);
@@ -296,8 +291,8 @@ fn run_build(
     }
 
     // Open WAL for crash-safe segment publication
-    let wal = Wal::create(&wal_dir)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let wal =
+        Wal::create(&wal_dir).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let mut txn_id: u64 = 1;
 
     let started_at = now_unix_secs();
@@ -319,8 +314,8 @@ fn run_build(
     let mut generation: u64 = 1;
     let mut all_segment_names: Vec<String> = Vec::new();
 
-    let mut keystone = KeystoneIndex::new(4096)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut keystone =
+        KeystoneIndex::new(4096).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     let mut hash_index = native::HashIndex::create(4096)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -386,7 +381,8 @@ fn run_build(
             };
 
             // Get relative path from root
-            let rel_path = path.strip_prefix(&root_path)
+            let rel_path = path
+                .strip_prefix(&root_path)
                 .unwrap_or(path)
                 .to_string_lossy()
                 .to_string();
@@ -481,7 +477,9 @@ fn run_build(
                         // Log the segment in the WAL
                         let metadata = format!(
                             "{{\"generation\":{},\"files\":{},\"bytes\":{}}}",
-                            generation, doc_records.len(), batch_source_bytes
+                            generation,
+                            doc_records.len(),
+                            batch_source_bytes
                         );
                         wal.log_segment(txn_id, &seg_name, metadata.as_bytes());
 
@@ -539,7 +537,9 @@ fn run_build(
             Ok(seg_name) => {
                 let metadata = format!(
                     "{{\"generation\":{},\"files\":{},\"bytes\":{}}}",
-                    generation, doc_records.len(), batch_source_bytes
+                    generation,
+                    doc_records.len(),
+                    batch_source_bytes
                 );
                 wal.log_segment(txn_id, &seg_name, metadata.as_bytes());
                 all_segment_names.push(seg_name);
@@ -596,14 +596,17 @@ fn flush_batch(
     generation: u64,
     state_dir: &Path,
 ) -> std::io::Result<String> {
-    keystone.finalize()
+    keystone
+        .finalize()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // Collect postings from KEYSTONE visitor
     let postings = collect_postings(keystone);
 
     // Build segment
-    let seg_path = state_dir.join("tmp").join(format!("seg_{:08}.tgs", generation));
+    let seg_path = state_dir
+        .join("tmp")
+        .join(format!("seg_{:08}.tgs", generation));
     let mut writer = SegmentWriter::new(seg_path, generation);
     for doc in doc_records {
         writer.add_doc_record(doc.clone());
@@ -627,8 +630,8 @@ fn flush_batch(
 
     // Reset KEYSTONE for next batch
     // (We create a new index since KEYSTONE doesn't have a reset API)
-    *keystone = KeystoneIndex::new(4096)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    *keystone =
+        KeystoneIndex::new(4096).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // Reset hash index for next batch
     *hash_index = native::HashIndex::create(4096)
@@ -639,11 +642,10 @@ fn flush_batch(
 
 /// Collect all postings from KEYSTONE via the visitor trampoline.
 fn collect_postings(idx: &KeystoneIndex) -> BTreeMap<u32, Vec<u32>> {
-    idx.collect_postings()
-        .unwrap_or_else(|e| {
-            eprintln!("tgrep: warning: posting collection failed: {}", e);
-            BTreeMap::new()
-        })
+    idx.collect_postings().unwrap_or_else(|e| {
+        eprintln!("tgrep: warning: posting collection failed: {}", e);
+        BTreeMap::new()
+    })
 }
 
 /// Tokenize file content and add unique tokens to the hash index.

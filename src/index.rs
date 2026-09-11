@@ -3,7 +3,12 @@ use crate::store;
 
 pub fn run_index_command(cmd: IndexCommand) {
     match cmd {
-        IndexCommand::Build { roots, threads, max_memory, io_limit } => {
+        IndexCommand::Build {
+            roots,
+            threads,
+            max_memory,
+            io_limit,
+        } => {
             crate::build::start_build(&roots, threads, &max_memory, &io_limit);
         }
         IndexCommand::Status => {
@@ -79,7 +84,10 @@ fn print_status() {
             Ok(reader) => {
                 total_docs += reader.doc_count() as u64;
                 let postings: Vec<(u32, Vec<u32>)> = reader.iter_postings();
-                total_postings += postings.iter().map(|(_, ids)| ids.len() as u64).sum::<u64>();
+                total_postings += postings
+                    .iter()
+                    .map(|(_, ids)| ids.len() as u64)
+                    .sum::<u64>();
                 let file_size = std::fs::metadata(&seg_path).map(|m| m.len()).unwrap_or(0);
                 total_bytes += file_size;
                 println!(
@@ -105,9 +113,23 @@ fn print_status() {
     if let Ok(data) = std::fs::read_to_string(&build_path) {
         if let Ok(bs) = serde_json::from_str::<serde_json::Value>(&data) {
             println!();
-            println!("  build status:   {}", bs.get("status").and_then(|v| v.as_str()).unwrap_or("?"));
-            println!("  files indexed:  {}", bs.get("files_indexed").and_then(|v| v.as_u64()).unwrap_or(0));
-            println!("  bytes indexed:  {} MB", bs.get("bytes_indexed").and_then(|v| v.as_u64()).unwrap_or(0) / 1_000_000);
+            println!(
+                "  build status:   {}",
+                bs.get("status").and_then(|v| v.as_str()).unwrap_or("?")
+            );
+            println!(
+                "  files indexed:  {}",
+                bs.get("files_indexed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+            );
+            println!(
+                "  bytes indexed:  {} MB",
+                bs.get("bytes_indexed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    / 1_000_000
+            );
         }
     }
 }
