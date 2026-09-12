@@ -113,6 +113,19 @@ enum IndexSubcommands {
 }
 
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+
+    // Detect rg-compat mode: invoked as `rg` via wrapper script or symlink.
+    // The installer creates a wrapper that sets TGREP_REAL_RG and execs tgrep.
+    // We also detect by argv[0] ending in "rg" (but not "tgrep").
+    let prog_name = argv.first().map(|s| s.as_str()).unwrap_or("tgrep");
+    let invoked_as_rg = std::env::var("TGREP_REAL_RG").is_ok()
+        || (prog_name.ends_with("rg") && !prog_name.ends_with("tgrep"));
+
+    if invoked_as_rg {
+        tgrep::rg_compat::run_as_rg(&argv);
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
