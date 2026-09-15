@@ -173,6 +173,85 @@ before verification loop. Uses `libc::posix_fadvise` or `libc::readahead`.
 - [ ] Sequential posting lists already benefit from hardware prefetcher
 - [ ] Gain would be microseconds, not milliseconds — low priority
 
+## Future: Hardware-Aware SIMD Dispatch (AVX2/AVX-512)
+
+KEYSTONE has runtime CPU feature detection (`keystone_detect_cpu_features`)
+and multiple SIMD code paths for AVX2, AVX-512, and SSE4.2. However,
+tgrep's `build.rs` only passes `-msse4.2`, so all AVX2 and AVX-512 code
+paths are compiled out via `#ifdef __AVX2__` / `#ifdef __AVX512F__` guards.
+The runtime detection runs but finds no code to dispatch to.
+
+### Current state
+
+- SSE4.2 trigram extraction: **enabled** (`pshufb` shuffle, 16 bytes/iter)
+- SSE4.2 posting list intersection: **enabled** (`simd_lower_bound_u32`)
+- SSE4.2 software prefetch: **enabled** (Sandy Bridge tuned, 32-64 elements)
+- AVX2 chunked search: **compiled out** (`#ifdef __AVX2__` in keystone.c:609)
+- AVX-512 linear search: **compiled out** (`#ifdef __AVX512F__` in keystone.c:604)
+- AVX-512 lower_bound: **compiled out** (keystone.c:927, for windows 33-64)
+- AVX-512 sorted batch merge-walk: **compiled out** (keystone.c:1440, 8 keys parallel)
+- AVX-512 multi-key parallel search: **compiled out** (keystone_avx512_search.c, entire file)
+- AVX2/AVX-512 software prefetch: **compiled out** (keystone.c:1125, 64-128 element hints)
+- Runtime CPU detection: **runs but useless** (detects features, no code to dispatch to)
+
+### What enabling AVX2/AVX-512 would do
+
+| Phase | Current (SSE4.2) | With AVX-512 | Impact |
+|-------|-----------------|-------------|--------|
+| Trigram extraction (build) | 16 bytes/iter | 64 bytes/iter (4x) | Faster indexing |
+| Posting list intersection | 4-way SIMD | 4-way SIMD (already enough) | Marginal |
+| File-ID batch lookup | Scalar fallback | 8-key merge-walk | Marginal (<50ms phase) |
+| Interpolation search | Scalar + binary | AVX-512 linear + lower_bound | Marginal |
+| File verification | grep_searcher (Rust) | Not KEYSTONE's domain | None |
+
+### Bottleneck analysis
+
+Benchmark data: cold search is 170–870ms, of which:
+- Index lookup (KEYSTONE): <50ms
+- File I/O verification (grep_searcher): 120–820ms
+
+Enabling AVX-512 would speed up the <50ms phase. The 120–820ms I/O
+phase is untouched. Even cutting lookup to 10ms saves <10% on cold searches.
+
+**However**, AVX-512 becomes meaningful when combined with speculative
+prefetch (Level 1 above). If I/O is overlapped with computation via
+`posix_fadvise`, faster computation means we're ready to verify files
+sooner — but only if the I/O has completed. The two optimizations are
+complementary: prefetch hides I/O latency, AVX-512 hides computation
+latency. Together they could reduce cold search more than either alone.
+
+### Implementation plan
+
+- [ ] Add `-mavx2` and `-mavx512f` to `build.rs` compiler flags
+- [ ] Verify KEYSTONE's runtime dispatch works: `keystone_detect_cpu_features`
+      should detect AVX-512 and dispatch to `keystone_linear_search_avx512`
+- [ ] Handle non-AVX-512 CPUs: KEYSTONE's runtime check already falls back
+      to SSE4.2/scalar, but verify the compiled AVX-512 code doesn't crash
+      on CPUs without AVX-512 (function-level `target("avx512f")` attributes
+      should handle this, but `#ifdef` guards may need adjustment)
+- [ ] Alternative: use function multiversioning instead of global `-mavx512f`
+      to avoid requiring AVX-512 at load time on all CPUs
+- [ ] Benchmark: measure index lookup phase before/after AVX-512 enable
+- [ ] Benchmark: measure combined AVX-512 + speculative prefetch vs baseline
+- [ ] Verify: 60 tests still pass with AVX-512 enabled
+
+### Risk: portability
+
+Adding `-mavx512f` globally means the binary requires AVX-512 at load
+time. This breaks portability to older CPUs (pre-Skylake-X, pre-ICX).
+
+Mitigation options:
+1. **Function multiversioning** — use `__attribute__((target("avx512f")))`
+   on specific functions, dispatch at runtime. No global flag needed.
+   KEYSTONE's `keystone_avx512_search.c` already uses this pattern.
+2. **Cargo feature flag** — add `avx512` feature in Cargo.toml, only
+   pass `-mavx512f` when enabled. Default build stays SSE4.2-only.
+3. **Runtime dispatch with dlopen** — compile AVX-512 code to a separate
+   object, load at runtime if CPU supports it. Most complex, most portable.
+
+Recommended: option 2 (Cargo feature flag) for simplicity. Users on
+AVX-512 machines build with `cargo build --release --features avx512`.
+
 ## Future: Unused KEYSTONE Algorithms
 
 KEYSTONE contains algorithms not yet integrated into tgrep. Assessment
