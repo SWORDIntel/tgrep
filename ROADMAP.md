@@ -1,6 +1,6 @@
 # tgrep Roadmap
 
-## Status: Phase 11 of 11 complete + v2 cache optimization
+## Status: Phase 11 of 11 complete + v2 cache optimization + rg-compat router
 
 ```
 [██████████████████████████████████████████████████████] 100%
@@ -100,6 +100,166 @@ segment for binary search, vs reading the entire .thi file.
 | Case-insensitive | 0.9x | **32.5x** | 2 |
 
 See `BENCHMARKS.md` for the full results table and `benchmarks/graphs/` for visualizations.
+
+## Post-Phase 11: rg-compat Router + Installer
+
+- [x] `src/rg_compat.rs` — CLI router for transparent rg compatibility
+- [x] `install.sh` — builds tgrep, finds real rg, creates `~/.local/bin/rg` wrapper
+- [x] `README.md` — full GitHub-ready documentation
+- [x] Supported flags handled by index: `-w -l -c -n -q -i -S -F -e -j -g -H -I --hidden`
+- [x] Unsupported flags delegate to real rg with identical output
+- [x] `--help`, `--version`, `--files`, `--type-list` always delegate to real rg
+- [x] No index → delegates to real rg (transparent fallback)
+- [x] 60 tests pass, 7 integration tests pass
+
+## Future: Speculative Execution (SPECTRE-inspired I/O optimization)
+
+Inspired by SPECTRE's speculative execution model: predict the next
+operation, execute ahead, and roll back if wrong. tgrep's trigram index
+already "predicts" which files will match — the current bottleneck is that
+we don't act on that prediction until verification time, serializing I/O.
+
+Benchmark data confirms: cold search latency is 170–870ms, of which the
+index lookup is <50ms and file I/O verification is the remainder. The
+speculation opportunity is to overlap I/O with computation.
+
+### Level 1: Speculative file prefetch (high impact, easy)
+
+- [ ] After index intersection, issue `posix_fadvise(FADV_WILLNEED)` or
+      `readahead()` for ALL candidate files immediately, before any
+      verification begins
+- [ ] While kernel prefetches into page cache, run index-trust metadata
+      checks (mtime, size, inode) in parallel
+- [ ] By the time verification starts, most files are already in page cache
+- [ ] Rollback is free: wasted prefetch is harmless (page cache evicts
+      naturally)
+- [ ] Estimated 30–50% cold search latency reduction (overlaps I/O with
+      computation instead of serializing them)
+- [ ] Does not help `-w -l` index-trust path (skips file reading entirely)
+- [ ] Helps cold `-l` without index-trust, and all content-output modes
+      (`-n`, default)
+
+Implementation: ~50 lines in `src/search.rs` after candidate intersection,
+before verification loop. Uses `libc::posix_fadvise` or `libc::readahead`.
+
+### Level 2: Incremental speculative prefetch (medium impact, moderate)
+
+- [ ] Start prefetching files as soon as ANY trigram posting list suggests
+      they're candidates, before full intersection completes
+- [ ] Risk: first trigram's posting list is much larger than final
+      intersection (e.g., 5000 files vs 238 for "struct")
+- [ ] Mitigation: only speculatively prefetch files appearing in 2+ trigram
+      posting lists (incremental intersection narrows speculation to
+      high-confidence candidates)
+- [ ] Rollback: prefetched-but-eliminated files waste I/O bandwidth but
+      cause no correctness issue
+
+### Level 3: Query-level branch prediction (long-term, requires usage data)
+
+- [ ] Learn query sequences from history (n-gram predictor)
+- [ ] Speculatively pre-warm search cache for likely next query while
+      current results display
+- [ ] Example: user searches "struct" → 73% probability next query is
+      "impl" or "fn" → pre-warm cache for those patterns
+- [ ] Most SPECTRE-like: a predictor that learns from observed patterns
+      and speculatively executes the next query before the user types it
+- [ ] Requires query history data and a predictor model
+- [ ] Not worth building until tgrep has real users generating query patterns
+
+### Level 4: CPU-level prefetch in posting lists (marginal)
+
+- [ ] Use `__builtin_prefetch` for next posting entries during intersection
+- [ ] Only helps for random-access posting traversal (hash-index lookups)
+- [ ] Sequential posting lists already benefit from hardware prefetcher
+- [ ] Gain would be microseconds, not milliseconds — low priority
+
+## Future: Unused KEYSTONE Algorithms
+
+KEYSTONE contains algorithms not yet integrated into tgrep. Assessment
+of each, with applicability to tgrep's bottlenecks.
+
+### Currently used by tgrep
+
+- `keystone_trigram_*` — extraction, candidate selection, frequency, postings
+- `dsmil_hash_indexer` — whole-word hash index (`.thi` / `.qwi`)
+- `keystone_anchor_table` / `keystone_search_batch_auto` — interpolation
+  search for file-ID lookups
+- `keystone_get_performance_stats` / `keystone_set_performance_tracking`
+- `keystone_detect_cpu_features`
+
+### Available: `keystone_tar_zst` — streaming .tar.zst search
+
+- [ ] `keystone_tar_zst_open` / `keystone_tar_zst_search_member` /
+      `keystone_tar_zst_search_indexed` — live streaming decompression
+      and search over `.tar.zst` archives without materializing in memory
+- [ ] Supports indexed search: build index, save/load, search indexed
+- [ ] **Applicability:** New feature — search compressed codebase snapshots
+      directly (`tgrep "pattern" codebase-snapshot.tar.zst`)
+- [ ] **Not a performance win** for current filesystem search path
+- [ ] **Verdict:** Worth adding if tgrep needs to search archived snapshots.
+      Genuine capability addition, not a micro-optimization.
+
+### Available: `keystone_avx512_search` — multi-key parallel search
+
+- [ ] `keystone_multi_search_avx512` — searches 8 keys simultaneously
+      against sorted int64 array using AVX-512 8x8 comparison matrix
+- [ ] `keystone_linear_search_avx512` — single-key AVX-512 linear scan
+- [ ] `keystone_batch_linear_search_fallback_avx512` — batch fallback
+- [ ] **Applicability:** Posting-list intersection. When tgrep intersects
+      multiple trigram posting lists (e.g., "struct" → `str`, `tru`, `ruc`,
+      `uct`), the multi-key path could intersect 8 trigram candidate sets
+      in one pass.
+- [ ] **Bottleneck mismatch:** tgrep's bottleneck is file I/O, not index
+      lookup. Benchmark data shows index lookup <50ms of 170–870ms cold
+      search. Even cutting lookup to zero saves <10%.
+- [ ] **Verdict:** Marginal. Would only matter at scale (millions of files
+      per trigram) where posting-list intersection becomes measurable.
+
+### Available: `keystone_search_parallel` — parallel batch search
+
+- [ ] Parallelizes batch interpolation search across multiple threads with
+      configurable thread pool (`keystone_parallel_config_t`)
+- [ ] **Applicability:** Large batch file-ID lookups (hundreds of thousands
+      of IDs)
+- [ ] **Verdict:** Marginal for current workloads. Could matter if tgrep
+      indexes 1M+ files where the file-ID lookup set is large enough to
+      benefit from parallelism.
+
+### Available: `dsmil_telemetry_processor` — timestamp range queries
+
+- [ ] Timestamp-range lookups, device filtering, pattern analysis over
+      event streams
+- [ ] **Verdict:** Not applicable to file search.
+
+### Available: `dsmil_micro_model` — ML classification
+
+- [ ] Tiny neural network (260-dim input, 64 hidden, 6 classes) for text
+      context classification
+- [ ] **Potential use:** File-type classification at index time (source,
+      config, docs, binary) to improve filtering
+- [ ] **Problem:** Model is trained for document classification
+      (financial/corporate/government/healthcare/technology), not file-type
+      classification. Would need retraining.
+- [ ] **Verdict:** Over-engineered. The `ignore` crate already handles
+      file-type filtering well.
+
+### Available: `dsmil_dirty_parser` — artifact extraction
+
+- [ ] Extracts emails, URLs, credentials from unstructured log streams
+- [ ] **Verdict:** Not applicable to file search.
+
+### Available: `keystone_safe_alloc` — overflow-safe allocation
+
+- [ ] `checked_mul_size`, `checked_add_size`, `safe_mul_check` helpers
+- [ ] **Verdict:** Good defensive coding utility. Could adopt in native
+      wrappers for robustness, but not a performance feature.
+
+### Available: `qihse_keystone_bridge` — KEYSTONE→QIHSE ingestion
+
+- [ ] CRC16-routed KEYSTONE→QIHSE bridge for distributed ingestion with
+      authenticated security context
+- [ ] **Verdict:** Not applicable to tgrep's local search model. Relevant
+      only if tgrep ever becomes a distributed indexed search service.
 
 ## Completed
 
