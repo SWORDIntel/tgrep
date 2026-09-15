@@ -74,10 +74,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "=== tgrep installer ==="
 echo ""
 
-# 1. Build tgrep
-echo "[1/5] Building tgrep (release mode)..."
+# 1. Build tgrep (using compile.sh for CPU auto-detection)
+echo "[1/5] Building tgrep (release mode, auto-detecting CPU features)..."
 cd "$SCRIPT_DIR"
-cargo build --release
+./compile.sh --release
 if [ ! -f "target/release/tgrep" ]; then
     echo "Error: tgrep binary not found after build" >&2
     exit 1

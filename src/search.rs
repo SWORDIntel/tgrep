@@ -626,6 +626,18 @@ pub fn run_search(config: SearchConfig) {
         exit(0);
     }
 
+    // Speculative file prefetch (SPECTRE-inspired Level 1):
+    // The index "predicted" these files as candidates. Issue
+    // posix_fadvise(WILLNEED) for ALL candidates immediately, before
+    // any verification begins. While the kernel pulls pages into the
+    // page cache, we proceed to set up grep_searcher and start
+    // verification. By the time we read each file, it's likely already
+    // in page cache. Wasted prefetch (files that don't match) is
+    // harmless — the page cache evicts naturally.
+    if !all_files.is_empty() {
+        speculative_prefetch(&all_files);
+    }
+
     // Parallel search (only for files that need verification)
     let search_start = std::time::Instant::now();
     let (mut match_found, mut matched_paths) = parallel_search(
@@ -720,6 +732,44 @@ struct FileResult {
     _path: PathBuf,
     matched: bool,
     output: Vec<u8>,
+}
+
+/// Speculative file prefetch (SPECTRE-inspired Level 1).
+///
+/// Issues `posix_fadvise(FADV_WILLNEED)` for all candidate files
+/// immediately after index intersection, before verification begins.
+/// The kernel starts pulling these files into the page cache while
+/// we proceed to set up grep_searcher and begin verification.
+///
+/// "Rollback" is free: if a file was speculatively prefetched but
+/// doesn't match after verification, the prefetch was wasted I/O
+/// but harmless. The page cache entry will be evicted naturally.
+///
+/// This overlaps I/O with computation, hiding disk latency behind
+/// the index-trust metadata checks and grep_searcher setup.
+fn speculative_prefetch(files: &[PathBuf]) {
+    // POSIX_FADV_WILLNEED = 3
+    const POSIX_FADV_WILLNEED: i32 = 3;
+
+    for path in files {
+        // Open O_RDONLY | O_NONBLOCK (don't block on open)
+        let path_c = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Use a non-blocking open to avoid stalling on inaccessible files
+        let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        if fd < 0 {
+            continue;
+        }
+
+        // Advise the kernel we'll need this file's pages soon
+        unsafe {
+            libc::posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+            libc::close(fd);
+        }
+    }
 }
 
 /// Search files in parallel using scoped threads.

@@ -1,6 +1,6 @@
 # tgrep Roadmap
 
-## Status: Phase 11 of 11 complete + v2 cache optimization + rg-compat router
+## Status: Phase 11 + v2 cache + rg-compat + speculative prefetch + compile.sh
 
 ```
 [██████████████████████████████████████████████████████] 100%
@@ -123,24 +123,23 @@ Benchmark data confirms: cold search latency is 170–870ms, of which the
 index lookup is <50ms and file I/O verification is the remainder. The
 speculation opportunity is to overlap I/O with computation.
 
-### Level 1: Speculative file prefetch (high impact, easy)
+### Level 1: Speculative file prefetch (high impact, easy) — DONE
 
-- [ ] After index intersection, issue `posix_fadvise(FADV_WILLNEED)` or
-      `readahead()` for ALL candidate files immediately, before any
-      verification begins
-- [ ] While kernel prefetches into page cache, run index-trust metadata
+- [x] After index intersection, issue `posix_fadvise(FADV_WILLNEED)` for
+      ALL candidate files immediately, before verification begins
+- [x] While kernel prefetches into page cache, run index-trust metadata
       checks (mtime, size, inode) in parallel
-- [ ] By the time verification starts, most files are already in page cache
-- [ ] Rollback is free: wasted prefetch is harmless (page cache evicts
+- [x] By the time verification starts, most files are already in page cache
+- [x] Rollback is free: wasted prefetch is harmless (page cache evicts
       naturally)
-- [ ] Estimated 30–50% cold search latency reduction (overlaps I/O with
-      computation instead of serializing them)
-- [ ] Does not help `-w -l` index-trust path (skips file reading entirely)
-- [ ] Helps cold `-l` without index-trust, and all content-output modes
+- [ ] Benchmark: measure 30–50% cold search latency reduction estimate
+- [x] Does not help `-w -l` index-trust path (skips file reading entirely)
+- [x] Helps cold `-l` without index-trust, and all content-output modes
       (`-n`, default)
 
-Implementation: ~50 lines in `src/search.rs` after candidate intersection,
-before verification loop. Uses `libc::posix_fadvise` or `libc::readahead`.
+Implementation: `speculative_prefetch()` in `src/search.rs`, called after
+candidate intersection, before `parallel_search()`. Uses `libc::open()`
+with `O_NONBLOCK` + `libc::posix_fadvise(FADV_WILLNEED)` + `libc::close()`.
 
 ### Level 2: Incremental speculative prefetch (medium impact, moderate)
 
@@ -222,15 +221,19 @@ latency. Together they could reduce cold search more than either alone.
 
 ### Implementation plan
 
-- [ ] Add `-mavx2` and `-mavx512f` to `build.rs` compiler flags
+- [x] `compile.sh` — auto-detects CPU features from /proc/cpuinfo, selects
+      highest available SIMD level (SSE4.2/AVX2/AVX-512), sets
+      `TGREP_SIMD_FLAGS` env var
+- [x] `build.rs` — reads `TGREP_SIMD_FLAGS` env var, applies flags to cc::Build,
+      passes cfg flags to Rust code (`avx512`, `avx2`)
+- [x] `install.sh` — now calls `compile.sh --release` instead of `cargo build`
+- [ ] Add `-mavx2` and `-mavx512f` to `build.rs` compiler flags (via compile.sh)
 - [ ] Verify KEYSTONE's runtime dispatch works: `keystone_detect_cpu_features`
       should detect AVX-512 and dispatch to `keystone_linear_search_avx512`
 - [ ] Handle non-AVX-512 CPUs: KEYSTONE's runtime check already falls back
       to SSE4.2/scalar, but verify the compiled AVX-512 code doesn't crash
       on CPUs without AVX-512 (function-level `target("avx512f")` attributes
       should handle this, but `#ifdef` guards may need adjustment)
-- [ ] Alternative: use function multiversioning instead of global `-mavx512f`
-      to avoid requiring AVX-512 at load time on all CPUs
 - [ ] Benchmark: measure index lookup phase before/after AVX-512 enable
 - [ ] Benchmark: measure combined AVX-512 + speculative prefetch vs baseline
 - [ ] Verify: 60 tests still pass with AVX-512 enabled

@@ -517,6 +517,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "libc",
  "memmap2",
  "regex-syntax",
  "serde",
