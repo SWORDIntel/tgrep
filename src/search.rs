@@ -634,7 +634,8 @@ pub fn run_search(config: SearchConfig) {
     // verification. By the time we read each file, it's likely already
     // in page cache. Wasted prefetch (files that don't match) is
     // harmless — the page cache evicts naturally.
-    if !all_files.is_empty() {
+    // Disable with TGREP_NO_PREFETCH=1 for A/B benchmarking.
+    if !all_files.is_empty() && std::env::var("TGREP_NO_PREFETCH").is_err() {
         speculative_prefetch(&all_files);
     }
 
