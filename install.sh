@@ -2,7 +2,8 @@
 # tgrep installer — installs tgrep and creates an rg wrapper.
 #
 # Usage:
-#   ./install.sh [--prefix DIR] [--uninstall]
+#   ./install.sh [--prefix DIR] [--uninstall] [--index] [--no-index]
+#                [--zfs] [--no-zfs]
 #
 # Default prefix: ~/.local
 #
@@ -12,6 +13,8 @@
 #   3. Installs tgrep to $PREFIX/bin/tgrep
 #   4. Creates an rg wrapper at $PREFIX/bin/rg that routes to tgrep
 #   5. Stores the real rg path for delegation
+#   6. Offers a compressed ZFS dataset for the index (when ZFS is present)
+#   7. Offers to build a systemwide index
 #
 # After installation, `rg` commands are transparently routed:
 #   - Indexed searches → tgrep (faster)
@@ -25,6 +28,8 @@ set -euo pipefail
 
 PREFIX="$HOME/.local"
 UNINSTALL=false
+WANT_INDEX=""    # "" = ask (TTY only), "yes", "no"
+WANT_ZFS=""      # "" = ask (TTY only), "yes", "no"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -36,11 +41,31 @@ while [[ $# -gt 0 ]]; do
             UNINSTALL=true
             shift
             ;;
+        --index)
+            WANT_INDEX="yes"
+            shift
+            ;;
+        --no-index)
+            WANT_INDEX="no"
+            shift
+            ;;
+        --zfs)
+            WANT_ZFS="yes"
+            shift
+            ;;
+        --no-zfs)
+            WANT_ZFS="no"
+            shift
+            ;;
         --help|-h)
-            echo "Usage: $0 [--prefix DIR] [--uninstall]"
+            echo "Usage: $0 [--prefix DIR] [--uninstall] [--index|--no-index] [--zfs|--no-zfs]"
             echo ""
-            echo "  --prefix DIR   Install prefix (default: ~/.local)"
-            echo "  --uninstall    Remove tgrep and restore direct rg access"
+            echo "  --prefix DIR    Install prefix (default: ~/.local)"
+            echo "  --index         Build a systemwide index without asking"
+            echo "  --no-index      Skip the index-build offer"
+            echo "  --zfs           Place the index on a ZFS dataset without asking"
+            echo "  --no-zfs        Skip the ZFS offer"
+            echo "  --uninstall     Remove tgrep and restore direct rg access"
             exit 0
             ;;
         *)
@@ -170,11 +195,103 @@ echo ""
 echo "tgrep is now installed. The 'rg' command will use tgrep's index"
 echo "when available, and fall back to real ripgrep for everything else."
 echo ""
-echo "To build an index for your codebase:"
-echo "  tgrep index build /path/to/code"
+
+# ── 6. Optional: ZFS-backed index dataset ────────────────────────────
+
+STATE_DIR="$HOME/.local/state/tgrep"
+
+ask() {  # ask "question" -> 0 if yes; only prompts when stdin is a TTY
+    local q="$1"
+    if [[ -n "$WANT_ZFS" && "$q" == *ZFS* ]]; then
+        [[ "$WANT_ZFS" == "yes" ]]
+        return
+    fi
+    if [[ -n "$WANT_INDEX" && "$q" == *index* ]]; then
+        [[ "$WANT_INDEX" == "yes" ]]
+        return
+    fi
+    [[ -t 0 ]] || return 1
+    local a
+    read -r -p "$q [y/N] " a
+    [[ "$a" =~ ^[Yy] ]]
+}
+
+if command -v zfs >/dev/null 2>&1 && command -v zpool >/dev/null 2>&1; then
+    POOL="$(zpool list -H -o name 2>/dev/null | head -1 || true)"
+    if [[ -n "$POOL" ]]; then
+        echo "ZFS detected (pool: $POOL)."
+        echo "  A native ZFS dataset is the best home for the tgrep index:"
+        echo "  transparent zstd compression shrinks it ~2-3x, the ARC keeps"
+        echo "  hot trigram blocks in RAM, and snapshots give you free rollback."
+        if ask "Create ZFS dataset $POOL/tgrep for the index (uses sudo)?"; then
+            if ! zfs list "$POOL/tgrep" >/dev/null 2>&1; then
+                if sudo zfs create -o compression=zstd -o atime=off \
+                    -o mountpoint="$STATE_DIR" "$POOL/tgrep"; then
+                    sudo chown "$(id -u):$(id -g)" "$STATE_DIR"
+                    echo "      Created: $POOL/tgrep mounted at $STATE_DIR"
+                else
+                    echo "      zfs create failed — keeping the plain directory." >&2
+                fi
+            else
+                echo "      Dataset $POOL/tgrep already exists — leaving it alone."
+                echo "      To use it here: sudo zfs set mountpoint=$STATE_DIR $POOL/tgrep"
+            fi
+        else
+            echo "      Skipping ZFS setup (index will live in a plain directory)."
+        fi
+        echo ""
+    fi
+fi
+
+# ── 7. Optional: build a systemwide index ────────────────────────────
+
+echo "The rg wrapper only accelerates searches over indexed paths."
+if ask "Build a systemwide index now?"; then
+    echo ""
+    echo "  What should tgrep index?"
+    echo "    [1] Your home directory ($HOME)  — recommended"
+    echo "    [2] The entire system (/)        — large; needs sudo for some paths"
+    echo "    [3] Custom paths"
+    CHOICE=""
+    if [[ -n "$WANT_INDEX" && "$WANT_INDEX" == "yes" && ! -t 0 ]]; then
+        CHOICE="1"
+    else
+        read -r -p "  Choice [1]: " CHOICE
+    fi
+    CHOICE="${CHOICE:-1}"
+    case "$CHOICE" in
+        1)
+            echo "      Indexing $HOME (this can take a few minutes)..."
+            "$BIN_DIR/tgrep" index build "$HOME" || true
+            ;;
+        2)
+            echo "      WARNING: indexing / reads every readable file and can"
+            echo "      produce a multi-GB index. Ctrl-C to abort."
+            sleep 3
+            sudo "$BIN_DIR/tgrep" index build / || true
+            ;;
+        3)
+            read -r -p "  Paths to index (space-separated): " INDEX_PATHS
+            if [[ -n "${INDEX_PATHS:-}" ]]; then
+                # shellcheck disable=SC2086
+                "$BIN_DIR/tgrep" index build $INDEX_PATHS || true
+            fi
+            ;;
+        *)
+            echo "      Unknown choice — skipping."
+            ;;
+    esac
+else
+    echo ""
+    echo "Skipped. Build one any time:"
+    echo "  tgrep index build /path/to/code"
+fi
 echo ""
-echo "To check index status:"
-echo "  tgrep index status"
+
+echo "Useful commands:"
+echo "  tgrep index status     — indexed paths, segments, cache stats"
+echo "  tgrep index build DIR  — (re)index a path"
+echo "  tgrep cache clear      — drop cached search results"
 echo ""
 echo "To uninstall:"
 echo "  $0 --uninstall"

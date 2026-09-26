@@ -11,21 +11,6 @@ wrapper, it transparently routes searches to the index when beneficial and
 delegates to real ripgrep for everything else — all `rg` flags work
 identically.
 
-## Install
-
-**Debian/Ubuntu (amd64)** — grab the `.deb` from
-[Releases](https://github.com/SWORDIntel/tgrep/releases):
-
-```bash
-sudo apt install ./tgrep_1.0.0_amd64.deb
-tgrep index build ~          # index your home directory
-```
-
-**From source** (all platforms): run `./install.sh` — it builds, installs the
-`rg` wrapper, offers a compressed ZFS dataset for the index on ZFS systems,
-and offers to build a systemwide index. Scripted installs: `--index`,
-`--no-index`, `--zfs`, `--no-zfs`.
-
 ## Performance
 
 Benchmarked on a 26K-file, 1.15 GB corpus (10 trials, cold cache):

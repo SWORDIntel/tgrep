@@ -1,0 +1,20 @@
+Package: tgrep
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: libc6 (>= 2.31), libgcc-s1 (>= 3.0) | libgcc1
+Suggests: ripgrep
+Recommends: zfsutils-linux
+Maintainer: SWORDIntel <noreply@github.com>
+Homepage: https://github.com/SWORDIntel/tgrep
+Description: Persistent trigram-indexed search, a drop-in ripgrep accelerator
+ tgrep builds a persistent trigram index over your codebase and uses it to
+ skip files that cannot match the search pattern. Installed as an rg wrapper
+ (see install.sh in the source repo) it transparently routes searches to the
+ index when beneficial and delegates to real ripgrep for everything else.
+ .
+ The index lives under ~/.local/state/tgrep; a compressed ZFS dataset
+ (zfs create -o compression=zstd) is the recommended location on ZFS systems.
+ .
+ Licensed under GNU AGPL-3.0.

@@ -1,0 +1,26 @@
+#!/bin/sh
+# tgrep postinst — print getting-started hints. Non-interactive by design:
+# dpkg hooks must never block on prompts.
+set -e
+
+case "$1" in
+    configure)
+        echo "tgrep installed."
+        echo ""
+        echo "Build an index to accelerate searches:"
+        echo "  tgrep index build $HOME"
+        echo ""
+        echo "ZFS tip: on a ZFS system, the index is best kept on a compressed"
+        echo "dataset (transparent ~2-3x compression, ARC-cached reads):"
+        echo "  sudo zfs create -o compression=zstd -o atime=off \\"
+        echo "      -o mountpoint=\$HOME/.local/state/tgrep <pool>/tgrep"
+        echo ""
+        echo "Status and maintenance:"
+        echo "  tgrep index status"
+        echo "  tgrep index compact"
+        echo ""
+        echo "To also route 'rg' through tgrep's index (opt-in), use the"
+        echo "installer from the source repo: ./install.sh"
+        ;;
+esac
+exit 0
