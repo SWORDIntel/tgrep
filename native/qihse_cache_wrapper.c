@@ -81,6 +81,15 @@ tgrep_cache_t* tgrep_cache_create(void) {
     cols[4].name = strdup("cached_at");
     cols[4].type = QIHSE_TS_INT64;
 
+    for (int i = 0; i < 5; i++) {
+        if (!cols[i].name) {
+            for (int j = 0; j < 5; j++) free(cols[j].name);
+            qihse_table_store_destroy(cache->store);
+            free(cache);
+            return NULL;
+        }
+    }
+
     cache->table = qihse_table_store_create_table(cache->store, "search_cache", cols, 5);
     for (int i = 0; i < 5; i++) free(cols[i].name);
 
@@ -236,7 +245,10 @@ int tgrep_cache_invalidate(
 
 size_t tgrep_cache_count(tgrep_cache_t* cache) {
     if (!cache || !cache->table) return 0;
-    return qihse_table_row_count(cache->table);
+    pthread_mutex_lock(&cache->lock);
+    size_t count = qihse_table_row_count(cache->table);
+    pthread_mutex_unlock(&cache->lock);
+    return count;
 }
 
 /* ── Cache stats: enumerate unique patterns ────────────────────────── */
@@ -278,15 +290,19 @@ static bool cache_enum_cb(const qihse_col_value_t* values, size_t num_cols, void
         char** np = realloc(c->patterns, new_cap * sizeof(char*));
         if (!np) return false;
         c->patterns = np;
+
         int32_t* nf = realloc(c->flags_arr, new_cap * sizeof(int32_t));
         if (!nf) return false;
         c->flags_arr = nf;
+
         int64_t* ng = realloc(c->generations, new_cap * sizeof(int64_t));
         if (!ng) return false;
         c->generations = ng;
+
         size_t* nc = realloc(c->counts, new_cap * sizeof(size_t));
         if (!nc) return false;
         c->counts = nc;
+
         c->cap = new_cap;
     }
 
@@ -403,24 +419,35 @@ static bool cache_save_cb(const qihse_col_value_t* values, size_t num_cols, void
 static int cache_save(tgrep_cache_t* cache, const char* path) {
     if (!cache || !path) return -1;
 
-    FILE* f = fopen(path, "wb");
-    if (!f) return -1;
-
     pthread_mutex_lock(&cache->lock);
+
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        pthread_mutex_unlock(&cache->lock);
+        return -1;
+    }
 
     uint32_t magic = TGSC_MAGIC;
     uint32_t version = TGSC_VERSION;
     size_t row_count = qihse_table_row_count(cache->table);
 
-    fwrite(&magic, 4, 1, f);
-    fwrite(&version, 4, 1, f);
-    fwrite(&row_count, sizeof(size_t), 1, f);
+    if (fwrite(&magic, 4, 1, f) != 1 ||
+        fwrite(&version, 4, 1, f) != 1 ||
+        fwrite(&row_count, sizeof(size_t), 1, f) != 1) {
+        fclose(f);
+        pthread_mutex_unlock(&cache->lock);
+        return -1;
+    }
 
     save_ctx_t sctx = { .f = f, .written = 0 };
     qihse_table_scan(cache->table, cache_save_cb, &sctx);
 
+    if (fclose(f) != 0) {
+        pthread_mutex_unlock(&cache->lock);
+        return -1;
+    }
+
     pthread_mutex_unlock(&cache->lock);
-    fclose(f);
     return (int)sctx.written;
 }
 
@@ -453,7 +480,7 @@ static int cache_load(tgrep_cache_t* cache, const char* path) {
     for (size_t i = 0; i < row_count; i++) {
         /* pattern */
         uint32_t pat_len;
-        if (fread(&pat_len, 4, 1, f) != 1) break;
+        if (fread(&pat_len, 4, 1, f) != 1 || pat_len > 65536) break;
         char* pattern = malloc(pat_len + 1);
         if (!pattern) break;
         if (fread(pattern, 1, pat_len, f) != pat_len) { free(pattern); break; }
@@ -469,7 +496,7 @@ static int cache_load(tgrep_cache_t* cache, const char* path) {
 
         /* file_path */
         uint32_t fp_len;
-        if (fread(&fp_len, 4, 1, f) != 1) { free(pattern); break; }
+        if (fread(&fp_len, 4, 1, f) != 1 || fp_len > 65536) { free(pattern); break; }
         char* file_path = malloc(fp_len + 1);
         if (!file_path) { free(pattern); break; }
         if (fread(file_path, 1, fp_len, f) != fp_len) { free(pattern); free(file_path); break; }
@@ -500,8 +527,8 @@ static int cache_load(tgrep_cache_t* cache, const char* path) {
         free(file_path);
     }
 
-    pthread_mutex_unlock(&cache->lock);
     fclose(f);
+    pthread_mutex_unlock(&cache->lock);
     return loaded;
 }
 

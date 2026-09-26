@@ -1,0 +1,1344 @@
+#ifndef QIHSE_FEDERATION_H
+#define QIHSE_FEDERATION_H
+
+/* QIHSE federation — stage F0 primitives.
+ *
+ * The federation data plane (consistency classes, local-authority
+ * namespaces, event journal, watches, leases, trust plane) builds on these
+ * primitives. F0 deliberately changes no existing cluster behaviour: it adds
+ * the identity, time, version, and fencing vocabulary the later stages need.
+ * See docs/plans/qihse_federation_upgrade_plan.md.
+ */
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include "qihse_event_stream.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define QIHSE_UUID_BYTES 16u
+#define QIHSE_UUID_STR_LEN 36u /* "8-4-4-4-12" without NUL */
+
+typedef struct {
+    uint8_t bytes[QIHSE_UUID_BYTES];
+} qihse_uuid_t;
+
+/* Identity. A federation node/object identity is a UUID — never an IP, a
+ * hostname, or a topology index (plan §18). */
+bool qihse_uuid_generate(qihse_uuid_t* out);
+/* Deterministic identity for a seed (SHA-384 derived, version/variant bits
+ * set): same seed, same UUID, on every node. */
+bool qihse_uuid_from_seed(const void* seed, size_t seed_len, qihse_uuid_t* out);
+bool qihse_uuid_parse(const char* text, qihse_uuid_t* out);
+bool qihse_uuid_format(const qihse_uuid_t* id, char out[QIHSE_UUID_STR_LEN + 1u]);
+bool qihse_uuid_is_nil(const qihse_uuid_t* id);
+bool qihse_uuid_equal(const qihse_uuid_t* a, const qihse_uuid_t* b);
+
+/* Hybrid logical clock (plan §7.1): physical milliseconds plus a logical
+ * counter, monotonic on a node and causally ordered across nodes. */
+typedef struct {
+    uint64_t physical_ms;
+    uint32_t logical;
+} qihse_hlc_t;
+
+void qihse_hlc_init(qihse_hlc_t* clock);
+/* Local event: strictly greater than any previous tick and any observed
+ * remote timestamp. */
+void qihse_hlc_tick(qihse_hlc_t* clock, qihse_hlc_t* out);
+/* Receive path: advance the local clock past a remote timestamp so the next
+ * local tick is ordered after the remote event. */
+void qihse_hlc_observe(qihse_hlc_t* clock, const qihse_hlc_t* remote);
+/* Total order across nodes: -1, 0, +1. */
+int qihse_hlc_compare(const qihse_hlc_t* a, const qihse_hlc_t* b);
+/* Sortable 64-bit encoding (48-bit ms + 16-bit logical counter). */
+uint64_t qihse_hlc_pack(const qihse_hlc_t* clock);
+void qihse_hlc_unpack(uint64_t packed, qihse_hlc_t* out);
+
+/* Object generation (plan §7.2): per-object version bumped on every mutation,
+ * carrying the HLC stamp of the bump. */
+typedef struct {
+    qihse_uuid_t object;
+    uint64_t generation;
+    qihse_hlc_t stamp;
+} qihse_object_version_t;
+
+void qihse_object_version_init(qihse_object_version_t* version, const qihse_uuid_t* object);
+/* Bump to the next generation and stamp it with the clock's next tick. */
+void qihse_object_version_bump(qihse_object_version_t* version, qihse_hlc_t* clock);
+/* Order by generation first, HLC stamp as the tie-break: -1, 0, +1. */
+int qihse_object_version_compare(const qihse_object_version_t* a,
+                                 const qihse_object_version_t* b);
+
+/* Fencing epoch (plan §7.3): monotonic ownership epoch for exclusive state.
+ * A holder may only act while its epoch is the highest it has observed. */
+typedef struct {
+    uint64_t epoch;
+    qihse_uuid_t holder;
+} qihse_fencing_token_t;
+
+void qihse_fencing_token_init(qihse_fencing_token_t* token);
+/* Acquire exclusive state: succeeds only when `observed_epoch` is strictly
+ * older than the new epoch, and always advances the epoch. Fails closed. */
+bool qihse_fencing_acquire(qihse_fencing_token_t* token, uint64_t observed_epoch,
+                           const qihse_uuid_t* holder);
+/* Is this token still the highest the caller has observed? */
+bool qihse_fencing_valid(const qihse_fencing_token_t* token, uint64_t observed_epoch);
+
+/* ────────────────────────────────────────────────────────────────────────
+ * F1 — Sovereign local state (plan §4, §5).
+ *
+ * A consistency class tags how a namespace reaches agreement. LOCAL
+ * namespaces are authoritative on one node and MUST remain read-write
+ * during complete network isolation. QUORUM/LINEARIZABLE namespaces fail
+ * closed when consensus is unavailable; they never force the whole node
+ * read-only (plan §3.1, §3.2, acceptance criteria 1–2).
+ * ──────────────────────────────────────────────────────────────────────── */
+
+typedef enum {
+    QIHSE_CONSISTENCY_LOCAL = 0,
+    QIHSE_CONSISTENCY_EVENTUAL,
+    QIHSE_CONSISTENCY_CAUSAL,
+    QIHSE_CONSISTENCY_QUORUM,
+    QIHSE_CONSISTENCY_LINEARIZABLE
+} qihse_consistency_class_t;
+
+/* Human-readable name ("LOCAL", "EVENTUAL", ...); NULL if invalid. */
+const char* qihse_consistency_class_name(qihse_consistency_class_t c);
+/* Parse a name into a class; false on unknown. */
+bool qihse_consistency_class_parse(const char* name, qihse_consistency_class_t* out);
+/* A class is "local-safe" if an isolated node may continue to serve
+ * authorized reads and writes without peer agreement. LOCAL always;
+ * EVENTUAL and CAUSAL are local-safe for non-exclusive state. */
+bool qihse_consistency_class_is_local_safe(qihse_consistency_class_t c);
+/* A class is "strong" if it requires peer agreement and must fail closed
+ * when that agreement is unavailable (QUORUM, LINEARIZABLE). */
+bool qihse_consistency_class_is_strong(qihse_consistency_class_t c);
+
+/* Federation operating state of a node (plan §5). */
+typedef enum {
+    QIHSE_FEDERATION_STATE_CONNECTED = 0,
+    QIHSE_FEDERATION_STATE_DEGRADED,
+    QIHSE_FEDERATION_STATE_ISOLATED,
+    QIHSE_FEDERATION_STATE_RECOVERING,
+    QIHSE_FEDERATION_STATE_FENCED,
+    QIHSE_FEDERATION_STATE_MAINTENANCE
+} qihse_federation_state_t;
+
+const char* qihse_federation_state_name(qihse_federation_state_t s);
+bool qihse_federation_state_parse(const char* name, qihse_federation_state_t* out);
+
+/* Local database usability, independent of federation state. A node in
+ * ISOLATED state still reports local_database = READ_WRITE for LOCAL
+ * namespaces (acceptance criterion 2). */
+typedef enum {
+    QIHSE_LOCAL_DB_READ_WRITE = 0,
+    QIHSE_LOCAL_DB_READ_ONLY
+} qihse_local_db_state_t;
+
+const char* qihse_local_db_state_name(qihse_local_db_state_t s);
+
+/* Namespace authority record (plan §5, §6). A namespace is either
+ * local-authority (this node owns it) or federation-authority (peers must
+ * agree). LOCAL namespaces are always local-authority. */
+typedef struct {
+    char name[64];
+    qihse_consistency_class_t consistency;
+    qihse_uuid_t authority_node;
+    bool local_authority;
+} qihse_federation_namespace_t;
+
+/* A namespace is writable on this node right now if its consistency class
+ * is local-safe OR the authority is the local node OR the federation is
+ * CONNECTED/DEGRADED for strong namespaces. Strong namespaces fail closed
+ * (not writable) when the node is ISOLATED/FENCED/RECOVERING without peers. */
+bool qihse_federation_namespace_writable(const qihse_federation_namespace_t* ns,
+                                         qihse_federation_state_t state,
+                                         const qihse_uuid_t* local_node);
+
+/* Federation status snapshot (plan §5 status object). */
+typedef struct {
+    qihse_uuid_t node_id;
+    qihse_federation_state_t federation_state;
+    qihse_local_db_state_t local_database;
+    bool strong_namespaces_available;
+    bool eventual_namespaces_available;
+    uint64_t pending_replication_events;
+    qihse_hlc_t last_peer_contact_hlc;
+    bool reconciliation_required;
+} qihse_federation_status_t;
+
+void qihse_federation_status_init(qihse_federation_status_t* status,
+                                 const qihse_uuid_t* node_id);
+/* Recompute derived fields from the federation state: local_database stays
+ * READ_WRITE for local-safe namespaces; strong_namespaces_available is true
+ * only when the state allows consensus. */
+void qihse_federation_status_recompute(qihse_federation_status_t* status);
+/* Render the status as a single-line JSON-ish string into `out`. */
+void qihse_federation_status_format(const qihse_federation_status_t* status,
+                                    char* out, size_t out_cap);
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Namespace registry. Backed by the caller-provided KV store under the
+ * "fedns:" prefix. Every entry takes an explicit authenticated user so the
+ * registry never becomes an authorization bypass (AGENTS.md invariant 1).
+ * ──────────────────────────────────────────────────────────────────────── */
+
+#define QIHSE_FEDERATION_NS_PREFIX "fedns:"
+#define QIHSE_FEDERATION_NS_NAME_MAX 63u
+
+/* Register or replace a namespace. `local_node` is the calling node's UUID;
+ * local_authority is set when authority_node equals local_node OR when the
+ * consistency class is LOCAL. Returns false on invalid name/class. */
+bool qihse_federation_namespace_register(void* store_void, void* user_void,
+                                         const char* name,
+                                         qihse_consistency_class_t consistency,
+                                         const qihse_uuid_t* authority_node,
+                                         const qihse_uuid_t* local_node);
+/* Look up a namespace by name. Returns false if not registered. */
+bool qihse_federation_namespace_lookup(void* store_void, void* user_void,
+                                        const char* name,
+                                        qihse_federation_namespace_t* out);
+/* Remove a namespace registration. Returns false if not found. */
+bool qihse_federation_namespace_unregister(void* store_void, void* user_void,
+                                            const char* name);
+/* Iterate registered namespaces. cb returns false to stop. */
+typedef bool (*qihse_federation_ns_iter_cb)(const qihse_federation_namespace_t* ns,
+                                            void* user_data);
+void qihse_federation_namespace_foreach(void* store_void, void* user_void,
+                                        qihse_federation_ns_iter_cb cb,
+                                        void* user_data);
+
+/* ────────────────────────────────────────────────────────────────────────
+ * F2 — Event journal + watches (plan §8, §9, §12, §13).
+ *
+ * Every cross-node mutation carries a federation mutation envelope so the
+ * journal can deduplicate retries (idempotency), attribute changes, and
+ * detect conflicts.  The journal itself is an append-only log backed by
+ * qihse_event_stream under the "federation" topic; records form a hash
+ * chain for tamper-evidence.  Watches are resumable cursors over the
+ * journal with prefix filtering and at-least-once delivery.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* Mutation envelope (plan §8). Every cross-node write path carries this. */
+typedef struct {
+    qihse_uuid_t request_id;      /* idempotency key — retries reuse it */
+    qihse_uuid_t origin_node;     /* node that initiated the mutation */
+    qihse_uuid_t principal_id;    /* authenticated principal */
+    qihse_hlc_t  hlc;             /* causal timestamp */
+    uint64_t     expected_generation; /* CAS guard; 0 = no CAS */
+    uint64_t     fencing_epoch;   /* exclusive-state epoch; 0 = none */
+    qihse_consistency_class_t consistency;
+    uint32_t     flags;           /* reserved */
+} qihse_federation_mutation_t;
+
+/* Idempotency ledger (plan §9). Bounded, KV-backed under "fedreq:". Maps
+ * request_id -> result digest + completion generation. Every entry takes
+ * an explicit authenticated user (AGENTS.md invariant 1). */
+typedef struct {
+    qihse_uuid_t request_id;
+    uint64_t     completed_generation;
+    uint32_t     result_code;
+    char         result_digest[64]; /* hex SHA-384 truncated, or empty */
+} qihse_federation_request_result_t;
+
+#define QIHSE_FEDERATION_REQ_PREFIX "fedreq:"
+
+/* Record a completed request. Returns false if the request_id is already
+ * present (caller should treat that as a replay and fetch the stored result
+ * instead of re-executing). */
+bool qihse_federation_request_record(void* store_void, void* user_void,
+                                     const qihse_federation_request_result_t* result);
+/* Look up a previously completed request. Returns false if not found. */
+bool qihse_federation_request_lookup(void* store_void, void* user_void,
+                                     const qihse_uuid_t* request_id,
+                                     qihse_federation_request_result_t* out);
+/* Is this request_id already completed? (idempotency check before execute) */
+bool qihse_federation_request_seen(void* store_void, void* user_void,
+                                   const qihse_uuid_t* request_id);
+
+/* ── Event journal ──────────────────────────────────────────────────────── */
+
+#define QIHSE_FEDERATION_JOURNAL_TOPIC "federation"
+#define QIHSE_FEDERATION_EVENT_TYPE_MAX 63u
+
+typedef struct {
+    qihse_uuid_t event_id;        /* journal-assigned, monotonic-ish */
+    qihse_federation_mutation_t mutation;
+    char event_type[QIHSE_FEDERATION_EVENT_TYPE_MAX + 1u];
+    char resource_id[64];
+    uint64_t journal_offset;      /* assigned by the event stream */
+    uint8_t  previous_hash[48];   /* SHA-384 chain */
+    uint8_t  hash[48];            /* SHA-384 of (previous_hash || envelope || payload) */
+} qihse_federation_event_t;
+
+/* Opaque journal handle. Backed by qihse_event_stream. */
+typedef struct qihse_federation_journal qihse_federation_journal_t;
+
+qihse_federation_journal_t* qihse_federation_journal_open(const char* log_directory,
+                                                         qihse_es_durability_t durability);
+void qihse_federation_journal_destroy(qihse_federation_journal_t* journal);
+
+/* Append a federation event. The envelope's hlc is ticked from the journal's
+ * clock if it is zero; the event_id is generated if nil. The hash chain is
+ * extended from the previous record. Returns the journal offset, or 0 on
+ * failure. The payload is opaque bytes stored alongside the envelope. */
+uint64_t qihse_federation_journal_append(qihse_federation_journal_t* journal,
+                                        const qihse_federation_mutation_t* mutation,
+                                        const char* event_type,
+                                        const char* resource_id,
+                                        const uint8_t* payload, size_t payload_len,
+                                        qihse_federation_event_t* out_event);
+
+/* Replay events from a cursor (0 = beginning). Returns the number of events
+ * replayed. cb returns false to stop. */
+typedef bool (*qihse_federation_journal_cb)(const qihse_federation_event_t* event,
+                                           const uint8_t* payload, size_t payload_len,
+                                           void* user_data);
+uint64_t qihse_federation_journal_replay(qihse_federation_journal_t* journal,
+                                        uint64_t from_cursor,
+                                        qihse_federation_journal_cb cb,
+                                        void* user_data);
+
+/* Bounded replay that reports where to resume.
+ *
+ * The cursor is owned by the event stream (a record's size is only known once
+ * read), so a caller cannot compute the next offset from the current one.  A
+ * range transfer needs exactly this: ship at most `max_events` records from
+ * `from_cursor`, then learn the offset to resume from.  Returns the number of
+ * events delivered; `out_cursor` receives the resume point and is unchanged
+ * when nothing was delivered, which is what makes a failed round retryable. */
+uint64_t qihse_federation_journal_replay_window(qihse_federation_journal_t* journal,
+                                               uint64_t from_cursor,
+                                               uint64_t max_events,
+                                               qihse_federation_journal_cb cb,
+                                               void* user_data,
+                                               uint64_t* out_cursor);
+
+/* Current journal length (offset of the next append). */
+uint64_t qihse_federation_journal_length(qihse_federation_journal_t* journal);
+
+/* ── Resumable watches (plan §13) ───────────────────────────────────────── */
+
+typedef struct qihse_federation_watch qihse_federation_watch_t;
+
+typedef struct {
+    char prefix[64];        /* resource_id prefix filter; "" = all */
+    uint64_t cursor;        /* resume point; 0 = from beginning */
+    uint64_t last_ack;      /* highest acknowledged offset */
+    size_t  backlog_limit;  /* max unacked events before backpressure */
+} qihse_federation_watch_config_t;
+
+qihse_federation_watch_t* qihse_federation_watch_open(qihse_federation_journal_t* journal,
+                                                     const qihse_federation_watch_config_t* config);
+void qihse_federation_watch_destroy(qihse_federation_watch_t* watch);
+
+/* Fetch the next event matching the prefix filter. Returns false at
+ * end-of-journal (caller may poll or sleep). Advances the internal cursor
+ * but does NOT advance last_ack — call qihse_federation_watch_ack(). */
+bool qihse_federation_watch_next(qihse_federation_watch_t* watch,
+                                qihse_federation_event_t* out_event,
+                                uint8_t** out_payload, size_t* out_payload_len);
+
+/* Acknowledge events up to `offset`. At-least-once: unacked events are
+ * re-delivered on resume. */
+bool qihse_federation_watch_ack(qihse_federation_watch_t* watch, uint64_t offset);
+
+/* Resume a watch from a previously saved cursor (e.g. after reconnect). */
+bool qihse_federation_watch_resume(qihse_federation_watch_t* watch, uint64_t cursor);
+
+/* Get the current cursor and last_ack for persistence. */
+uint64_t qihse_federation_watch_cursor(const qihse_federation_watch_t* watch);
+uint64_t qihse_federation_watch_last_ack(const qihse_federation_watch_t* watch);
+/* Number of unacked events in the backlog. */
+size_t qihse_federation_watch_backlog(const qihse_federation_watch_t* watch);
+
+/* ────────────────────────────────────────────────────────────────────────
+ * F3 — Replication correctness (plan §10, §11).
+ *
+ * Anti-entropy: each namespace produces a manifest of range digests over
+ * sorted object IDs so peers can compare state without full dataset
+ * transfer.  Divergent ranges are reconciled by exchanging missing events
+ * from the F2 journal.
+ *
+ * Conflict handling: irreconcilable control-plane conflicts are never
+ * silently overwritten.  Each namespace has a conflict policy; conflicts
+ * are recorded as explicit conflict objects under "fedconf:" with both
+ * versions, causal metadata, origin nodes, principal, reason, and
+ * resolution status.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* Conflict policies (plan §11). */
+typedef enum {
+    QIHSE_CONFLICT_LWW_HLC = 0,      /* last-writer-wins by HLC */
+    QIHSE_CONFLICT_MERGE_SET,        /* set union merge */
+    QIHSE_CONFLICT_COUNTER,          /* CRDT counter merge */
+    QIHSE_CONFLICT_APPEND_ONLY,      /* append, never overwrite */
+    QIHSE_CONFLICT_MANUAL,           /* require operator resolution */
+    QIHSE_CONFLICT_REJECT,            /* reject the conflicting write */
+    QIHSE_CONFLICT_CUSTOM             /* caller-defined merge function */
+} qihse_conflict_policy_t;
+
+const char* qihse_conflict_policy_name(qihse_conflict_policy_t policy);
+bool qihse_conflict_policy_parse(const char* name, qihse_conflict_policy_t* out);
+
+/* Conflict object (plan §11). Stored under "fedconf:<uuid>". */
+typedef struct {
+    qihse_uuid_t conflict_id;        /* assigned at creation */
+    char namespace_name[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+    char resource_id[64];
+    qihse_conflict_policy_t policy;
+    qihse_federation_mutation_t local_mutation;
+    qihse_federation_mutation_t remote_mutation;
+    uint8_t local_value[256];
+    size_t local_value_len;
+    uint8_t remote_value[256];
+    size_t remote_value_len;
+    char reason[128];
+    bool resolved;
+    qihse_uuid_t resolved_by;        /* nil if unresolved */
+    uint64_t resolved_at_hlc_physical;
+} qihse_federation_conflict_t;
+
+#define QIHSE_FEDERATION_CONFLICT_PREFIX "fedconf:"
+
+/* Record a conflict. Returns false if a conflict with the same id exists.
+ * Every entry takes an explicit authenticated user (AGENTS.md invariant 1). */
+bool qihse_federation_conflict_record(void* store_void, void* user_void,
+                                     const qihse_federation_conflict_t* conflict);
+/* Look up a conflict by id. */
+bool qihse_federation_conflict_lookup(void* store_void, void* user_void,
+                                      const qihse_uuid_t* conflict_id,
+                                      qihse_federation_conflict_t* out);
+/* Mark a conflict resolved. */
+bool qihse_federation_conflict_resolve(void* store_void, void* user_void,
+                                       const qihse_uuid_t* conflict_id,
+                                       const qihse_uuid_t* resolver);
+/* Iterate unresolved conflicts. cb returns false to stop. */
+typedef bool (*qihse_federation_conflict_cb)(const qihse_federation_conflict_t* conflict,
+                                            void* user_data);
+void qihse_federation_conflict_foreach(void* store_void, void* user_void,
+                                       qihse_federation_conflict_cb cb,
+                                       void* user_data);
+
+/* ── Namespace manifest (plan §10) ──────────────────────────────────────── */
+
+/* A manifest entry covers a contiguous range of object IDs and carries a
+ * SHA-384 digest of the sorted (id, generation, hlc) tuples in that range.
+ * Peers compare manifests to identify divergent ranges without transferring
+ * the full dataset. */
+#define QIHSE_FEDERATION_MANIFEST_MAX_RANGES 64u
+
+typedef struct {
+    char range_start[64];   /* inclusive lower bound of object id range */
+    char range_end[64];     /* exclusive upper bound; "" = end of keyspace */
+    uint64_t object_count;
+    uint8_t digest[48];     /* SHA-384 of sorted (id||generation||hlc) */
+} qihse_federation_manifest_entry_t;
+
+typedef struct {
+    char namespace_name[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+    uint64_t total_objects;
+    uint64_t max_generation;
+    qihse_hlc_t max_hlc;
+    size_t entry_count;
+    qihse_federation_manifest_entry_t entries[QIHSE_FEDERATION_MANIFEST_MAX_RANGES];
+} qihse_federation_manifest_t;
+
+/* Build a manifest for a namespace by scanning KV keys with the namespace
+ * prefix. The scan takes an explicit authenticated user (AGENTS.md invariant 1). */
+bool qihse_federation_manifest_build(void* store_void, void* user_void,
+                                     const char* namespace_name,
+                                     qihse_federation_manifest_t* out);
+
+/* Compare two manifests. Returns the number of divergent ranges. Divergent
+ * ranges are written to `out_divergent` (up to out_cap). A range is divergent
+ * if the digests differ or the object counts differ. */
+size_t qihse_federation_manifest_compare(const qihse_federation_manifest_t* local,
+                                        const qihse_federation_manifest_t* remote,
+                                        qihse_federation_manifest_entry_t* out_divergent,
+                                        size_t out_cap);
+
+/* ── Anti-entropy sync (plan §10) ───────────────────────────────────────── */
+
+/* A sync plan identifies what a peer needs to send or receive. */
+typedef enum {
+    QIHSE_SYNC_NONE = 0,
+    QIHSE_SYNC_FETCH,    /* local is missing objects remote has */
+    QIHSE_SYNC_SEND,     /* remote is missing objects local has */
+    QIHSE_SYNC_CONFLICT  /* both have objects but they diverge */
+} qihse_sync_action_t;
+
+typedef struct {
+    char range_start[64];
+    char range_end[64];
+    qihse_sync_action_t action;
+} qihse_federation_sync_range_t;
+
+/* Produce a sync plan from a manifest comparison. Returns the number of
+ * ranges needing action. */
+size_t qihse_federation_sync_plan(const qihse_federation_manifest_t* local,
+                                 const qihse_federation_manifest_t* remote,
+                                 qihse_federation_sync_range_t* out_ranges,
+                                 size_t out_cap);
+
+/* ────────────────────────────────────────────────────────────────────────
+ * F4 — Strong namespace (plan §7.2, §7.3, §14, §15, §16).
+ *
+ * Strong namespaces require:
+ *   - native compare-and-swap (CAS) on generation-tagged objects;
+ *   - monotonic, non-reusable fencing epochs;
+ *   - a lease primitive with server-side expiry;
+ *   - scoped replication groups (not a monolithic federation quorum).
+ *
+ * Consensus is NOT implemented as Raft in F4 — the plan explicitly forbids
+ * labeling a component Raft without full Raft safety mechanics.  F4 provides
+ * the data structures and local primitives; actual consensus is a future
+ * stage.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* ── Native CAS (plan §7.2) ─────────────────────────────────────────────── */
+
+/* A CAS result tells the caller whether the swap succeeded, what the old
+ * generation was, and what the new generation is. */
+typedef struct {
+    bool swapped;           /* true if the CAS succeeded */
+    uint64_t old_generation;/* generation observed before the CAS */
+    uint64_t new_generation;/* generation after the CAS (old+1 on success) */
+} qihse_federation_cas_result_t;
+
+/* Atomically compare-and-swap a generation-tagged object value.
+ *
+ * The object is stored under "fedobj:<namespace>:<resource_id>" and its
+ * value format is "<generation>\t<value>".  If expected_generation matches
+ * the stored generation, the value is replaced and the generation is
+ * incremented.  Otherwise the swap fails and the current generation is
+ * returned in old_generation.
+ *
+ * Every CAS takes an explicit authenticated user (AGENTS.md invariant 1).
+ * The CAS is atomic under the federation CAS lock. */
+bool qihse_federation_object_cas(void* store_void, void* user_void,
+                                 const char* namespace_name,
+                                 const char* resource_id,
+                                 uint64_t expected_generation,
+                                 const char* new_value,
+                                 qihse_federation_cas_result_t* result);
+
+/* Read a generation-tagged object. Returns false if not found. */
+bool qihse_federation_object_get(void* store_void, void* user_void,
+                                 const char* namespace_name,
+                                 const char* resource_id,
+                                 uint64_t* out_generation,
+                                 char* out_value, size_t out_value_cap);
+
+/* ── Fencing epochs (plan §7.3) ─────────────────────────────────────────── */
+
+/* Fencing epochs are monotonic and non-reusable.  Each node maintains a
+ * persistent counter under "fedepoch:<node_id>".  EPOCH.NEXT advances the
+ * counter and returns the new value.  The counter never goes backwards. */
+uint64_t qihse_federation_epoch_next(void* store_void, void* user_void,
+                                      const qihse_uuid_t* node_id);
+uint64_t qihse_federation_epoch_current(void* store_void, void* user_void,
+                                        const qihse_uuid_t* node_id);
+
+/* ── Lease primitive (plan §14) ───────────────────────────────────────────
+ *
+ * PHASE-B LIVENESS CONTRACT (R7 gap-analysis fixes — honest statement):
+ *
+ *   Server-side expiry: a GRANTED lease whose expires_hlc_physical is
+ *   non-zero and in the past (now_ms > expires) is DEAD.  The dead state
+ *   becomes visible three ways: (1) qihse_federation_lease_renew() and
+ *   qihse_federation_lease_renew_checked() refuse it AND persist the
+ *   EXPIRED transition (reap); (2) qihse_federation_lease_acquire()
+ *   reaps a dead predecessor when taking over the resource and reaps a
+ *   dead lease reached through the request-id idempotency index; the new
+ *   lease then supersedes it on the resource record; (3)
+ *   qihse_federation_lease_read() derives EXPIRED in the returned copy
+ *   (without persisting) so readers never see a time-dead lease reported
+ *   as GRANTED.  Acquire does not re-validate the REQUESTED expiry: a
+ *   lease whose requested expiry is already past is granted in the
+ *   GRANTED state but is born-dead — the first renew/reap transition
+ *   marks it EXPIRED.
+ *
+ *   Holder check: acquire records the authenticated principal
+ *   (qihse_user_get_id of the caller's user context) in
+ *   holder_user_id / has_holder.  Every renewal must present the SAME
+ *   principal.  has_holder distinguishes "holder recorded" from legacy
+ *   records persisted before this contract: a lease with no recorded
+ *   holder CANNOT be renewed by anyone (id 0 is a valid principal — the
+ *   operator — so absence is a separate flag, not a zero sentinel).
+ *   Legacy records must re-acquire.  Fail closed.
+ *
+ *   Stale renewal rejection: every successful mutation advances
+ *   `generation` (acquire sets request->generation + 1; renew bumps by
+ *   1).  qihse_federation_lease_renew_checked() takes the caller's
+ *   expected generation and refuses on mismatch, so a renewal computed
+ *   against a stale view of the lease is rejected.
+ *
+ *   TIME AND PARTITION RISK (plan §42 — documented, not rewritten in
+ *   this pass): liveness is evaluated against the caller-supplied
+ *   now_ms of renew_checked; the module itself reads no clock.  The
+ *   compatibility wrapper renew() and the acquire/read paths use
+ *   wall-clock milliseconds (time(NULL) * 1000), the same source the
+ *   RESP handler uses to stamp issued_hlc_physical.  A partitioned node
+ *   with a skewed wall clock can therefore judge liveness divergently
+ *   from its peers until reconciliation.  The module's own HLC
+ *   (qihse_hlc_tick/observe) is the intended future source: callers of
+ *   renew_checked can feed an HLC-derived physical value (or any
+ *   deterministic, injected value — the test does exactly that).  The
+ *   fencing-epoch high-water mark bounds the damage of a holder that
+ *   wrongly believes its lease is alive: it may renew its record, but it
+ *   can never commit exclusive-resource actions at an epoch below the
+ *   high-water mark. */
+
+typedef enum {
+    QIHSE_LEASE_FREE = 0,
+    QIHSE_LEASE_GRANTED,
+    QIHSE_LEASE_EXPIRED,
+    QIHSE_LEASE_RELEASED
+} qihse_lease_state_t;
+
+const char* qihse_lease_state_name(qihse_lease_state_t state);
+
+typedef struct {
+    qihse_uuid_t lease_id;
+    qihse_uuid_t owner_node;
+    char namespace_name[QIHSE_FEDERATION_NS_NAME_MAX + 1u];
+    char resource_id[64];
+    uint64_t fencing_epoch;
+    uint64_t generation;
+    qihse_lease_state_t state;
+    uint64_t issued_hlc_physical;
+    uint64_t expires_hlc_physical;  /* 0 = no expiry */
+    qihse_uuid_t request_id;         /* for idempotency */
+    qihse_uuid_t issuer;
+    /* Authenticated principal that acquired (holds) the lease.  Set by
+     * acquire() from the caller's user context; renewals must present
+     * the same principal.  has_holder == false marks a legacy record
+     * persisted before this field existed — such records fail closed
+     * on renew (see the PHASE-B contract above). */
+    uint32_t holder_user_id;
+    bool has_holder;
+} qihse_federation_lease_t;
+
+#define QIHSE_FEDERATION_LEASE_PREFIX "fedlease:"
+/* Request-id index for idempotent retries. */
+#define QIHSE_FEDERATION_LEASE_REQUEST_PREFIX "fedleasereq:"
+/* Resource index carrying the monotonic fencing high-water mark.  Persists
+ * after release so a stale holder at a lower epoch can never re-acquire. */
+#define QIHSE_FEDERATION_LEASE_RESOURCE_PREFIX "fedleaseres:"
+
+/* Acquire a lease.  If a live lease exists for the resource, the acquire
+ * fails unless the caller's fencing_epoch is strictly greater than the
+ * existing lease's epoch (monotonic, non-reusable — a dead lease does not
+ * lower the mark).  A time-dead lease never blocks: acquire reaps it and
+ * supersedes it on the resource record.  Idempotent: a repeated request_id
+ * returns the existing lease (reaped first if time-dead).  The acquiring
+ * principal is recorded as the lease holder. */
+bool qihse_federation_lease_acquire(void* store_void, void* user_void,
+                                   const qihse_federation_lease_t* request,
+                                   qihse_federation_lease_t* out);
+
+/* Renewal outcome detail for qihse_federation_lease_renew_checked(). */
+typedef enum {
+    QIHSE_LEASE_RENEW_OK = 0,
+    QIHSE_LEASE_RENEW_ERR_INVALID,            /* NULL/nonsensical arguments */
+    QIHSE_LEASE_RENEW_ERR_NOT_FOUND,          /* no such lease id */
+    QIHSE_LEASE_RENEW_ERR_EXPIRED,            /* past expiry — DEAD (reaped) */
+    QIHSE_LEASE_RENEW_ERR_NOT_GRANTED,        /* released or otherwise dead */
+    QIHSE_LEASE_RENEW_ERR_HOLDER_MISMATCH,    /* renewal by a non-holder, or
+                                               * a legacy record with no
+                                               * recorded holder */
+    QIHSE_LEASE_RENEW_ERR_GENERATION_MISMATCH,/* stale expected_generation */
+    QIHSE_LEASE_RENEW_ERR_STORE               /* persistence failure */
+} qihse_federation_lease_renew_status_t;
+
+const char* qihse_federation_lease_renew_status_name(
+    qihse_federation_lease_renew_status_t status);
+
+/* Sentinel for "the caller declines the generation check" in
+ * qihse_federation_lease_renew_checked().  Engine-minted leases start at
+ * generation 1, so 0 is never a live generation value.  Expiry and holder
+ * checks are NOT skippable. */
+#define QIHSE_FEDERATION_LEASE_GENERATION_UNCHECKED 0u
+
+/* Fully-checked renewal (Phase-B primary path): refuses a time-dead lease
+ * (now_ms > expires_hlc_physical, 0 = never expires — evaluated against the
+ * CALLER-SUPPLIED now_ms so the liveness clock is injectable/deterministic;
+ * feed an HLC-derived value in production, see plan §42 note above), a
+ * non-holder, and — unless expected_generation is
+ * QIHSE_FEDERATION_LEASE_GENERATION_UNCHECKED — a renewal computed from a
+ * stale generation.  On QIHSE_LEASE_RENEW_OK the lease is re-written with
+ * the new expiry and generation advanced by one; on EXPIRED the record is
+ * reaped to QIHSE_LEASE_EXPIRED.  *out receives the resulting record on
+ * OK and EXPIRED. */
+qihse_federation_lease_renew_status_t qihse_federation_lease_renew_checked(
+    void* store_void, void* user_void,
+    const qihse_uuid_t* lease_id,
+    uint64_t expected_generation,
+    uint64_t now_ms,
+    uint64_t new_expires_hlc_physical,
+    qihse_federation_lease_t* out);
+
+/* Backward-compatible renewal wrapper (same signature as before Phase-B).
+ * Enforces everything renew_checked enforces EXCEPT the caller-supplied
+ * expected generation (the signature cannot carry it — callers who can
+ * supply one must migrate to renew_checked) and the explicit liveness
+ * clock: wall-clock milliseconds are used, with the documented plan §42
+ * partition risk.  Returns false on every condition renew_checked
+ * refuses; inspect via renew_checked for the specific reason.  A
+ * successful renew advances generation by one. */
+bool qihse_federation_lease_renew(void* store_void, void* user_void,
+                                 const qihse_uuid_t* lease_id,
+                                 uint64_t new_expires_hlc_physical,
+                                 qihse_federation_lease_t* out);
+
+/* Release a lease.  Idempotent: releasing an already-released lease succeeds. */
+bool qihse_federation_lease_release(void* store_void, void* user_void,
+                                   const qihse_uuid_t* lease_id);
+
+/* Read a lease by id.  Read-only: the returned copy derives EXPIRED for a
+ * GRANTED lease past its expiry (without persisting the transition), so a
+ * time-dead lease is never reported as granted; the persisted state
+ * changes only through renew/acquire reaping or release. */
+bool qihse_federation_lease_read(void* store_void, void* user_void,
+                                 const qihse_uuid_t* lease_id,
+                                 qihse_federation_lease_t* out);
+
+/* ── Replication groups (plan §15) ──────────────────────────────────────── */
+
+#define QIHSE_FEDERATION_GROUP_MAX_MEMBERS 32u
+
+typedef struct {
+    qihse_uuid_t member_id;
+    bool is_voter;
+    bool is_witness;
+} qihse_federation_group_member_t;
+
+typedef struct {
+    char group_id[64];
+    size_t member_count;
+    qihse_federation_group_member_t members[QIHSE_FEDERATION_GROUP_MAX_MEMBERS];
+    uint64_t term;
+    qihse_consistency_class_t consistency;
+} qihse_federation_group_t;
+
+#define QIHSE_FEDERATION_GROUP_PREFIX "fedgrp:"
+
+/* Create a replication group. Returns false if the group already exists. */
+bool qihse_federation_group_create(void* store_void, void* user_void,
+                                   const qihse_federation_group_t* group);
+/* Look up a group by id. */
+bool qihse_federation_group_lookup(void* store_void, void* user_void,
+                                   const char* group_id,
+                                   qihse_federation_group_t* out);
+/* Add or update a member. */
+bool qihse_federation_group_add_member(void* store_void, void* user_void,
+                                       const char* group_id,
+                                       const qihse_federation_group_member_t* member);
+/* Remove a member. */
+bool qihse_federation_group_remove_member(void* store_void, void* user_void,
+                                          const char* group_id,
+                                          const qihse_uuid_t* member_id);
+/* Advance the term. Returns the new term. */
+uint64_t qihse_federation_group_advance_term(void* store_void, void* user_void,
+                                              const char* group_id);
+/* List all groups. cb returns false to stop. */
+typedef bool (*qihse_federation_group_cb)(const qihse_federation_group_t* group,
+                                         void* user_data);
+void qihse_federation_group_foreach(void* store_void, void* user_void,
+                                    qihse_federation_group_cb cb,
+                                    void* user_data);
+
+/* ────────────────────────────────────────────────────────────────────────
+ * F5 — Trust plane (plan §17, §18, §19, §20).
+ *
+ * Node identity is a durable keypair, not an IP address, hostname, or
+ * topology index.  Enrollment is an operator-approved flow:
+ *
+ *   generate node key -> operator approves -> federation CA signs
+ *     -> node obtains scoped certificate -> QIHSE stores enrollment event
+ *
+ * Private keys are NEVER placed in QIHSE records.  Records carry a key
+ * handle (a filesystem reference) and the public key only (plan §20).
+ *
+ * Gossip becomes a signed membership/health plane with a replay window.
+ * A UDP datagram is never trusted merely because its source IP matches a
+ * configured peer (plan §17).
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* ── Infrastructure authorization scopes (plan §19) ─────────────────────── */
+
+typedef uint32_t qihse_infra_scope_t;
+
+#define QIHSE_SCOPE_NONE              (0u)
+#define QIHSE_SCOPE_FEDERATION_READ   (1u << 0)
+#define QIHSE_SCOPE_FEDERATION_WRITE  (1u << 1)
+#define QIHSE_SCOPE_NODE_ENROLL       (1u << 2)
+#define QIHSE_SCOPE_NODE_REVOKE       (1u << 3)
+#define QIHSE_SCOPE_POLICY_READ       (1u << 4)
+#define QIHSE_SCOPE_POLICY_WRITE      (1u << 5)
+#define QIHSE_SCOPE_LEASE_READ        (1u << 6)
+#define QIHSE_SCOPE_LEASE_WRITE       (1u << 7)
+#define QIHSE_SCOPE_SECURITY_ADMIN    (1u << 8)
+#define QIHSE_SCOPE_AUDIT_READ        (1u << 9)
+#define QIHSE_SCOPE_TELEMETRY_WRITE   (1u << 10)
+
+/* Every scope that exists, for iteration/validation. */
+#define QIHSE_SCOPE_ALL               (0x7FFu)
+
+const char* qihse_infra_scope_name(qihse_infra_scope_t scope);
+bool qihse_infra_scope_parse(const char* name, qihse_infra_scope_t* out);
+
+/* Service identities are distinct from human principals.  KEYSTONE must
+ * receive a read/index identity, never database-admin privileges. */
+typedef enum {
+    QIHSE_IDENTITY_OPERATOR = 0,
+    QIHSE_IDENTITY_HYPERVISOR_CONTROLLER,
+    QIHSE_IDENTITY_HOST_AGENT,
+    QIHSE_IDENTITY_UI_API,
+    QIHSE_IDENTITY_KEYSTONE_INDEXER,
+    QIHSE_IDENTITY_BACKUP_AGENT
+} qihse_service_identity_t;
+
+const char* qihse_service_identity_name(qihse_service_identity_t kind);
+bool qihse_service_identity_parse(const char* name, qihse_service_identity_t* out);
+
+/* The default scope set granted to a service identity at enrollment.
+ * KEYSTONE_INDEXER deliberately receives read/index scopes only. */
+qihse_infra_scope_t qihse_service_identity_default_scopes(qihse_service_identity_t kind);
+
+/* Check whether an authenticated principal holds the required scope.
+ * The operator principal implicitly holds every scope. */
+bool qihse_infra_scope_check(void* user_void, qihse_infra_scope_t required);
+
+/* ── Node identity and trust (plan §18, §20) ────────────────────────────── */
+
+typedef enum {
+    QIHSE_TRUST_UNKNOWN = 0,
+    QIHSE_TRUST_PENDING,    /* enrollment requested, awaiting operator approval */
+    QIHSE_TRUST_APPROVED,   /* CA-signed and active */
+    QIHSE_TRUST_REVOKED     /* permanently denied */
+} qihse_trust_state_t;
+
+const char* qihse_trust_state_name(qihse_trust_state_t state);
+bool qihse_trust_state_parse(const char* name, qihse_trust_state_t* out);
+
+/* ── Signature algorithms ──────────────────────────────────────────────────
+ *
+ * Algorithm agility is a hard requirement, not a nicety: a node record or
+ * frame written under one algorithm must stay readable after the fleet moves
+ * to another.  Every persisted identity and every signed frame therefore
+ * carries its algorithm, and the key/signature fields are length-tagged.
+ *
+ * ML-DSA is FIPS 204.  Ed25519 is retained so pre-quantum records remain
+ * readable and so a bootstrap path exists, but it is not the default.
+ */
+typedef enum {
+    QIHSE_SIG_ED25519 = 0,      /* legacy / bootstrap only */
+    QIHSE_SIG_ML_DSA_44 = 1,    /* NIST level 2 */
+    QIHSE_SIG_ML_DSA_65 = 2,    /* NIST level 3 */
+    QIHSE_SIG_ML_DSA_87 = 3     /* NIST level 5, CNSA 2.0 */
+} qihse_sig_alg_t;
+
+/* The default for new node identities and signed membership statements. */
+#define QIHSE_SIG_ALG_DEFAULT QIHSE_SIG_ML_DSA_87
+
+const char* qihse_sig_alg_name(qihse_sig_alg_t alg);
+bool qihse_sig_alg_parse(const char* name, qihse_sig_alg_t* out);
+size_t qihse_sig_alg_public_key_bytes(qihse_sig_alg_t alg);
+size_t qihse_sig_alg_signature_bytes(qihse_sig_alg_t alg);
+bool qihse_sig_alg_is_post_quantum(qihse_sig_alg_t alg);
+
+/* Upper bounds across all supported algorithms, so records can be sized
+ * without a heap allocation.  Values are the ML-DSA-87 figures. */
+#define QIHSE_FEDERATION_PUBKEY_MAX_BYTES 2592u
+#define QIHSE_FEDERATION_SIG_MAX_BYTES    4627u
+#define QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES 48u /* SHA-384 */
+
+typedef struct {
+    qihse_uuid_t node_id;       /* durable, immutable identity */
+    char hostname[128];         /* mutable attribute — display only */
+    char boot_id[64];           /* boot/session identifier, changes per boot */
+    char key_handle[160];       /* filesystem reference to the private key */
+    qihse_sig_alg_t sig_alg;    /* which algorithm public_key belongs to */
+    uint16_t public_key_len;
+    uint8_t public_key[QIHSE_FEDERATION_PUBKEY_MAX_BYTES];
+    uint8_t fingerprint[QIHSE_FEDERATION_NODE_FINGERPRINT_BYTES];
+    qihse_trust_state_t trust;
+    uint64_t enrollment_epoch;
+    qihse_service_identity_t identity_kind;
+    qihse_infra_scope_t scopes;
+    uint32_t capabilities;      /* RESERVED.  Not a capability profile: too
+                                 * small for the five-field tuple, and this is
+                                 * a trust record that must not be rewritten
+                                 * at heartbeat rate.  The durable capability
+                                 * profile is qihse_federation_node_capability_t
+                                 * at federation/node/<uuid> (W2.4). */
+    uint64_t last_hlc_physical;
+} qihse_federation_node_identity_t;
+
+#define QIHSE_FEDERATION_NODE_PREFIX "fednode:"
+
+/* Generate a durable node identity keypair.  The private key is written to
+ * "<key_directory>/<node_id>.key" with 0600 permissions; only the public key
+ * and a key handle are returned.  The private key never enters a QIHSE
+ * record (plan §20).  key_directory must exist. */
+bool qihse_federation_node_keygen(const char* key_directory,
+                                  const qihse_uuid_t* node_id,
+                                  uint8_t* out_public_key,
+                                  char* out_key_handle, size_t out_key_handle_cap);
+
+/* Algorithm-agile key generation.  Fills sig_alg, public_key,
+ * public_key_len, key_handle and fingerprint.  node_id and hostname must be
+ * set by the caller first. */
+bool qihse_federation_node_keygen_alg(const char* key_directory,
+                                      qihse_sig_alg_t alg,
+                                      qihse_federation_node_identity_t* out);
+
+/* Compute the SHA-384 fingerprint of a raw public key of the given length. */
+bool qihse_federation_node_fingerprint(const uint8_t* public_key,
+                                       size_t public_key_len,
+                                       uint8_t* out_fingerprint);
+
+/* Load a node private key from a handle.  Returns an opaque EVP_PKEY* which
+ * the caller must release with qihse_federation_node_key_free(). */
+void* qihse_federation_node_key_load(const char* key_handle);
+void qihse_federation_node_key_free(void* pkey);
+
+/* Enrollment: request records a PENDING identity; approve promotes it to
+ * APPROVED and assigns the enrollment epoch; revoke marks it REVOKED and
+ * makes it permanently unusable. */
+bool qihse_federation_node_enroll_request(void* store_void, void* user_void,
+                                         const qihse_federation_node_identity_t* identity);
+bool qihse_federation_node_enroll_approve(void* store_void, void* user_void,
+                                         const qihse_uuid_t* node_id,
+                                         uint64_t enrollment_epoch);
+bool qihse_federation_node_revoke(void* store_void, void* user_void,
+                                  const qihse_uuid_t* node_id);
+bool qihse_federation_node_lookup(void* store_void, void* user_void,
+                                  const qihse_uuid_t* node_id,
+                                  qihse_federation_node_identity_t* out);
+
+typedef bool (*qihse_federation_node_cb)(const qihse_federation_node_identity_t* node,
+                                        void* user_data);
+void qihse_federation_node_foreach(void* store_void, void* user_void,
+                                   qihse_federation_node_cb cb, void* user_data);
+
+/* ── Node capability records (W2.4) ──────────────────────────────────────
+ *
+ * A NODE_CAP bus frame is a 50-byte, unauthenticated, in-memory hint: it is
+ * lost on restart, and nothing binds the node id in the payload to the
+ * sender.  The durable record below is the first-class form of that payload,
+ * stored at "federation/node/<uuid>" — the same per-node resource path the
+ * federation journal already uses for trust.state.changed.
+ *
+ * It is a SEPARATE record from the identity record (fednode:<uuid>) rather
+ * than fields on it, because:
+ *   1. The identity record is the object of trust: enroll/approve/revoke
+ *      rewrite it with a read-decode-modify-encode cycle.  Capability changes
+ *      at heartbeat rate, so merging them would turn every capability update
+ *      into a read-modify-write of a trust record, where a lost update could
+ *      silently revert an approval or a revocation.
+ *   2. The identity record carries a 2592-byte ML-DSA-87 public key (~5 KB
+ *      hex on disk).  A 1 Hz capability refresh must not rewrite it.
+ *   3. Trust changes are journaled (trust.state.changed).  A capability
+ *      observation is not a trust change and must not look like one.
+ *
+ * Trust state is still part of the record, as the item requires, but it is a
+ * SNAPSHOT taken at admission time for attribution and audit.  It is NOT
+ * authorization: qihse_federation_node_capability_lookup_admissible()
+ * re-reads the identity record, so a node revoked after its capability was
+ * recorded stops being admissible.
+ *
+ * The stored values are always a CLAIM, never an attested fact.  A signature
+ * proves which node made the claim, not that the hardware exists.  A
+ * self-reported record therefore has QIHSE_CAP_FLAG_ATTESTED clear; nothing
+ * in this library sets that flag.
+ *
+ * Producers:
+ *   - qihse_federation_node_capability_record_local() — the node's own probe
+ *     (authenticated by construction).  The cluster bus calls this for its
+ *     configured local_node_uuid.
+ *   - qihse_federation_gossip_accept() — a signature-verified v3 membership
+ *     statement from an APPROVED node persists that node's profile.  An
+ *     unauthenticated NODE_CAP frame never writes this record: a durable
+ *     record that any host on the wire can poison is worse than an
+ *     in-memory hint that any host on the wire can poison.
+ */
+
+#define QIHSE_FEDERATION_NODE_CAP_PREFIX "federation/node/"
+
+/* The known ISA tier enum (0=generic .. 4=AVX-512+AMX).  A claim outside this
+ * range is refused on write and on read. */
+#define QIHSE_FEDERATION_CAP_ISA_TIER_MAX 4u
+
+typedef enum {
+    QIHSE_CAP_SOURCE_NONE = 0,            /* no claim on record */
+    QIHSE_CAP_SOURCE_LOCAL_PROBE = 1,     /* this node's own hardware probe */
+    QIHSE_CAP_SOURCE_SIGNED_STATEMENT = 2,/* signature-verified peer statement */
+    QIHSE_CAP_SOURCE_OPERATOR = 3         /* operator-attested (reserved) */
+} qihse_capability_source_t;
+
+const char* qihse_capability_source_name(qihse_capability_source_t source);
+
+/* Bit 0: the values have been attested by an operator rather than merely
+ * claimed by the node.  Never set by a self-report. */
+#define QIHSE_CAP_FLAG_ATTESTED 0x1u
+
+/* The five NODE_CAP fields, without the node id. */
+typedef struct {
+    uint8_t isa_tier;          /* 0..QIHSE_FEDERATION_CAP_ISA_TIER_MAX */
+    uint8_t npu;               /* 0 or 1 */
+    uint8_t gpu;               /* 0 or 1 */
+    uint32_t free_ram_mb;
+    uint16_t load_pct;
+} qihse_federation_capability_values_t;
+
+/* A signed dispatch endpoint (v4 membership statement): the address a peer
+ * advertises for FABRIC dispatch, inside the signed region.  This is
+ * deliberately NOT part of capability_values_t: hardware capabilities are
+ * a claim about what the node HAS, an endpoint is a claim about where its
+ * dispatch listener IS, and conflating them would let a capability update
+ * silently rewrite a dial target.  port == 0 means "not advertised" and
+ * requires an empty host; a nonzero port requires a printable host. */
+#define QIHSE_FEDERATION_ENDPOINT_HOST_LEN 64u
+typedef struct {
+    char host[QIHSE_FEDERATION_ENDPOINT_HOST_LEN]; /* NUL-terminated within */
+    uint16_t port;
+} qihse_federation_endpoint_t;
+
+typedef struct {
+    qihse_uuid_t node_id;      /* key: federation/node/<uuid> */
+    qihse_uuid_t boot_id;      /* boot that made the claim (nil = local probe) */
+    qihse_uuid_t session_id;   /* signed-statement session (nil = local probe) */
+    uint64_t sequence;         /* statement sequence that carried the claim */
+    qihse_federation_capability_values_t values;
+    qihse_trust_state_t trust; /* trust state AT ADMISSION (snapshot, not auth) */
+    qihse_capability_source_t source;
+    uint32_t flags;
+    qihse_hlc_t observed;      /* when the claim was observed */
+    /* The node's signed dispatch endpoint, copied from a v4 statement.
+     * Empty for a v2/v3 statement and for a local probe: nothing unsigned
+     * may fill it — a topology host:port or a NODE_CAP frame is a hint,
+     * never a recorded endpoint. */
+    qihse_federation_endpoint_t dispatch_endpoint;
+} qihse_federation_node_capability_t;
+
+/* Record the LOCAL node's own hardware probe.  The trust snapshot is read
+ * from the node's identity record when one exists (UNKNOWN otherwise), never
+ * supplied by the caller, and the source is always LOCAL_PROBE.  Returns
+ * false for an out-of-range tuple or a storage failure. */
+bool qihse_federation_node_capability_record_local(
+    void* store_void, void* user_void, const qihse_uuid_t* node_id,
+    const qihse_federation_capability_values_t* values);
+
+/* Read the durable capability record for a node.  The body's node id must
+ * agree with the key, every field is range-checked, and an unknown record
+ * version is refused.  This does NOT check trust: it returns what is stored,
+ * for audit and for callers that only want provenance. */
+bool qihse_federation_node_capability_lookup(void* store_void, void* user_void,
+                                             const qihse_uuid_t* node_id,
+                                             qihse_federation_node_capability_t* out);
+
+/* Read a capability record AND require that the node is APPROVED right now.
+ * The identity record is re-read, so a revocation invalidates capability data
+ * that was admitted earlier.  This is the accessor a placement decision must
+ * use: it is the difference between "somebody claimed this" and "this is
+ * usable". */
+bool qihse_federation_node_capability_lookup_admissible(
+    void* store_void, void* user_void, const qihse_uuid_t* node_id,
+    qihse_federation_node_capability_t* out);
+
+typedef enum {
+    QIHSE_GOSSIP_ACCEPTED = 0,
+    QIHSE_GOSSIP_REJECT_MALFORMED,
+    QIHSE_GOSSIP_REJECT_VERSION,
+    QIHSE_GOSSIP_REJECT_UNKNOWN_SENDER,
+    QIHSE_GOSSIP_REJECT_UNTRUSTED_SENDER,
+    QIHSE_GOSSIP_REJECT_BAD_SIGNATURE,
+    QIHSE_GOSSIP_REJECT_REPLAY
+} qihse_gossip_result_t;
+
+const char* qihse_gossip_result_name(qihse_gossip_result_t result);
+
+/* ── Signed gossip: membership statements and heartbeats (plan §17) ───────
+ *
+ * Two tiers, because they have different costs and different authority:
+ *
+ *   MEMBERSHIP STATEMENT  signed, interval-based or on change.  This is what
+ *                         carries authority: it names the node, its boot
+ *                         session, its capabilities and health, and it mints
+ *                         the session id that authenticates the cheap tier.
+ *
+ *   HEARTBEAT             unsigned, frequent, small.  Carries liveness only,
+ *                         and is accepted ONLY while it matches the session
+ *                         id from a valid statement.  A heartbeat therefore
+ *                         cannot be forged without forging a statement, so
+ *                         liveness is not a weaker claim than membership.
+ *
+ * Signing on an interval rather than per packet is what makes ML-DSA
+ * affordable here: the signature cost is amortised over the interval, and a
+ * lost statement is simply replaced by the next one.
+ */
+
+#define QIHSE_FEDERATION_GOSSIP_MAGIC 0x51484753u /* "QHGS" */
+/* The version a producer writes by DEFAULT.  Version 3 is opt-in: a producer
+ * that wants its capability profile recorded sets version 3 and fills caps.
+ * Keeping the default at 2 means an existing producer's frames are byte-for-
+ * byte what they were, and a mixed-version cluster does not see a new frame
+ * length it cannot parse. */
+#define QIHSE_FEDERATION_GOSSIP_VERSION 2u
+/* v3 adds the NODE_CAP profile to the signed region (W2.4). */
+#define QIHSE_FEDERATION_GOSSIP_VERSION_CAPABILITY 3u
+/* v4 adds the signed dispatch endpoint (ai-fabric endpoint discovery):
+ * the address a node advertises for FABRIC dispatch, signed like the
+ * capability profile.  A v4 statement is what populates the durable
+ * capability record's dispatch_endpoint field. */
+#define QIHSE_FEDERATION_GOSSIP_VERSION_ENDPOINT 4u
+/* Both versions remain readable and verifiable: the serializer and the
+ * verifier write/check the layout the frame's OWN version names, so an old
+ * record on disk still verifies against the v2 bytes it was signed over.
+ * v2 carries no capability profile, so a v2 statement is accepted without
+ * touching the durable capability record. */
+#define QIHSE_FEDERATION_GOSSIP_VERSION_MIN 2u
+#define QIHSE_FEDERATION_GOSSIP_VERSION_MAX QIHSE_FEDERATION_GOSSIP_VERSION_ENDPOINT
+#define QIHSE_FEDERATION_HEARTBEAT_MAGIC 0x51484842u /* "QHHB" */
+#define QIHSE_FEDERATION_HEARTBEAT_VERSION 1u
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;          /* protocol version */
+    uint16_t feature_bitmap;   /* feature negotiation */
+    qihse_uuid_t cluster_id;   /* cluster/federation UUID */
+    qihse_uuid_t sender_node;  /* sender node UUID, not topology index */
+    qihse_uuid_t boot_id;      /* boot/session UUID */
+    /* Mints the session id that the cheap heartbeat tier must match.  A new
+     * statement starts a new session, which retires every old heartbeat. */
+    qihse_uuid_t session_id;
+    uint64_t sequence;         /* monotonic per boot */
+    qihse_hlc_t hlc;
+    uint32_t capability_bitmap;
+    uint32_t health_summary;
+    /* v3: the NODE_CAP profile, INSIDE the signed region.  A capability claim
+     * that steers placement must be attributable, so it is covered by the
+     * signature rather than sent as a separate unauthenticated frame.  Zero
+     * for a v2 statement. */
+    qihse_federation_capability_values_t caps;
+    /* v4: the signed dispatch endpoint — where this node's fabric dispatch
+     * listener accepts jobs.  Zero (empty host, port 0) for a node that does
+     * not advertise one.  Part of the signed region, so a forged endpoint is
+     * a signature failure, not a misdirected dial. */
+    qihse_federation_endpoint_t dispatch_endpoint;
+    qihse_sig_alg_t sig_alg;
+    uint16_t signature_len;
+    uint8_t signature[QIHSE_FEDERATION_SIG_MAX_BYTES];
+} qihse_federation_gossip_t;
+
+/* The bytes covered by the signature: every field except the signature
+ * itself.  Serialization is little-endian and length-prefixed so a peer
+ * cannot reinterpret fields, and it is VERSION-DEPENDENT so a frame signed
+ * under one version verifies under that version only. */
+bool qihse_federation_gossip_serialize(const qihse_federation_gossip_t* gossip,
+                                       uint8_t* out, size_t out_cap, size_t* out_len);
+
+/* Wire form of a statement: the signed region followed by the raw signature.
+ * Deserialization validates the magic, version, algorithm and length fields
+ * before returning, so a malformed frame never reaches the verifier. */
+bool qihse_federation_gossip_deserialize(const uint8_t* in, size_t in_len,
+                                         qihse_federation_gossip_t* out);
+/* Total wire size of a statement for the given algorithm, at the DEFAULT
+ * version.  A producer that writes another version must use the explicit
+ * version-aware form below, or its size check will not match its frame. */
+size_t qihse_federation_gossip_wire_size(qihse_sig_alg_t alg);
+/* Total wire size for an explicit version, so a sender can size a v2 frame
+ * as well as the current version.  Returns 0 for an unknown version. */
+size_t qihse_federation_gossip_wire_size_v(uint16_t version, qihse_sig_alg_t alg);
+
+/* Sign a statement in place. pkey is an EVP_PKEY* from node_key_load(). */
+bool qihse_federation_gossip_sign(void* pkey, qihse_federation_gossip_t* gossip);
+
+/* Verify a statement's signature against a raw public key of the algorithm
+ * named in the statement itself. */
+bool qihse_federation_gossip_verify(const uint8_t* public_key, size_t public_key_len,
+                                    const qihse_federation_gossip_t* gossip);
+
+/* ── Algorithm-agile detached signatures (plan §17) ──────────────────────
+ *
+ * The membership statement above is one consumer of a signature; a durable
+ * record that must be attributable (a brain decision, a supply-chain
+ * attestation) is another.  These primitives keep the algorithm knowledge in
+ * this module — the module that owns the algorithm table — so a consumer
+ * never has to hard-code a key type name.
+ *
+ * The caller is responsible for putting the algorithm INSIDE the bytes it
+ * signs (as the statement serializer does), so an algorithm-downgrade edit
+ * invalidates the signature rather than reinterpreting it.
+ */
+
+/* Algorithm of a loaded key handle (an EVP_PKEY* from node_key_load()).
+ * Returns false for a key type the federation does not support. */
+bool qihse_federation_pkey_sig_alg(void* pkey, qihse_sig_alg_t* out);
+
+/* Sign `data` with a loaded key.  `in_out_len` is the capacity of out_sig on
+ * entry and receives the bytes written; the capacity must be at least the
+ * algorithm's signature size. */
+bool qihse_federation_sign(void* pkey, const uint8_t* data, size_t data_len,
+                           uint8_t* out_sig, size_t* in_out_len);
+
+/* Verify a detached signature against a raw public key of the given
+ * algorithm.  The declared key and signature lengths are validated against
+ * the algorithm's fixed sizes before any crypto runs, so a truncated or
+ * padded signature never reaches the verifier. */
+bool qihse_federation_verify(qihse_sig_alg_t alg,
+                             const uint8_t* public_key, size_t public_key_len,
+                             const uint8_t* data, size_t data_len,
+                             const uint8_t* signature, size_t signature_len);
+
+/* ── Cheap heartbeat tier ──────────────────────────────────────────────── */
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    qihse_uuid_t sender_node;
+    qihse_uuid_t boot_id;
+    qihse_uuid_t session_id;   /* must match the current signed statement */
+    uint64_t sequence;         /* monotonic within the session */
+    qihse_hlc_t hlc;
+    uint32_t health_summary;
+} qihse_federation_heartbeat_t;
+
+bool qihse_federation_heartbeat_serialize(const qihse_federation_heartbeat_t* hb,
+                                          uint8_t* out, size_t out_cap, size_t* out_len);
+bool qihse_federation_heartbeat_deserialize(const uint8_t* in, size_t in_len,
+                                            qihse_federation_heartbeat_t* out);
+
+/* Accept a heartbeat.  Succeeds only when a valid signed statement for the
+ * same (sender, boot) is on record, the session ids match, and the heartbeat
+ * sequence advances.  A heartbeat from a node that has never signed, or that
+ * carries a retired session id, is refused. */
+qihse_gossip_result_t qihse_federation_heartbeat_accept(void* store_void, void* user_void,
+                                                       const qihse_federation_heartbeat_t* hb);
+
+/* ── Liveness versus membership: enforced by type, not by comment ────────
+ *
+ * A heartbeat is accepted only while it matches the session id minted by a
+ * signed statement, so it cannot be forged without forging a statement.  But
+ * the session id is minted on an interval, so an attacker who can read the
+ * wire can forge a heartbeat for up to one interval.
+ *
+ * What that buys is a false LIVENESS claim, and the harm from that is delayed
+ * failover.  So the rule is: liveness may inform health, and must never inform
+ * authority.
+ *
+ * That rule is enforced by the type system rather than by documentation.  A
+ * liveness observation and a membership record are different types, and only a
+ * signature-checked statement converts into a membership record.  A consumer
+ * that needs to make an authority decision (slot ownership, lease grant, voter
+ * eligibility) cannot pass a liveness observation where membership is
+ * required: the compiler refuses.  A comment could not do that.
+ */
+typedef struct {
+    qihse_uuid_t sender_node;
+    qihse_uuid_t boot_id;
+    uint64_t sequence;
+    uint32_t health_summary;
+} qihse_federation_liveness_t;
+
+typedef struct {
+    qihse_uuid_t sender_node;
+    qihse_uuid_t boot_id;
+    qihse_uuid_t session_id;
+    uint64_t sequence;
+    qihse_hlc_t hlc;
+    uint32_t capability_bitmap;
+    uint32_t health_summary;
+    qihse_federation_capability_values_t caps; /* v3 statements; zero for v2 */
+    qihse_federation_endpoint_t dispatch_endpoint; /* v4; empty otherwise */
+    qihse_sig_alg_t sig_alg;
+} qihse_federation_membership_t;
+
+/* The ONLY way to obtain a membership record: from a statement that already
+ * passed signature, trust-state and replay verification.  There is no
+ * conversion from a liveness observation, by design. */
+bool qihse_federation_membership_from_statement(const qihse_federation_gossip_t* stmt,
+                                               qihse_federation_membership_t* out);
+
+/* Read the recorded statement for a (sender, boot).  Returns false if the
+ * node has not signed. */
+bool qihse_federation_gossip_statement_read(void* store_void, void* user_void,
+                                            const qihse_uuid_t* sender_node,
+                                            const qihse_uuid_t* boot_id,
+                                            qihse_federation_gossip_t* out);
+
+/* Replay-window state, one per (sender node, boot). */
+typedef struct {
+    qihse_uuid_t sender_node;
+    qihse_uuid_t boot_id;
+    uint64_t highest_sequence;
+    uint64_t first_seen_hlc_physical;
+} qihse_federation_replay_state_t;
+
+#define QIHSE_FEDERATION_REPLAY_PREFIX "fedreplay:"
+
+/* Accept a gossip frame: checks the magic/version, the sender's trust state,
+ * the signature against the enrolled public key, and the replay window.
+ * A frame is rejected if its sequence is not strictly greater than the
+ * highest sequence already accepted from that (sender, boot).
+ *
+ * A v3 frame also carries the sender's NODE_CAP profile inside the signed
+ * region; on acceptance that profile is persisted as the sender's durable
+ * capability record at "federation/node/<uuid>", with the trust state it was
+ * admitted under.  This is the producer for peer capability data: it only
+ * ever runs on a signature-verified frame from an APPROVED node.  A storage
+ * failure refuses the frame (the same way a statement-store failure does)
+ * rather than silently leaving the record missing.
+ *
+ * Replay state persists under "fedreplay:<node>:<boot>" so a restart does
+ * not reopen the window.  Every call takes an explicit authenticated user
+ * (AGENTS.md invariant 1). */
+
+qihse_gossip_result_t qihse_federation_gossip_accept(void* store_void, void* user_void,
+                                                    const qihse_federation_gossip_t* gossip);
+
+/* Read the stored replay state for a (sender, boot). */
+bool qihse_federation_replay_state_read(void* store_void, void* user_void,
+                                        const qihse_uuid_t* sender_node,
+                                        const qihse_uuid_t* boot_id,
+                                        qihse_federation_replay_state_t* out);
+
+/* ── Statement production ──────────────────────────────────────────────────
+ *
+ * qihse_federation_statement_mint() is the PRODUCER half of signed gossip:
+ * it fills a v4 statement for the local node and signs it in place.  The
+ * sequence continues from the highest recorded sequence for (sender, boot)
+ * — a mint mid-boot can never emit a frame a receiver's replay window would
+ * refuse — and a FRESH session id is generated per call, because a new
+ * statement retires every heartbeat issued under the old one by design.
+ *
+ * Nothing is emitted when the signature cannot be produced.  `caps` may be
+ * NULL (a statement with a zeroed profile is still attributable
+ * membership); `endpoint` may be NULL (the node advertises no dispatch
+ * listener) and is validated when given — an endpoint that violates the
+ * host/port contract fails the mint rather than producing a statement no
+ * receiver will accept.  This function does NOT check enrollment or
+ * approval — receivers enforce that — but a producer that mints for a node
+ * that is not enrolled produces frames every peer refuses, which is noise
+ * rather than harm. */
+bool qihse_federation_statement_mint(void* store_void, void* user_void,
+                                     const qihse_uuid_t* cluster_id,
+                                     const qihse_uuid_t* sender_node,
+                                     const qihse_uuid_t* boot_id,
+                                     const qihse_federation_capability_values_t* caps,
+                                     const qihse_federation_endpoint_t* endpoint,
+                                     void* pkey,
+                                     qihse_federation_gossip_t* out);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* QIHSE_FEDERATION_H */

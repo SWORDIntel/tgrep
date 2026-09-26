@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use crate::native;
 
@@ -10,6 +11,11 @@ pub const SEGMENT_MAGIC: u32 = 0x54475331; // "TGS1"
 pub const FORMAT_VERSION: u16 = 1;
 pub const FOOTER_MAGIC: u32 = 0x5447464E; // "TGFN" (tgrep footer)
 pub const POSTING_BLOCK_SIZE: usize = 128;
+
+/// Segments are immutable once committed; verify each file identity once per
+/// process instead of checksumming on every open (a search opens hundreds).
+static CHECKSUM_VERIFIED: LazyLock<Mutex<std::collections::HashSet<(u64, u64, i64, u64)>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 // ── Structs ─────────────────────────────────────────────────────────
 
@@ -66,9 +72,11 @@ impl SegmentWriter {
     pub fn add_document(&mut self, doc: DocRecord, grams: &[u32]) {
         let id = doc.local_id;
         self.docs.push(doc);
+        // Use a HashSet for O(1) dedup instead of Vec::contains (O(n²))
+        let mut seen = std::collections::HashSet::with_capacity(grams.len());
         let mut deduped: Vec<u32> = Vec::with_capacity(grams.len());
         for &g in grams {
-            if !deduped.contains(&g) {
+            if seen.insert(g) {
                 deduped.push(g);
             }
         }
@@ -364,14 +372,31 @@ impl SegmentReader {
         let data = unsafe { memmap2::Mmap::map(&file)? };
 
         let header = Self::parse_header(&data)?;
+        let len = data.len();
+
+        // Validate every header offset against the real mapping length before
+        // any downstream reader trusts it (all fields are attacker-facing).
+        let chk = |name: &str, off: u64| -> io::Result<usize> {
+            let off = usize::try_from(off).map_err(|_| invalid(name))?;
+            if off > len {
+                return Err(invalid(name));
+            }
+            Ok(off)
+        };
+        let file_table_offset = chk("file_table_offset", header.file_table_offset)?;
+        let _path_index_offset = chk("path_index_offset", header.path_index_offset)?;
+        let dictionary_offset = chk("dictionary_offset", header.dictionary_offset)?;
+        let postings_offset = chk("postings_offset", header.postings_offset)?;
+        let footer_start = chk("footer_offset", header.footer_offset)?;
+
+        // Sections must be ordered; readers rely on these invariants.
+        if dictionary_offset > postings_offset || postings_offset > footer_start {
+            return Err(invalid("section order"));
+        }
 
         // Verify footer
-        let footer_start = header.footer_offset as usize;
-        if footer_start + 16 > data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "segment too short for footer",
-            ));
+        if footer_start + 16 > len {
+            return Err(invalid("segment too short for footer"));
         }
         let footer_magic = u32::from_le_bytes(
             data[footer_start + 8..footer_start + 12]
@@ -379,12 +404,32 @@ impl SegmentReader {
                 .unwrap(),
         );
         if footer_magic != FOOTER_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid footer magic",
-            ));
+            return Err(invalid("invalid footer magic"));
         }
 
+        // Verify the content checksum (covers everything before the footer),
+        // at most once per file identity per process.
+        let stored = u64::from_le_bytes(
+            data[footer_start..footer_start + 8].try_into().unwrap(),
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let md = file.metadata()?;
+            let key = (md.dev(), md.ino(), md.mtime(), md.len());
+            if !CHECKSUM_VERIFIED.lock().unwrap().contains(&key) {
+                if simple_checksum(&data[..footer_start]) != stored {
+                    return Err(invalid("segment checksum mismatch"));
+                }
+                CHECKSUM_VERIFIED.lock().unwrap().insert(key);
+            }
+        }
+        #[cfg(not(unix))]
+        if simple_checksum(&data[..footer_start]) != stored {
+            return Err(invalid("segment checksum mismatch"));
+        }
+
+        let _ = (file_table_offset, dictionary_offset, postings_offset);
         Ok(Self { data, header })
     }
 
@@ -598,8 +643,15 @@ impl SegmentReader {
     }
 
     fn decode_postings(&self, posting_offset: u64, doc_freq: u32) -> Vec<u32> {
-        let mut result = Vec::with_capacity(doc_freq as usize);
-        let mut offset = self.header.postings_offset as usize + posting_offset as usize;
+        // Capacity is bounded by what could actually be encoded in the mapping:
+        // each result entry costs at least one varint byte. Never trust doc_freq.
+        let base = self.header.postings_offset as usize;
+        let start = base.saturating_add(posting_offset as usize);
+        let avail = self.data.len().saturating_sub(start);
+        let mut result = Vec::with_capacity(
+            (doc_freq as usize).min(avail).min(1 << 24),
+        );
+        let mut offset = start;
         let mut remaining = doc_freq as usize;
 
         while remaining > 0 && offset + 12 <= self.data.len() {
@@ -649,7 +701,7 @@ impl SegmentReader {
         let dict_start = self.header.dictionary_offset as usize;
         let dict_end = self.header.postings_offset as usize;
         let dict_entry_size = 16;
-        let num_entries = (dict_end - dict_start) / dict_entry_size;
+        let num_entries = dict_end.saturating_sub(dict_start) / dict_entry_size;
 
         let mut result = Vec::with_capacity(num_entries);
         for i in 0..num_entries {
@@ -736,15 +788,22 @@ fn decode_varint_u32(data: &[u8]) -> (u32, usize) {
 
 // ── Checksum ────────────────────────────────────────────────────────
 
+fn invalid(what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("invalid segment: {what}"),
+    )
+}
+
 fn simple_checksum(data: &[u8]) -> u64 {
-    let mut checksum: u64 = 0;
-    let mut i = 0;
-    while i + 8 <= data.len() {
-        let chunk = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
-        checksum ^= chunk;
-        i += 8;
-    }
+    // chunks_exact lets the optimizer vectorize the XOR; the old per-8-byte
+    // bounds-checked loop ran ~55 MB/s and stalled segment-heavy commands.
+    let mut checksum: u64 = data
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .fold(0u64, |acc, c| acc ^ c);
     // Handle remaining bytes
+    let i = data.len() - data.len() % 8;
     if i < data.len() {
         let mut last: [u8; 8] = [0; 8];
         last[..data.len() - i].copy_from_slice(&data[i..]);

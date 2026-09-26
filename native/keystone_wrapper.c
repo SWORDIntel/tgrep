@@ -205,7 +205,7 @@ static int collector_visitor(
         c->truncated = 1;
         return 1; /* stop */
     }
-    if (c->num_doc_ids + count > c->max_doc_ids) {
+    if (c->num_doc_ids + count > c->max_doc_ids || c->num_doc_ids > UINT32_MAX) {
         c->truncated = 1;
         return 1; /* stop */
     }

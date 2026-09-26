@@ -1,0 +1,138 @@
+#ifndef QIHSE_OPTIMIZER_H
+#define QIHSE_OPTIMIZER_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "qihse_sql_parser.h"
+#include "qihse_schema.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* -------------------------------------------------------------------------
+ * Cost-based optimizer — Phase 1 Relational Completeness
+ *
+ * Maintains basic statistics (row count estimates, column histograms),
+ * estimates cardinality for filter conditions, and enumerates plans
+ * choosing between seq scan, index scan, hash join vs nested loop.
+ * ------------------------------------------------------------------------- */
+
+typedef enum {
+    QIHSE_PLAN_SEQ_SCAN    = 1,
+    QIHSE_PLAN_INDEX_SCAN  = 2,
+    QIHSE_PLAN_HASH_JOIN   = 3,
+    QIHSE_PLAN_NESTED_LOOP = 4,
+    QIHSE_PLAN_AGGREGATE   = 5,
+    QIHSE_PLAN_SORT        = 6,
+    QIHSE_PLAN_LIMIT       = 7,
+    QIHSE_PLAN_SUBQUERY    = 8
+} qihse_plan_node_type_t;
+
+typedef struct qihse_plan_node {
+    qihse_plan_node_type_t type;
+    char*  table_name;          /* for scan nodes */
+    char*  index_name;          /* for index scan */
+    char*  filter_column;       /* filter column */
+    double estimated_rows;
+    double estimated_cost;
+    struct qihse_plan_node* left;
+    struct qihse_plan_node* right;
+    /* join-specific */
+    char*  join_key_left;
+    char*  join_key_right;
+    qihse_sql_join_type_t join_type;
+    /* aggregate / sort specific */
+    char** group_cols;
+    size_t num_group_cols;
+    char** sort_cols;
+    int*   sort_asc;
+    size_t num_sort_cols;
+    int    limit;
+} qihse_plan_node_t;
+
+/* Maximum number of histogram buckets a column statistic can hold. */
+#define QIHSE_OPT_HIST_MAX_BUCKETS 16
+
+/* Column statistics: distinct count, min, max (as strings), null fraction */
+typedef struct {
+    char*  column_name;
+    int64_t distinct_count;
+    double  null_fraction;
+    char*  min_value;
+    char*  max_value;
+    /* Histogram: up to QIHSE_OPT_HIST_MAX_BUCKETS buckets.  Bucket i covers
+     * [hist_lo[i], hist_hi[i]] and hist_freq[i] is the number of rows the
+     * statistics collector counted in it.  Populated by
+     * qihse_optimizer_set_column_histogram(); range selectivity uses it when
+     * num_buckets > 0, and falls back to a fixed estimate otherwise. */
+    char*  hist_lo[QIHSE_OPT_HIST_MAX_BUCKETS];
+    char*  hist_hi[QIHSE_OPT_HIST_MAX_BUCKETS];
+    int64_t hist_freq[QIHSE_OPT_HIST_MAX_BUCKETS];
+    int    num_buckets;
+} qihse_column_stat_t;
+
+/* Table statistics */
+typedef struct {
+    char*  table_name;
+    int64_t row_count;
+    qihse_column_stat_t* columns;
+    size_t num_columns;
+} qihse_table_stat_t;
+
+typedef struct qihse_optimizer qihse_optimizer_t;
+
+/* Create / destroy */
+qihse_optimizer_t* qihse_optimizer_create(qihse_schema_registry_t* schema);
+void qihse_optimizer_destroy(qihse_optimizer_t* opt);
+
+/* Statistics management */
+void qihse_optimizer_set_table_stats(qihse_optimizer_t* opt, const char* table, int64_t row_count);
+void qihse_optimizer_set_column_stats(qihse_optimizer_t* opt, const char* table,
+                                       const char* column, int64_t distinct_count,
+                                       double null_fraction, const char* min_val, const char* max_val);
+/* Populate a column histogram.  lo/hi/freq are parallel arrays of num_buckets
+ * entries (1..QIHSE_OPT_HIST_MAX_BUCKETS); the optimizer copies the strings.
+ * The optimizer has no data access of its own, so the caller is the statistics
+ * collector — the same contract as qihse_optimizer_set_column_stats().  Returns
+ * false, leaving any existing histogram unchanged, when the arguments are
+ * malformed or num_buckets is out of range. */
+bool qihse_optimizer_set_column_histogram(qihse_optimizer_t* opt, const char* table,
+                                          const char* column,
+                                          const char* const* lo,
+                                          const char* const* hi,
+                                          const int64_t* freq,
+                                          size_t num_buckets);
+const qihse_table_stat_t* qihse_optimizer_get_table_stats(const qihse_optimizer_t* opt, const char* table);
+
+/* Cardinality estimation for a filter condition */
+double qihse_optimizer_estimate_selectivity(const qihse_optimizer_t* opt,
+                                             const char* table,
+                                             const qihse_sql_condition_t* cond);
+
+/* Plan enumeration: build a plan tree from an AST */
+qihse_plan_node_t* qihse_optimizer_build_plan(qihse_optimizer_t* opt, const qihse_sql_ast_t* ast);
+
+/* Free a plan tree */
+void qihse_plan_node_free(qihse_plan_node_t* node);
+
+/* A 64-bit digest of a plan's SHAPE: node types, scan/index choice, join
+ * algorithm and the columns each node touches, with the child digests mixed
+ * in.  Table names are deliberately NOT part of it — two tables accessed the
+ * same way have the same shape, and a caller that needs to tell them apart
+ * does so through its own workload key.  Returns 0 for a NULL plan, which is
+ * a shape no caller can claim.
+ *
+ * This is what optimizer governance (W5.1) compares: a plan change is a
+ * change of digest.  A digest is a hash, never a label. */
+uint64_t qihse_optimizer_plan_shape_digest(const qihse_plan_node_t* plan);
+
+/* Get a human-readable name for a plan node type */
+const char* qihse_plan_node_type_name(qihse_plan_node_type_t t);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

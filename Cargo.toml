@@ -1,6 +1,7 @@
 [package]
 name = "tgrep"
-version = "0.1.0"
+version = "1.0.0"
+license = "AGPL-3.0-only"
 edition = "2021"
 
 [dependencies]

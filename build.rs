@@ -14,20 +14,20 @@ fn main() {
         .file("native/qihse_cache_wrapper.c")
         .file("native/word_index_mmap.c")
         // KEYSTONE trigram source (all tgrep extensions are in this file)
-        .file("/home/john/Documents/KEYSTONE/src/keystone_trigram.c")
+        .file("vendor/KEYSTONE/src/keystone_trigram.c")
         // KEYSTONE core + hash index sources
-        .file("/home/john/Documents/KEYSTONE/src/keystone.c")
-        .file("/home/john/Documents/KEYSTONE/src/keystone_avx512.c")
-        .file("/home/john/Documents/KEYSTONE/src/keystone_avx512_search.c")
-        .file("/home/john/Documents/KEYSTONE/src/dsmil_hash_indexer.c")
+        .file("vendor/KEYSTONE/src/keystone.c")
+        .file("vendor/KEYSTONE/src/keystone_avx512.c")
+        .file("vendor/KEYSTONE/src/keystone_avx512_search.c")
+        .file("vendor/KEYSTONE/src/dsmil_hash_indexer.c")
         // QIHSE WAL source
-        .file("/home/john/Documents/QIHSE/src/tractable/qihse_wal.c")
-        .file("/home/john/Documents/QIHSE/src/tractable/qihse_table_store.c")
+        .file("vendor/QIHSE/src/tractable/qihse_wal.c")
+        .file("vendor/QIHSE/src/tractable/qihse_table_store.c")
         // QIHSE btree source (persistent word index)
-        .file("/home/john/Documents/QIHSE/src/frieze/qihse_btree.c")
-        .include("/home/john/Documents/KEYSTONE/include")
-        .include("/home/john/Documents/QIHSE/include")
-        .include("/home/john/Documents/QIHSE/persistence")
+        .file("vendor/QIHSE/src/frieze/qihse_btree.c")
+        .include("vendor/KEYSTONE/include")
+        .include("vendor/QIHSE/include")
+        .include("vendor/QIHSE/persistence")
         .flag("-std=c11")
         .flag("-D_GNU_SOURCE")
         .flag("-Wall")
@@ -48,26 +48,29 @@ fn main() {
 
     build.compile("tgrep_native");
 
-    println!("cargo:rerun-if-env-changed=TGREP_SIMD_FLAGS");
-    println!("cargo:rerun-if-changed=native/keystone_wrapper.c");
-    println!("cargo:rerun-if-changed=native/qihse_wrapper.c");
-    println!("cargo:rerun-if-changed=native/qihse_wal_wrapper.c");
-    println!("cargo:rerun-if-changed=native/qihse_cache_wrapper.c");
-    println!("cargo:rerun-if-changed=native/hash_wrapper.c");
-    println!("cargo:rerun-if-changed=native/word_index_mmap.c");
-    println!("cargo:rerun-if-changed=/home/john/Documents/QIHSE/src/tractable/qihse_table_store.c");
-    println!("cargo:rerun-if-changed=/home/john/Documents/QIHSE/src/tractable/qihse_wal.c");
-    println!("cargo:rerun-if-changed=/home/john/Documents/QIHSE/src/frieze/qihse_btree.c");
-    println!("cargo:rerun-if-changed=/home/john/Documents/KEYSTONE/src/keystone_trigram.c");
-    println!("cargo:rerun-if-changed=/home/john/Documents/KEYSTONE/src/keystone.c");
-    println!("cargo:rerun-if-changed=/home/john/Documents/KEYSTONE/src/keystone_avx512.c");
-    println!("cargo:rerun-if-changed=/home/john/Documents/KEYSTONE/src/keystone_avx512_search.c");
-    println!("cargo:rerun-if-changed=/home/john/Documents/KEYSTONE/src/dsmil_hash_indexer.c");
-    println!("cargo:rerun-if-changed=/home/john/Documents/KEYSTONE/include/keystone_trigram.h");
-    println!("cargo:rerun-if-changed=/home/john/Documents/KEYSTONE/include/dsmil_hash_indexer.h");
-    println!("cargo:rerun-if-changed=/home/john/Documents/KEYSTONE/include/keystone.h");
-    println!("cargo:rerun-if-changed=/home/john/Documents/QIHSE/include/qihse_btree.h");
-    println!("cargo:rerun-if-changed=/home/john/Documents/QIHSE/include/qihse_hash_index.h");
-    println!("cargo:rerun-if-changed=/home/john/Documents/QIHSE/include/qihse_platform.h");
+    for f in [
+        "native/keystone_wrapper.c",
+        "native/qihse_wrapper.c",
+        "native/qihse_wal_wrapper.c",
+        "native/qihse_cache_wrapper.c",
+        "native/hash_wrapper.c",
+        "native/word_index_mmap.c",
+        "vendor/QIHSE/src/tractable/qihse_table_store.c",
+        "vendor/QIHSE/src/tractable/qihse_wal.c",
+        "vendor/QIHSE/src/frieze/qihse_btree.c",
+        "vendor/KEYSTONE/src/keystone_trigram.c",
+        "vendor/KEYSTONE/src/keystone.c",
+        "vendor/KEYSTONE/src/keystone_avx512.c",
+        "vendor/KEYSTONE/src/keystone_avx512_search.c",
+        "vendor/KEYSTONE/src/dsmil_hash_indexer.c",
+        "vendor/KEYSTONE/include/keystone_trigram.h",
+        "vendor/KEYSTONE/include/dsmil_hash_indexer.h",
+        "vendor/KEYSTONE/include/keystone.h",
+        "vendor/QIHSE/include/qihse_btree.h",
+        "vendor/QIHSE/include/qihse_hash_index.h",
+        "vendor/QIHSE/include/qihse_platform.h",
+    ] {
+        println!("cargo:rerun-if-changed={f}");
+    }
     println!("cargo:rerun-if-changed=Cargo.toml");
 }

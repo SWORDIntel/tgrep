@@ -59,18 +59,44 @@ pub fn default_state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("TGREP_STATE_DIR") {
         return PathBuf::from(dir);
     }
+    // XDG Base Directory Specification: persistent state (survives reboots,
+    // not user-facing data) belongs in $XDG_STATE_HOME (~/.local/state).
+    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        if !state_home.is_empty() {
+            return PathBuf::from(state_home).join("tgrep");
+        }
+    }
     if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".local/share/tgrep");
+        return PathBuf::from(home).join(".local/state/tgrep");
     }
     PathBuf::from(".tgrep")
 }
 
 fn ensure_state_dirs(state_dir: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(state_dir)?;
-    fs::create_dir_all(state_dir.join("segments"))?;
-    fs::create_dir_all(state_dir.join("tmp"))?;
-    fs::create_dir_all(state_dir.join("wal"))?;
-    Ok(())
+    // 0700: the state dir enumerates indexed paths and feeds search results;
+    // other local users have no business reading or writing it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mk = |p: &Path| -> std::io::Result<()> {
+            fs::create_dir_all(p)?;
+            fs::set_permissions(p, fs::Permissions::from_mode(0o700))?;
+            Ok(())
+        };
+        mk(state_dir)?;
+        mk(&state_dir.join("segments"))?;
+        mk(&state_dir.join("tmp"))?;
+        mk(&state_dir.join("wal"))?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(state_dir)?;
+        fs::create_dir_all(state_dir.join("segments"))?;
+        fs::create_dir_all(state_dir.join("tmp"))?;
+        fs::create_dir_all(state_dir.join("wal"))?;
+        Ok(())
+    }
 }
 
 // ── WAL recovery ────────────────────────────────────────────────────
@@ -374,12 +400,41 @@ fn run_build(
                 continue;
             }
 
-            // Read file content
-            let content = match fs::read(path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("tgrep: read error {}: {}", path.display(), e);
-                    continue;
+            // Read file content. Open non-blocking first so a file swapped to
+            // a FIFO between stat and open can't block the build forever.
+            let content = {
+                #[cfg(unix)]
+                {
+                    use std::io::Read;
+                    let opened = (|| -> std::io::Result<Vec<u8>> {
+                        let f = std::fs::File::open(path)?;
+                        use std::os::unix::io::AsRawFd;
+                        let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
+                        if flags >= 0 {
+                            let _ = unsafe {
+                                libc::fcntl(f.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                            };
+                        }
+                        // Nonblocking read of an empty FIFO errors instead of blocking.
+                        let mut buf = Vec::new();
+                        (&f).read_to_end(&mut buf)?;
+                        Ok(buf)
+                    })();
+                    match opened {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("tgrep: read error {}: {}", path.display(), e);
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                match fs::read(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("tgrep: read error {}: {}", path.display(), e);
+                        continue;
+                    }
                 }
             };
 
@@ -466,8 +521,7 @@ fn run_build(
             let ks_mem = keystone.memory_usage();
             let should_flush = batch_source_bytes >= FLUSH_SOURCE_BYTES
                 || ks_mem as u64 >= FLUSH_SOURCE_BYTES * 2
-                || elapsed >= FLUSH_TIME_SECS
-                || doc_id > 0 && doc_id % 10000 == 0;
+                || elapsed >= FLUSH_TIME_SECS;
 
             if should_flush && !doc_records.is_empty() {
                 // WAL: log segment publication as a transaction
@@ -641,9 +695,14 @@ fn flush_batch(
     }
 
     // Save QIHSE btree word index alongside the segment
+    // (empty segments with only binary files produce no .qwi file — this is fine)
     let qwi_path = segments_dir.join(format!("seg_{:08}.qwi", generation));
     if let Err(e) = qwi_index.save(&qwi_path) {
-        eprintln!("tgrep: warning: qihse word index save failed: {}", e);
+        eprintln!(
+            "tgrep: ERROR: qwi word index save failed for seg_{:08}: {} \
+             (word searches will fall back to slower .thi hash index)",
+            generation, e
+        );
     }
 
     // Reset KEYSTONE for next batch

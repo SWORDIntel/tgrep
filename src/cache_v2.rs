@@ -204,10 +204,15 @@ impl SearchCacheV2 {
     /// Save cache to a .qsc file (v2 format).
     pub fn save(&self, path: &str) -> Result<(), String> {
         let path = Path::new(path);
-        let tmp = path.with_extension("qsc.tmp");
+        // Exclusive, pid-suffixed temp: never follows a pre-planted symlink and
+        // never clobbers a concurrent writer's temp.
+        let tmp = path.with_extension(format!("qsc.{}.tmp", std::process::id()));
 
-        let mut f = std::fs::File::create(&tmp)
-            .map_err(|e| format!("create {}: {}", path.display(), e))?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| format!("create {}: {}", tmp.display(), e))?;
 
         // Header
         f.write_all(&TGSC_MAGIC.to_le_bytes())
@@ -298,7 +303,10 @@ impl SearchCacheV2 {
 
         self.entries.clear();
         self.index.clear();
-        self.entries.reserve(entry_count);
+        // Reserve only what the remaining bytes could plausibly describe
+        // (min entry = 2 pat_len + 20 fixed + 4 fc = 26 bytes).
+        let reserve_n = entry_count.min((data.len() - pos) / 26);
+        self.entries.reserve(reserve_n);
 
         for _ in 0..entry_count {
             // pattern
@@ -345,7 +353,7 @@ impl SearchCacheV2 {
             if pos + fc * 4 > data.len() {
                 return Err("truncated file IDs".to_string());
             }
-            let mut file_ids = Vec::with_capacity(fc);
+            let mut file_ids = Vec::with_capacity(fc.min((data.len() - pos) / 4));
             for _ in 0..fc {
                 let id = u32::from_le_bytes([
                     data[pos], data[pos + 1], data[pos + 2], data[pos + 3],

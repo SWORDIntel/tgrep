@@ -1,0 +1,1061 @@
+#include "qihse_platform.h"
+
+#include "qihse_vector_store.h"
+
+#include "codecs/qihse_trinary_tryte_codec.h"
+#include "qihse_container.h"
+#include "qihse_persist_format.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+#define QIHSE_MANIFEST_MAGIC "QIHSEMAN"
+#define QIHSE_INDEX_MAGIC "QIHSEQIX"
+#define QIHSE_IDMAP_MAGIC "QIHSEQID"
+
+#define QIHSE_MANIFEST_V1_SIZE 128u
+#define QIHSE_MANIFEST_SIZE 192u
+#define QIHSE_FILE_HEADER_SIZE 32u
+#define QIHSE_FORMAT_VERSION 1u
+#define QIHSE_INDEX_ROW_DISK_SIZE 48u
+#define QIHSE_IDMAP_ENTRY_DISK_SIZE 16u
+
+static bool qihse_u64_to_size(uint64_t value, size_t* out) {
+    if (!out || value > (uint64_t)SIZE_MAX) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    *out = (size_t)value;
+    return true;
+}
+
+
+
+static void qihse_encode_file_header(uint8_t out[QIHSE_FILE_HEADER_SIZE],
+                                     const char magic[8],
+                                     uint64_t count,
+                                     uint64_t crc64,
+                                     uint32_t row_bytes) {
+    memset(out, 0, QIHSE_FILE_HEADER_SIZE);
+    memcpy(out, magic, 8u);
+    qihse_le_write_u32(out + 8u, QIHSE_FORMAT_VERSION);
+    qihse_le_write_u32(out + 12u, row_bytes);
+    qihse_le_write_u64(out + 16u, count);
+    qihse_le_write_u64(out + 24u, crc64);
+}
+
+static bool qihse_decode_file_header(const uint8_t in[QIHSE_FILE_HEADER_SIZE],
+                                     const char magic[8],
+                                     uint64_t* count,
+                                     uint64_t* crc64,
+                                     uint32_t* row_bytes) {
+    if (memcmp(in, magic, 8u) != 0 || qihse_le_read_u32(in + 8u) != QIHSE_FORMAT_VERSION) {
+        errno = EINVAL;
+        return false;
+    }
+    if (row_bytes) {
+        *row_bytes = qihse_le_read_u32(in + 12u);
+    }
+    if (count) {
+        *count = qihse_le_read_u64(in + 16u);
+    }
+    if (crc64) {
+        *crc64 = qihse_le_read_u64(in + 24u);
+    }
+    return true;
+}
+
+static bool qihse_manifest_expected_trinary_row_bytes(uint32_t dims, uint64_t* out) {
+    if (!out) {
+        errno = EINVAL;
+        return false;
+    }
+    *out = ((uint64_t)dims + 4u) / 5u;
+    return true;
+}
+
+static bool qihse_manifest_validate_sidecar(uint32_t flags,
+                                            uint32_t allowed_flags,
+                                            uint32_t present_flag,
+                                            uint32_t valid_flag,
+                                            uint64_t generation,
+                                            uint64_t row_bytes,
+                                            uint64_t rows,
+                                            uint64_t crc64,
+                                            uint64_t expected_generation,
+                                            uint64_t expected_row_bytes,
+                                            uint64_t expected_rows) {
+    if ((flags & ~allowed_flags) != 0u ||
+        ((flags & valid_flag) != 0u && (flags & present_flag) == 0u)) {
+        errno = EINVAL;
+        return false;
+    }
+    if ((flags & present_flag) == 0u) {
+        if (generation != 0u || row_bytes != 0u || rows != 0u || crc64 != 0u) {
+            errno = EINVAL;
+            return false;
+        }
+        return true;
+    }
+    if (generation != expected_generation ||
+        row_bytes != expected_row_bytes ||
+        rows != expected_rows) {
+        errno = EINVAL;
+        return false;
+    }
+    return true;
+}
+
+static bool qihse_validate_manifest(const qihse_vector_store_manifest_t* m) {
+    uint64_t vector_row_bytes;
+    uint64_t expected_vector_bytes;
+    uint64_t expected_trinary_row_bytes;
+
+    if (!m) {
+        errno = EINVAL;
+        return false;
+    }
+    if (m->format_version != QIHSE_FORMAT_VERSION ||
+        m->encoding_id != QIHSE_VSTORE_ENCODING_FLOAT32 ||
+        m->encoding_version != QIHSE_VSTORE_ENCODING_VERSION ||
+        (m->row_count != 0u && m->vector_dims == 0u)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_checked_mul_u64((uint64_t)m->vector_dims, (uint64_t)sizeof(float),
+                               &vector_row_bytes) ||
+        !qihse_checked_mul_u64(m->row_count, vector_row_bytes, &expected_vector_bytes) ||
+        m->vector_bytes != expected_vector_bytes ||
+        !qihse_manifest_expected_trinary_row_bytes(m->vector_dims,
+                                                   &expected_trinary_row_bytes)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_manifest_validate_sidecar(
+            m->trinary_flags,
+            QIHSE_VSTORE_TRI_PRESENT | QIHSE_VSTORE_TRI_VALID,
+            QIHSE_VSTORE_TRI_PRESENT,
+            QIHSE_VSTORE_TRI_VALID,
+            m->trinary_generation,
+            m->trinary_row_bytes,
+            m->trinary_rows,
+            m->trinary_crc64,
+            m->commit_generation,
+            expected_trinary_row_bytes,
+            m->row_count)) {
+        return false;
+    }
+    if (!qihse_manifest_validate_sidecar(
+            m->magnitude_flags,
+            QIHSE_VSTORE_MAG_PRESENT | QIHSE_VSTORE_MAG_VALID,
+            QIHSE_VSTORE_MAG_PRESENT,
+            QIHSE_VSTORE_MAG_VALID,
+            m->magnitude_generation,
+            m->magnitude_row_bytes,
+            m->magnitude_rows,
+            m->magnitude_crc64,
+            m->commit_generation,
+            (uint64_t)m->vector_dims,
+            m->row_count)) {
+        return false;
+    }
+    return true;
+}
+
+static void qihse_encode_manifest(uint8_t out[QIHSE_MANIFEST_SIZE],
+                                  const qihse_vector_store_manifest_t* m) {
+    memset(out, 0, QIHSE_MANIFEST_SIZE);
+    memcpy(out, QIHSE_MANIFEST_MAGIC, 8u);
+    qihse_le_write_u32(out + 8u, m->format_version);
+    qihse_le_write_u32(out + 12u, m->encoding_id);
+    qihse_le_write_u32(out + 16u, m->encoding_version);
+    qihse_le_write_u32(out + 20u, m->vector_dims);
+    qihse_le_write_u64(out + 24u, m->row_count);
+    qihse_le_write_u64(out + 32u, m->vector_bytes);
+    qihse_le_write_u64(out + 40u, m->metadata_bytes);
+    qihse_le_write_u64(out + 48u, m->commit_generation);
+    qihse_le_write_u64(out + 56u, m->index_crc64);
+    qihse_le_write_u64(out + 64u, m->vector_crc64);
+    qihse_le_write_u64(out + 72u, m->metadata_crc64);
+    qihse_le_write_u64(out + 80u, m->idmap_crc64);
+    qihse_le_write_u64(out + 88u, m->trinary_generation);
+    qihse_le_write_u64(out + 96u, m->trinary_row_bytes);
+    qihse_le_write_u64(out + 104u, m->trinary_rows);
+    qihse_le_write_u64(out + 112u, m->trinary_crc64);
+    qihse_le_write_u32(out + 120u, m->trinary_flags);
+    qihse_le_write_u64(out + 128u, m->magnitude_generation);
+    qihse_le_write_u64(out + 136u, m->magnitude_row_bytes);
+    qihse_le_write_u64(out + 144u, m->magnitude_rows);
+    qihse_le_write_u64(out + 152u, m->magnitude_crc64);
+    qihse_le_write_u32(out + 160u, m->magnitude_flags);
+}
+
+static bool qihse_decode_manifest(const uint8_t* in,
+                                  size_t size,
+                                  qihse_vector_store_manifest_t* m) {
+    if (!in || !m ||
+        (size != QIHSE_MANIFEST_V1_SIZE && size != QIHSE_MANIFEST_SIZE) ||
+        memcmp(in, QIHSE_MANIFEST_MAGIC, 8u) != 0) {
+        errno = EINVAL;
+        return false;
+    }
+
+    memset(m, 0, sizeof(*m));
+    m->format_version = qihse_le_read_u32(in + 8u);
+    m->encoding_id = qihse_le_read_u32(in + 12u);
+    m->encoding_version = qihse_le_read_u32(in + 16u);
+    m->vector_dims = qihse_le_read_u32(in + 20u);
+    m->row_count = qihse_le_read_u64(in + 24u);
+    m->vector_bytes = qihse_le_read_u64(in + 32u);
+    m->metadata_bytes = qihse_le_read_u64(in + 40u);
+    m->commit_generation = qihse_le_read_u64(in + 48u);
+    m->index_crc64 = qihse_le_read_u64(in + 56u);
+    m->vector_crc64 = qihse_le_read_u64(in + 64u);
+    m->metadata_crc64 = qihse_le_read_u64(in + 72u);
+    m->idmap_crc64 = qihse_le_read_u64(in + 80u);
+    m->trinary_generation = qihse_le_read_u64(in + 88u);
+    m->trinary_row_bytes = qihse_le_read_u64(in + 96u);
+    m->trinary_rows = qihse_le_read_u64(in + 104u);
+    m->trinary_crc64 = qihse_le_read_u64(in + 112u);
+    m->trinary_flags = qihse_le_read_u32(in + 120u);
+    if (size >= QIHSE_MANIFEST_SIZE) {
+        m->magnitude_generation = qihse_le_read_u64(in + 128u);
+        m->magnitude_row_bytes = qihse_le_read_u64(in + 136u);
+        m->magnitude_rows = qihse_le_read_u64(in + 144u);
+        m->magnitude_crc64 = qihse_le_read_u64(in + 152u);
+        m->magnitude_flags = qihse_le_read_u32(in + 160u);
+    }
+
+    return qihse_validate_manifest(m);
+}
+
+static void qihse_encode_row(uint8_t out[QIHSE_INDEX_ROW_DISK_SIZE],
+                             const qihse_index_row_t* row) {
+    qihse_le_write_u64(out + 0u, row->vector_id);
+    qihse_le_write_u64(out + 8u, row->vector_offset);
+    qihse_le_write_u64(out + 16u, row->metadata_offset);
+    qihse_le_write_u64(out + 24u, row->metadata_size);
+    qihse_le_write_u64(out + 32u, row->commit_generation);
+    qihse_le_write_u32(out + 40u, row->row_flags);
+    uint32_t auth_bits = ((uint32_t)row->classification << 16) | (uint32_t)row->sci_compartment;
+    qihse_le_write_u32(out + 44u, auth_bits);
+}
+
+static void qihse_decode_row(const uint8_t in[QIHSE_INDEX_ROW_DISK_SIZE],
+                             qihse_index_row_t* row) {
+    row->vector_id = qihse_le_read_u64(in + 0u);
+    row->vector_offset = qihse_le_read_u64(in + 8u);
+    row->metadata_offset = qihse_le_read_u64(in + 16u);
+    row->metadata_size = qihse_le_read_u64(in + 24u);
+    row->commit_generation = qihse_le_read_u64(in + 32u);
+    row->row_flags = qihse_le_read_u32(in + 40u);
+    uint32_t auth_bits = qihse_le_read_u32(in + 44u);
+    row->classification = (uint16_t)(auth_bits >> 16);
+    row->sci_compartment = (uint16_t)(auth_bits & 0xFFFF);
+}
+
+static void qihse_encode_idmap(uint8_t out[QIHSE_IDMAP_ENTRY_DISK_SIZE],
+                               const qihse_idmap_entry_t* entry) {
+    qihse_le_write_u64(out + 0u, (uint64_t)entry->key);
+    qihse_le_write_u64(out + 8u, entry->row_index);
+}
+
+static void qihse_decode_idmap(const uint8_t in[QIHSE_IDMAP_ENTRY_DISK_SIZE],
+                               qihse_idmap_entry_t* entry) {
+    entry->key = (int64_t)qihse_le_read_u64(in + 0u);
+    entry->row_index = qihse_le_read_u64(in + 8u);
+}
+
+static bool qihse_encode_rows_buffer(const qihse_index_row_t* rows,
+                                     size_t row_count,
+                                     uint8_t** out,
+                                     size_t* out_size,
+                                     uint64_t* crc64) {
+    size_t payload_size;
+    uint8_t* data;
+    size_t i;
+
+    if ((!rows && row_count != 0u) || !out || !out_size || !crc64) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_checked_mul_size(row_count, QIHSE_INDEX_ROW_DISK_SIZE, &payload_size) ||
+        !qihse_checked_add_size(QIHSE_FILE_HEADER_SIZE, payload_size, out_size)) {
+        errno = EOVERFLOW;
+        return false;
+    }
+
+    data = (uint8_t*)malloc(*out_size == 0u ? 1u : *out_size);
+    if (!data) {
+        errno = ENOMEM;
+        return false;
+    }
+    memset(data, 0, *out_size);
+
+    for (i = 0u; i < row_count; i++) {
+        qihse_encode_row(data + QIHSE_FILE_HEADER_SIZE + (i * QIHSE_INDEX_ROW_DISK_SIZE), rows + i);
+    }
+    *crc64 = qihse_fnv1a64(data + QIHSE_FILE_HEADER_SIZE, payload_size);
+    qihse_encode_file_header(data, QIHSE_INDEX_MAGIC, (uint64_t)row_count, *crc64,
+                             QIHSE_INDEX_ROW_DISK_SIZE);
+    *out = data;
+    return true;
+}
+
+static bool qihse_encode_idmap_buffer(const qihse_idmap_entry_t* entries,
+                                      size_t entry_count,
+                                      uint8_t** out,
+                                      size_t* out_size,
+                                      uint64_t* crc64) {
+    size_t payload_size;
+    uint8_t* data;
+    size_t i;
+
+    if ((!entries && entry_count != 0u) || !out || !out_size || !crc64) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!qihse_checked_mul_size(entry_count, QIHSE_IDMAP_ENTRY_DISK_SIZE, &payload_size) ||
+        !qihse_checked_add_size(QIHSE_FILE_HEADER_SIZE, payload_size, out_size)) {
+        errno = EOVERFLOW;
+        return false;
+    }
+
+    data = (uint8_t*)malloc(*out_size == 0u ? 1u : *out_size);
+    if (!data) {
+        errno = ENOMEM;
+        return false;
+    }
+    memset(data, 0, *out_size);
+
+    for (i = 0u; i < entry_count; i++) {
+        if (i != 0u && entries[i - 1u].key > entries[i].key) {
+            free(data);
+            errno = EINVAL;
+            return false;
+        }
+        qihse_encode_idmap(data + QIHSE_FILE_HEADER_SIZE + (i * QIHSE_IDMAP_ENTRY_DISK_SIZE),
+                           entries + i);
+    }
+    *crc64 = qihse_fnv1a64(data + QIHSE_FILE_HEADER_SIZE, payload_size);
+    qihse_encode_file_header(data, QIHSE_IDMAP_MAGIC, (uint64_t)entry_count, *crc64,
+                             QIHSE_IDMAP_ENTRY_DISK_SIZE);
+    *out = data;
+    return true;
+}
+
+/* ── Container-based load helpers ─────────────────────────────────── */
+
+static bool qihse_load_manifest_ctr(const qihse_container_t* ctr,
+                                    qihse_vector_store_manifest_t* out) {
+    uint8_t* data = NULL;
+    size_t size = 0u;
+    bool ok;
+
+    if (!qihse_ctr_read_section_alloc(ctr, QIHSE_CTR_SEC_MANIFEST, &data, &size)) {
+        return false;
+    }
+    if (size != QIHSE_MANIFEST_V1_SIZE && size != QIHSE_MANIFEST_SIZE) {
+        free(data);
+        errno = EINVAL;
+        return false;
+    }
+    ok = qihse_decode_manifest(data, size, out);
+    free(data);
+    return ok;
+}
+
+/* Helper: verify CRC for a loaded section.
+ * Returns true if CRC matches, false otherwise.
+ * Uses CRC32C (SSE4.2) if use_crc32c is set and the expected CRC has
+ * the CRC32C marker (upper 32 bits = 0xC32C0000). Otherwise uses FNV-1a. */
+static bool verify_section_crc(const qihse_container_t* ctr,
+                               const void* data, size_t size,
+                               uint64_t expected_crc64) {
+    if (ctr->use_crc32c && (expected_crc64 >> 32) == 0xC32C0000u) {
+        uint32_t expected_crc32c = (uint32_t)(expected_crc64 & 0xFFFFFFFFu);
+        uint32_t actual_crc32c = qihse_crc32c_parallel(data, size,
+                                                        ctr->crc_threads);
+        return actual_crc32c == expected_crc32c;
+    }
+    uint64_t actual_crc = qihse_fnv1a64_parallel_verify(data, size,
+                                                        ctr->crc_threads);
+    return actual_crc == expected_crc64;
+}
+
+static bool qihse_load_raw_checked_ctr(const qihse_container_t* ctr,
+                                       uint16_t section_id,
+                                       uint64_t expected_size64,
+                                       uint64_t expected_crc64,
+                                       uint8_t** out,
+                                       size_t* out_size) {
+    if (expected_size64 == 0) {
+        *out = NULL;
+        *out_size = 0;
+        return true;
+    }
+    if (!qihse_ctr_read_section_alloc(ctr, section_id, out, out_size)) {
+        return false;
+    }
+    /* Skip CRC64 verification in pre-prod mode (no KEM key file).
+     * The integrity check scans the entire payload (373MB for vectors)
+     * and provides no security with a zero HMAC key. */
+    if (ctr->skip_integrity) {
+        return true;
+    }
+    /* Production mode: verify CRC using CRC32C or FNV-1a */
+    if ((uint64_t)*out_size != expected_size64 ||
+        !verify_section_crc(ctr, *out, *out_size, expected_crc64)) {
+        free(*out);
+        *out = NULL;
+        *out_size = 0u;
+        errno = EINVAL;
+        return false;
+    }
+    return true;
+}
+
+static bool qihse_validate_index_rows(const qihse_vector_store_manifest_t* manifest,
+                                      const qihse_index_row_t* rows,
+                                      size_t row_count) {
+    uint64_t vector_row_bytes;
+    size_t i;
+
+    if (!manifest || (!rows && row_count != 0u) ||
+        !qihse_checked_mul_u64((uint64_t)manifest->vector_dims,
+                               (uint64_t)sizeof(float),
+                               &vector_row_bytes)) {
+        errno = EINVAL;
+        return false;
+    }
+    for (i = 0u; i < row_count; i++) {
+        uint64_t vector_end;
+        uint64_t metadata_end;
+        const uint32_t allowed_flags = QIHSE_ROW_F_LIVE | QIHSE_ROW_F_TOMBSTONE;
+
+        if (rows[i].classification > 4u ||
+            (rows[i].row_flags & ~allowed_flags) != 0u ||
+            rows[i].commit_generation > manifest->commit_generation ||
+            !qihse_checked_add_u64(rows[i].vector_offset, vector_row_bytes, &vector_end) ||
+            vector_end > manifest->vector_bytes ||
+            !qihse_checked_add_u64(rows[i].metadata_offset,
+                                   rows[i].metadata_size,
+                                   &metadata_end) ||
+            metadata_end > manifest->metadata_bytes) {
+            errno = EINVAL;
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool qihse_load_index_ctr(const qihse_container_t* ctr,
+                                 const qihse_vector_store_manifest_t* manifest,
+                                 qihse_index_row_t** out_rows,
+                                 size_t* out_count) {
+    uint8_t* data = NULL;
+    size_t size = 0u;
+    size_t payload_size;
+    size_t expected_size;
+    uint64_t count64;
+    uint64_t crc64;
+    uint32_t row_bytes;
+    qihse_index_row_t* rows = NULL;
+    size_t row_count;
+    size_t i;
+
+    if (!qihse_ctr_read_section_alloc(ctr, QIHSE_CTR_SEC_INDEX, &data, &size)) {
+        return false;
+    }
+    if (size < QIHSE_FILE_HEADER_SIZE ||
+        !qihse_decode_file_header(data, QIHSE_INDEX_MAGIC, &count64, &crc64, &row_bytes) ||
+        row_bytes != QIHSE_INDEX_ROW_DISK_SIZE ||
+        count64 != manifest->row_count ||
+        !qihse_u64_to_size(count64, &row_count) ||
+        !qihse_checked_mul_size(row_count, QIHSE_INDEX_ROW_DISK_SIZE, &payload_size) ||
+        !qihse_checked_add_size(QIHSE_FILE_HEADER_SIZE, payload_size, &expected_size) ||
+        size != expected_size) {
+        free(data);
+        errno = EINVAL;
+        return false;
+    }
+    /* Skip CRC64 verification in pre-prod mode */
+    if (!ctr->skip_integrity) {
+        if (crc64 != manifest->index_crc64 ||
+            !verify_section_crc(ctr, data + QIHSE_FILE_HEADER_SIZE, payload_size, crc64)) {
+            free(data);
+            errno = EINVAL;
+            return false;
+        }
+    }
+
+    if (row_count != 0u) {
+        rows = (qihse_index_row_t*)calloc(row_count, sizeof(*rows));
+        if (!rows) {
+            free(data);
+            errno = ENOMEM;
+            return false;
+        }
+        for (i = 0u; i < row_count; i++) {
+            qihse_decode_row(data + QIHSE_FILE_HEADER_SIZE + (i * QIHSE_INDEX_ROW_DISK_SIZE),
+                             rows + i);
+        }
+        if (!qihse_validate_index_rows(manifest, rows, row_count)) {
+            free(rows);
+            free(data);
+            return false;
+        }
+    }
+
+    free(data);
+    *out_rows = rows;
+    *out_count = row_count;
+    return true;
+}
+
+static bool qihse_load_idmap_optional_ctr(const qihse_container_t* ctr,
+                                          const qihse_vector_store_manifest_t* manifest,
+                                          qihse_idmap_entry_t** out_entries,
+                                          size_t* out_count) {
+    uint8_t* data = NULL;
+    size_t size = 0u;
+    size_t payload_size;
+    size_t expected_size;
+    uint64_t count64;
+    uint64_t crc64;
+    uint32_t row_bytes;
+    qihse_idmap_entry_t* entries = NULL;
+    size_t entry_count;
+    size_t i;
+
+    *out_entries = NULL;
+    *out_count = 0u;
+    if (!qihse_ctr_read_section_alloc(ctr, QIHSE_CTR_SEC_IDMAP, &data, &size)) {
+        return false;
+    }
+    if (size < QIHSE_FILE_HEADER_SIZE ||
+        !qihse_decode_file_header(data, QIHSE_IDMAP_MAGIC, &count64, &crc64, &row_bytes) ||
+        row_bytes != QIHSE_IDMAP_ENTRY_DISK_SIZE ||
+        !qihse_u64_to_size(count64, &entry_count) ||
+        !qihse_checked_mul_size(entry_count, QIHSE_IDMAP_ENTRY_DISK_SIZE, &payload_size) ||
+        !qihse_checked_add_size(QIHSE_FILE_HEADER_SIZE, payload_size, &expected_size) ||
+        size != expected_size) {
+        free(data);
+        errno = EINVAL;
+        return false;
+    }
+    /* Skip CRC64 verification in pre-prod mode */
+    if (!ctr->skip_integrity) {
+        if (crc64 != manifest->idmap_crc64 ||
+            !verify_section_crc(ctr, data + QIHSE_FILE_HEADER_SIZE, payload_size, crc64)) {
+            free(data);
+            errno = EINVAL;
+            return false;
+        }
+    }
+
+    if (entry_count != 0u) {
+        entries = (qihse_idmap_entry_t*)calloc(entry_count, sizeof(*entries));
+        if (!entries) {
+            free(data);
+            errno = ENOMEM;
+            return false;
+        }
+        for (i = 0u; i < entry_count; i++) {
+            qihse_decode_idmap(data + QIHSE_FILE_HEADER_SIZE + (i * QIHSE_IDMAP_ENTRY_DISK_SIZE),
+                               entries + i);
+            if ((i != 0u && entries[i - 1u].key > entries[i].key) ||
+                entries[i].row_index >= manifest->row_count) {
+                free(entries);
+                free(data);
+                errno = EINVAL;
+                return false;
+            }
+        }
+    }
+
+    free(data);
+    *out_entries = entries;
+    *out_count = entry_count;
+    return true;
+}
+
+static bool qihse_load_trinary_optional_ctr(const qihse_container_t* ctr,
+                                            const qihse_vector_store_manifest_t* manifest,
+                                            uint8_t** out,
+                                            size_t* out_size) {
+    uint8_t* data = NULL;
+    size_t size = 0u;
+    uint64_t expected_size64;
+
+    *out = NULL;
+    *out_size = 0u;
+    if ((manifest->trinary_flags & QIHSE_VSTORE_TRI_PRESENT) == 0u) {
+        return false;
+    }
+    if (!qihse_checked_mul_u64(manifest->trinary_rows, manifest->trinary_row_bytes,
+                               &expected_size64)) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    if (!qihse_ctr_read_section_alloc(ctr, QIHSE_CTR_SEC_TRINARY, &data, &size)) {
+        return false;
+    }
+    if ((uint64_t)size != expected_size64) {
+        free(data);
+        errno = EINVAL;
+        return false;
+    }
+    /* Structural validation is mandatory; pre-prod mode may skip CRC64 only. */
+    {
+        if ((!ctr->skip_integrity &&
+             !verify_section_crc(ctr, data, size, manifest->trinary_crc64)) ||
+            !qihse_trinary_tryte_validate_payload(data,
+                                                  (size_t)manifest->trinary_rows,
+                                                  (size_t)manifest->vector_dims)) {
+            free(data);
+            errno = EINVAL;
+            return false;
+        }
+    }
+    *out = data;
+    *out_size = size;
+    return true;
+}
+
+static bool qihse_load_magnitude_optional_ctr(const qihse_container_t* ctr,
+                                              const qihse_vector_store_manifest_t* manifest,
+                                              uint8_t** out,
+                                              size_t* out_size) {
+    uint8_t* data = NULL;
+    size_t size = 0u;
+    uint64_t expected_size64;
+
+    *out = NULL;
+    *out_size = 0u;
+    if ((manifest->magnitude_flags & QIHSE_VSTORE_MAG_PRESENT) == 0u) {
+        return false;
+    }
+    if (!qihse_checked_mul_u64(manifest->magnitude_rows,
+                               manifest->magnitude_row_bytes,
+                               &expected_size64)) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    if (!qihse_ctr_read_section_alloc(ctr, QIHSE_CTR_SEC_MAGNITUDE, &data, &size)) {
+        return false;
+    }
+    if ((uint64_t)size != expected_size64) {
+        free(data);
+        errno = EINVAL;
+        return false;
+    }
+    /* Skip CRC64 + validation in pre-prod mode */
+    if (!ctr->skip_integrity) {
+        if (!verify_section_crc(ctr, data, size, manifest->magnitude_crc64) ||
+            !qihse_vector_store_validate_magnitude(data, size)) {
+            free(data);
+            errno = EINVAL;
+            return false;
+        }
+    }
+    *out = data;
+    *out_size = size;
+    return true;
+}
+
+static int qihse_idmap_compare(const void* a, const void* b) {
+    const qihse_idmap_entry_t* ea = (const qihse_idmap_entry_t*)a;
+    const qihse_idmap_entry_t* eb = (const qihse_idmap_entry_t*)b;
+    if (ea->key < eb->key) {
+        return -1;
+    }
+    if (ea->key > eb->key) {
+        return 1;
+    }
+    if (ea->row_index < eb->row_index) {
+        return -1;
+    }
+    if (ea->row_index > eb->row_index) {
+        return 1;
+    }
+    return 0;
+}
+
+static int64_t qihse_u64_to_sortable_i64(uint64_t id) {
+    return (int64_t)(id ^ UINT64_C(0x8000000000000000));
+}
+
+bool qihse_vector_store_validate_trinary(const void* data, size_t size) {
+    const uint8_t* p = (const uint8_t*)data;
+    size_t i;
+
+    if (!p && size != 0u) {
+        errno = EINVAL;
+        return false;
+    }
+    for (i = 0u; i < size; i++) {
+        if (p[i] >= 243u) {
+            errno = EINVAL;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool qihse_vector_store_validate_magnitude(const void* data, size_t size) {
+    if (!data && size != 0u) {
+        errno = EINVAL;
+        return false;
+    }
+    return true;
+}
+
+bool qihse_vector_store_build_idmap(const qihse_index_row_t* rows,
+                                    size_t row_count,
+                                    qihse_idmap_entry_t** out_entries,
+                                    size_t* out_count) {
+    qihse_idmap_entry_t* entries = NULL;
+    size_t live_count = 0u;
+    size_t i;
+    size_t j = 0u;
+
+    if ((!rows && row_count != 0u) || !out_entries || !out_count) {
+        errno = EINVAL;
+        return false;
+    }
+    *out_entries = NULL;
+    *out_count = 0u;
+
+    for (i = 0u; i < row_count; i++) {
+        if ((rows[i].row_flags & QIHSE_ROW_F_LIVE) != 0u &&
+            (rows[i].row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
+            live_count++;
+        }
+    }
+
+    if (live_count != 0u) {
+        entries = (qihse_idmap_entry_t*)calloc(live_count, sizeof(*entries));
+        if (!entries) {
+            errno = ENOMEM;
+            return false;
+        }
+        for (i = 0u; i < row_count; i++) {
+            if ((rows[i].row_flags & QIHSE_ROW_F_LIVE) != 0u &&
+                (rows[i].row_flags & QIHSE_ROW_F_TOMBSTONE) == 0u) {
+                entries[j].key = qihse_u64_to_sortable_i64(rows[i].vector_id);
+                entries[j].row_index = (uint64_t)i;
+                j++;
+            }
+        }
+        qsort(entries, live_count, sizeof(*entries), qihse_idmap_compare);
+    }
+
+    *out_entries = entries;
+    *out_count = live_count;
+    return true;
+}
+
+bool qihse_vector_store_load(const char* db_path, qihse_vector_store_snapshot_t* out) {
+    qihse_container_t ctr;
+    qihse_vector_store_snapshot_t snapshot;
+    bool ok = false;
+
+    if (!db_path || !out) {
+        errno = EINVAL;
+        return false;
+    }
+    memset(&snapshot, 0, sizeof(snapshot));
+
+    if (!qihse_ctr_open_read(db_path, &ctr)) {
+        return false;
+    }
+
+    if (!qihse_load_manifest_ctr(&ctr, &snapshot.manifest)) {
+        printf("[DEBUG] qihse_load_manifest_ctr failed\n");
+        goto done;
+    }
+
+    if (!qihse_load_index_ctr(&ctr, &snapshot.manifest,
+                              &snapshot.rows, &snapshot.row_count)) {
+        printf("[DEBUG] qihse_load_index_ctr failed\n");
+        goto done;
+    }
+
+    if (!qihse_load_raw_checked_ctr(&ctr, QIHSE_CTR_SEC_VECTORS,
+                                    snapshot.manifest.vector_bytes,
+                                    snapshot.manifest.vector_crc64,
+                                    &snapshot.vectors, &snapshot.vector_bytes)) {
+        printf("[DEBUG] qihse_load_raw_checked_ctr SEC_VECTORS failed\n");
+        goto done;
+    }
+
+    if (!qihse_load_raw_checked_ctr(&ctr, QIHSE_CTR_SEC_METADATA,
+                                    snapshot.manifest.metadata_bytes,
+                                    snapshot.manifest.metadata_crc64,
+                                    &snapshot.metadata, &snapshot.metadata_bytes)) {
+        printf("[DEBUG] qihse_load_raw_checked_ctr SEC_METADATA failed\n");
+        goto done;
+    }
+
+    if (qihse_load_idmap_optional_ctr(&ctr, &snapshot.manifest,
+                                      &snapshot.idmap, &snapshot.idmap_count)) {
+        snapshot.idmap_valid = true;
+    } else {
+        snapshot.idmap_valid = false;
+        free(snapshot.idmap);
+        snapshot.idmap = NULL;
+        snapshot.idmap_count = 0u;
+    }
+
+    /* Optional sections (trinary, magnitude) are sidecars used for
+     * quantized search modes. Skip loading them when QIHSE_SKIP_OPTIONAL_SECTIONS
+     * is set — this saves ~3-4s of CRC verification in production for
+     * workloads that only use graph/exact search. */
+    bool skip_optional = (getenv("QIHSE_SKIP_OPTIONAL_SECTIONS") != NULL);
+
+    if (!skip_optional) {
+        if (qihse_load_trinary_optional_ctr(&ctr, &snapshot.manifest,
+                                            &snapshot.trinary, &snapshot.trinary_bytes)) {
+            snapshot.trinary_valid = true;
+            snapshot.manifest.trinary_flags |= QIHSE_VSTORE_TRI_VALID;
+        } else {
+            snapshot.trinary_valid = false;
+            free(snapshot.trinary);
+            snapshot.trinary = NULL;
+            snapshot.trinary_bytes = 0u;
+            snapshot.manifest.trinary_flags &= ~QIHSE_VSTORE_TRI_VALID;
+        }
+
+        if (qihse_load_magnitude_optional_ctr(&ctr, &snapshot.manifest,
+                                              &snapshot.magnitude, &snapshot.magnitude_bytes)) {
+            snapshot.magnitude_valid = true;
+            snapshot.manifest.magnitude_flags |= QIHSE_VSTORE_MAG_VALID;
+        } else {
+            snapshot.magnitude_valid = false;
+            free(snapshot.magnitude);
+            snapshot.magnitude = NULL;
+            snapshot.magnitude_bytes = 0u;
+            snapshot.manifest.magnitude_flags &= ~QIHSE_VSTORE_MAG_VALID;
+        }
+    } else {
+        snapshot.trinary_valid = false;
+        snapshot.magnitude_valid = false;
+        snapshot.manifest.trinary_flags &= ~QIHSE_VSTORE_TRI_VALID;
+        snapshot.manifest.magnitude_flags &= ~QIHSE_VSTORE_MAG_VALID;
+    }
+
+    *out = snapshot;
+    ok = true;
+
+done:
+    qihse_ctr_close(&ctr);
+    if (!ok) {
+        qihse_vector_store_snapshot_free(&snapshot);
+    }
+    return ok;
+}
+
+bool qihse_vector_store_flush(const char* db_path, const qihse_vector_store_flush_t* in) {
+    qihse_container_t ctr;
+    bool ctr_open = false;
+    qihse_vector_store_manifest_t manifest;
+    qihse_idmap_entry_t* built_idmap = NULL;
+    const qihse_idmap_entry_t* idmap = NULL;
+    size_t idmap_count = 0u;
+    uint8_t* index_data = NULL;
+    size_t index_size = 0u;
+    uint8_t* idmap_data = NULL;
+    size_t idmap_size = 0u;
+    uint8_t manifest_data[QIHSE_MANIFEST_SIZE];
+    uint64_t index_crc64 = 0u;
+    uint64_t idmap_crc64 = 0u;
+    bool ok = false;
+
+    if (!db_path || !in ||
+        (!in->rows && in->row_count != 0u) ||
+        (!in->vectors && in->vector_bytes != 0u) ||
+        (!in->metadata && in->metadata_bytes != 0u) ||
+        (!in->idmap && in->idmap_count != 0u) ||
+        (!in->trinary && in->trinary_bytes != 0u) ||
+        (!in->magnitude && in->magnitude_bytes != 0u) ||
+        (!in->explicit_edges && in->explicit_edges_bytes != 0u)) {
+        errno = EINVAL;
+        return false;
+    }
+    if (in->trinary_bytes != 0u &&
+        !qihse_trinary_tryte_validate_payload(in->trinary,
+                                              in->row_count,
+                                              in->vector_dims)) {
+        return false;
+    }
+    if (in->trinary_bytes != 0u) {
+        uint64_t expected_trinary_size;
+        if (!qihse_checked_mul_u64(in->trinary_row_bytes, (uint64_t)in->row_count,
+                                   &expected_trinary_size) ||
+            expected_trinary_size != (uint64_t)in->trinary_bytes) {
+            errno = EINVAL;
+            return false;
+        }
+    }
+    if (in->magnitude_bytes != 0u &&
+        !qihse_vector_store_validate_magnitude(in->magnitude, in->magnitude_bytes)) {
+        return false;
+    }
+    if (in->magnitude_bytes != 0u) {
+        uint64_t expected_magnitude_size;
+        if (!qihse_checked_mul_u64(in->magnitude_row_bytes, (uint64_t)in->row_count,
+                                   &expected_magnitude_size) ||
+            expected_magnitude_size != (uint64_t)in->magnitude_bytes) {
+            errno = EINVAL;
+            return false;
+        }
+    }
+
+    /* Open (or create) the container and hold the write lock for the flush. */
+    if (!qihse_ctr_open_write(db_path, true, &ctr)) {
+        return false;
+    }
+    ctr_open = true;
+
+    if (in->idmap) {
+        idmap = in->idmap;
+        idmap_count = in->idmap_count;
+    } else if (!qihse_vector_store_build_idmap(in->rows, in->row_count,
+                                               &built_idmap, &idmap_count)) {
+        goto done;
+    } else {
+        idmap = built_idmap;
+    }
+
+    if (!qihse_encode_rows_buffer(in->rows, in->row_count,
+                                  &index_data, &index_size, &index_crc64) ||
+        !qihse_encode_idmap_buffer(idmap, idmap_count,
+                                   &idmap_data, &idmap_size, &idmap_crc64)) {
+        goto done;
+    }
+
+    memset(&manifest, 0, sizeof(manifest));
+    manifest.format_version = QIHSE_FORMAT_VERSION;
+    manifest.encoding_id = QIHSE_VSTORE_ENCODING_FLOAT32;
+    manifest.encoding_version = QIHSE_VSTORE_ENCODING_VERSION;
+    manifest.vector_dims = in->vector_dims;
+    manifest.row_count = (uint64_t)in->row_count;
+    manifest.vector_bytes = (uint64_t)in->vector_bytes;
+    manifest.metadata_bytes = (uint64_t)in->metadata_bytes;
+    manifest.commit_generation = in->commit_generation;
+    manifest.index_crc64 = index_crc64;
+    /* Use CRC32C (SSE4.2, ~10GB/s) if QIHSE_CRC32C=1, storing with
+     * marker 0xC32C0000 in upper 32 bits. Otherwise use FNV-1a. */
+    bool use_crc32c_write = (getenv("QIHSE_CRC32C") != NULL &&
+                             qihse_crc32c_available());
+    if (use_crc32c_write) {
+        manifest.vector_crc64 = ((uint64_t)0xC32C0000u << 32) |
+                                qihse_crc32c(in->vectors, in->vector_bytes);
+        manifest.metadata_crc64 = ((uint64_t)0xC32C0000u << 32) |
+                                  qihse_crc32c(in->metadata, in->metadata_bytes);
+    } else {
+        manifest.vector_crc64 = qihse_fnv1a64(in->vectors, in->vector_bytes);
+        manifest.metadata_crc64 = qihse_fnv1a64(in->metadata, in->metadata_bytes);
+    }
+    manifest.idmap_crc64 = idmap_crc64;
+    if (in->trinary_bytes != 0u) {
+        manifest.trinary_generation = in->trinary_generation;
+        manifest.trinary_row_bytes = in->trinary_row_bytes;
+        manifest.trinary_rows = (uint64_t)in->row_count;
+        manifest.trinary_crc64 = use_crc32c_write ?
+            (((uint64_t)0xC32C0000u << 32) | qihse_crc32c(in->trinary, in->trinary_bytes)) :
+            qihse_fnv1a64(in->trinary, in->trinary_bytes);
+        manifest.trinary_flags =
+            in->trinary_flags | QIHSE_VSTORE_TRI_PRESENT | QIHSE_VSTORE_TRI_VALID;
+    }
+    if (in->magnitude_bytes != 0u) {
+        manifest.magnitude_generation = in->magnitude_generation;
+        manifest.magnitude_row_bytes = in->magnitude_row_bytes;
+        manifest.magnitude_rows = (uint64_t)in->row_count;
+        manifest.magnitude_crc64 = use_crc32c_write ?
+            (((uint64_t)0xC32C0000u << 32) | qihse_crc32c(in->magnitude, in->magnitude_bytes)) :
+            qihse_fnv1a64(in->magnitude, in->magnitude_bytes);
+        manifest.magnitude_flags =
+            in->magnitude_flags | QIHSE_VSTORE_MAG_PRESENT | QIHSE_VSTORE_MAG_VALID;
+    }
+    qihse_encode_manifest(manifest_data, &manifest);
+
+    {
+        /* Build the section buffer list for the atomic container flush.
+         * Order: MANIFEST last so a partial write can be detected on reopen. */
+        qihse_ctr_section_buf_t bufs[9];
+        size_t nb = 0u;
+        bufs[nb].section_id = QIHSE_CTR_SEC_VECTORS;
+        bufs[nb].data       = in->vectors;
+        bufs[nb].size       = in->vector_bytes;
+        nb++;
+        bufs[nb].section_id = QIHSE_CTR_SEC_METADATA;
+        bufs[nb].data       = in->metadata;
+        bufs[nb].size       = in->metadata_bytes;
+        nb++;
+        bufs[nb].section_id = QIHSE_CTR_SEC_INDEX;
+        bufs[nb].data       = index_data;
+        bufs[nb].size       = index_size;
+        nb++;
+        bufs[nb].section_id = QIHSE_CTR_SEC_IDMAP;
+        bufs[nb].data       = idmap_data;
+        bufs[nb].size       = idmap_size;
+        nb++;
+        if (in->trinary_bytes != 0u) {
+            bufs[nb].section_id = QIHSE_CTR_SEC_TRINARY;
+            bufs[nb].data       = in->trinary;
+            bufs[nb].size       = in->trinary_bytes;
+            nb++;
+        }
+        if (in->magnitude_bytes != 0u) {
+            bufs[nb].section_id = QIHSE_CTR_SEC_MAGNITUDE;
+            bufs[nb].data       = in->magnitude;
+            bufs[nb].size       = in->magnitude_bytes;
+            nb++;
+        }
+        bufs[nb].section_id = QIHSE_CTR_SEC_EDGES;
+        bufs[nb].data       = in->explicit_edges;
+        bufs[nb].size       = in->explicit_edges_bytes;
+        nb++;
+        bufs[nb].section_id = QIHSE_CTR_SEC_MANIFEST;
+        bufs[nb].data       = manifest_data;
+        bufs[nb].size       = sizeof(manifest_data);
+        nb++;
+
+        ok = qihse_ctr_flush(&ctr, bufs, nb);
+    }
+
+done:
+    free(index_data);
+    free(idmap_data);
+    free(built_idmap);
+    if (ctr_open) {
+        qihse_ctr_close(&ctr);
+    }
+    return ok;
+}
+
+void qihse_vector_store_snapshot_free(qihse_vector_store_snapshot_t* snapshot) {
+    if (!snapshot) {
+        return;
+    }
+    free(snapshot->rows);
+    free(snapshot->vectors);
+    free(snapshot->metadata);
+    free(snapshot->idmap);
+    free(snapshot->trinary);
+    free(snapshot->magnitude);
+    memset(snapshot, 0, sizeof(*snapshot));
+}

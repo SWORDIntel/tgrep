@@ -187,11 +187,7 @@ fn show_status() {
     println!("╠══════════════════════════════════════════════════════════╣");
 
     for e in entries.iter().take(50) {
-        let pat_display = if e.pattern.len() > 30 {
-            format!("{}...", &e.pattern[..27])
-        } else {
-            e.pattern.clone()
-        };
+        let pat_display = truncate_pattern(&e.pattern);
         let gen_marker = if e.generation != current_gen { "*" } else { " " };
         println!(
             "║  {:<36} {:<6} {:>3}{} {:<6}║",
@@ -274,7 +270,8 @@ fn run_precache(
         write_progress(done, total, start.elapsed().as_secs_f64(), pattern);
 
         // Run tgrep -l for this pattern (populates cache)
-        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("tgrep"));
+        let mut cmd = std::process::Command::new(exe);
         cmd.arg("-l").arg(pattern).arg(&root);
         if *flags & CACHE_FLAG_CASE_INSENSITIVE != 0 {
             cmd.arg("-i");
@@ -533,11 +530,7 @@ fn run_dashboard(interval: f64) {
         println!("╠══════════════════════════════════════════════════════════╣");
         println!("║  Top entries:                                           ║");
         for e in entries.iter().take(10) {
-            let pat_display = if e.pattern.len() > 30 {
-                format!("{}...", &e.pattern[..27])
-            } else {
-                e.pattern.clone()
-            };
+            let pat_display = truncate_pattern(&e.pattern);
             let gen_marker = if e.generation != current_gen { "*" } else { " " };
             println!("║    {:<34} {:<5} {:>3}{} {:>5}║", pat_display, flags_string(e.flags), e.generation, gen_marker, e.file_count());
         }
@@ -549,4 +542,17 @@ fn run_dashboard(interval: f64) {
 
         std::thread::sleep(std::time::Duration::from_millis(interval_ms));
     }
+}
+
+/// Display truncation that cannot split a UTF-8 char (crafted cache entries
+/// may place a multi-byte char across any byte offset).
+fn truncate_pattern(p: &str) -> String {
+    if p.len() <= 30 {
+        return p.to_string();
+    }
+    let mut end = 27.min(p.len());
+    while end > 0 && !p.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &p[..end])
 }

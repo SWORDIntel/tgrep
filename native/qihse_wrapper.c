@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <stdio.h>
+#include <errno.h>
 
 /* fsync a file descriptor. Returns 0 on success, -1 on error. */
 int tgrep_qihse_file_sync(int fd) {
@@ -39,15 +40,24 @@ int tgrep_qihse_atomic_write(
 ) {
     if (!target_path || (!data && len > 0)) return -1;
 
-    /* Build tmp path: target_path + ".tmp" */
+    /* Build tmp path: target_path + ".<pid>.tmp" — unique per process so two
+     * writers never race on the same name. */
     size_t path_len = strlen(target_path);
     char tmp_path[4096];
-    if (path_len + 5 >= sizeof(tmp_path)) return -1;
-    memcpy(tmp_path, target_path, path_len);
-    memcpy(tmp_path + path_len, ".tmp", 5);
+    if (path_len + 24 >= sizeof(tmp_path)) return -1;
+    snprintf(tmp_path, sizeof(tmp_path), "%s.%ld.tmp", target_path, (long)getpid());
 
-    /* Write to tmp file */
-    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    /* Write to tmp file: exclusive (never clobber an existing file or follow a
+     * pre-planted symlink), private perms (0600). Retry with a fresh name if
+     * our own stale tmp from a previous run is in the way. */
+    int fd = -1;
+    for (int attempt = 0; attempt < 4 && fd < 0; attempt++) {
+        if (attempt > 0)
+            snprintf(tmp_path, sizeof(tmp_path), "%s.%ld.%d.tmp",
+                     target_path, (long)getpid(), attempt);
+        fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+        if (fd < 0 && errno != EEXIST) return -1;
+    }
     if (fd < 0) return -1;
 
     size_t written = 0;

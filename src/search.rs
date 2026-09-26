@@ -976,11 +976,19 @@ fn intersect_postings(
     let mut candidates: Vec<(PathBuf, u64)> = Vec::new();
 
     for reader in readers {
-        // Get posting lists for all grams in this segment
-        let posting_lists: Vec<Vec<u32>> = grams.iter().map(|&g| reader.read_postings(g)).collect();
+        // Read posting lists, but stop immediately if any trigram has zero postings in this segment
+        let mut posting_lists: Vec<Vec<u32>> = Vec::with_capacity(grams.len());
+        let mut any_empty = false;
+        for &g in grams {
+            let p = reader.read_postings(g);
+            if p.is_empty() {
+                any_empty = true;
+                break;
+            }
+            posting_lists.push(p);
+        }
 
-        // If any trigram has zero postings in this segment, no candidates here
-        if posting_lists.iter().any(|p| p.is_empty()) {
+        if any_empty {
             continue;
         }
 
@@ -1176,8 +1184,9 @@ fn qihse_word_index_candidates(
                             continue;
                         }
                     };
-                    // Cap results per segment to avoid unbounded allocation
-                    let max_results = qwi.size().max(1024);
+                    // Hard cap: qwi.size() tracks the file's entry count, but the
+                    // usable output is doc ids (u32). Bound the C-side buffer too.
+                    let max_results = qwi.size().min(1 << 22).max(1024);
                     let doc_ids_u64 = qwi.search(token_owned, max_results);
                     if doc_ids_u64.is_empty() {
                         continue;
@@ -1233,9 +1242,40 @@ fn intersect_sorted(lists: &[&Vec<u32>]) -> Vec<u32> {
     result
 }
 
-/// Intersect two sorted vectors.
+/// Intersect two sorted vectors with adaptive binary search for skewed list sizes
+/// (inspired by KEYSTONE Phase 1 ks_intersect_u32_adaptive).
 fn intersect_two(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut result = Vec::with_capacity(a.len().min(b.len()));
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+    // Ensure `a` is the smaller list for skewed optimization
+    if a.len() > b.len() {
+        return intersect_two(b, a);
+    }
+
+    let mut result = Vec::with_capacity(a.len());
+
+    // Skewed lists: binary search fast-path (like KEYSTONE ks_lower_bound_gallop_u32)
+    if b.len() >= a.len() * 8 {
+        let mut j = 0;
+        for &val in a {
+            if j >= b.len() {
+                break;
+            }
+            match b[j..].binary_search(&val) {
+                Ok(offset) => {
+                    result.push(val);
+                    j += offset + 1;
+                }
+                Err(offset) => {
+                    j += offset;
+                }
+            }
+        }
+        return result;
+    }
+
+    // Balanced lists: linear two-pointer merge
     let mut i = 0;
     let mut j = 0;
     while i < a.len() && j < b.len() {
@@ -1530,11 +1570,14 @@ fn try_load_file_cache(
 
     // Cache is valid — return the file list
     let files: Vec<PathBuf> = filtered.iter().map(|f| PathBuf::from(&f.path)).collect();
-    eprintln!(
-        "tgrep: using cached file list ({} files, verified {} samples)",
-        files.len(),
-        checked
-    );
+    // Only log cache hits under TGREP_DEBUG; normal operation should be silent.
+    if std::env::var("TGREP_DEBUG").is_ok() {
+        eprintln!(
+            "tgrep: using cached file list ({} files, verified {} samples)",
+            files.len(),
+            checked
+        );
+    }
     Some(files)
 }
 
@@ -1658,6 +1701,17 @@ mod tests {
         let a: Vec<u32> = vec![];
         let b = vec![1, 2, 3];
         assert!(intersect_two(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn test_intersect_two_skewed() {
+        // Skewed ratio >= 8 triggers binary search path
+        let small = vec![5, 42, 99, 500, 1000];
+        let large: Vec<u32> = (0..1000).collect();
+        let result1 = intersect_two(&small, &large);
+        let result2 = intersect_two(&large, &small);
+        assert_eq!(result1, vec![5, 42, 99, 500]);
+        assert_eq!(result2, vec![5, 42, 99, 500]);
     }
 
     #[test]

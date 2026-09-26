@@ -1,0 +1,571 @@
+#ifndef DSMIL_KEYSTONE_WRAPPER_H
+#define DSMIL_KEYSTONE_WRAPPER_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include "keystone_trigram.h"
+
+/**
+ * @file dsmil_keystone_wrapper.h
+ * @brief DSMIL-specific wrapper for KEYSTONE high-performance search algorithm
+ *
+ * This wrapper provides a clean DSMIL-specific API for KEYSTONE that integrates
+ * with DSMIL error handling, data types, and component patterns.
+ */
+
+/* ============================================================================
+ * DSMIL Error Codes
+ * ============================================================================ */
+
+#define DSMIL_SEARCH_SUCCESS              0
+#define DSMIL_SEARCH_ERROR_INVALID_PARAM -1
+#define DSMIL_SEARCH_ERROR_MEMORY        -2
+#define DSMIL_SEARCH_ERROR_NOT_FOUND     -3
+#define DSMIL_SEARCH_ERROR_NO_AVX2       -4
+#define DSMIL_SEARCH_ERROR_INIT_FAILED   -5
+
+/* ============================================================================
+ * DSMIL Data Types
+ * ============================================================================ */
+
+/**
+ * DSMIL timestamp type for telemetry and event data
+ */
+typedef uint64_t dsmil_timestamp_t;
+
+/**
+ * DSMIL security identifier type
+ */
+typedef uint32_t dsmil_security_id_t;
+
+/**
+ * DSMIL log entry ID type
+ */
+typedef uint64_t dsmil_log_id_t;
+
+/* ============================================================================
+ * Telemetry Search Structures
+ * ============================================================================ */
+
+/**
+ * DSMIL telemetry event structure
+ */
+typedef struct {
+    dsmil_timestamp_t timestamp;
+    uint32_t event_type;
+    uint32_t device_id;
+    uint32_t layer_id;
+    void *event_data;
+    size_t data_size;
+} dsmil_telemetry_event_t;
+
+/**
+ * DSMIL telemetry search result
+ */
+typedef struct {
+    const dsmil_telemetry_event_t *event;
+    size_t index;
+    dsmil_timestamp_t exact_match_time;
+    bool is_exact_match;
+} dsmil_telemetry_result_t;
+
+/* ============================================================================
+ * Security Search Structures
+ * ============================================================================ */
+
+/**
+ * DSMIL security event structure
+ */
+typedef struct {
+    dsmil_timestamp_t timestamp;
+    dsmil_security_id_t event_id;
+    uint32_t severity;
+    uint32_t category;
+    char description[256];
+} dsmil_security_event_t;
+
+/**
+ * DSMIL security search result
+ */
+typedef struct {
+    const dsmil_security_event_t *event;
+    size_t index;
+    dsmil_security_id_t matched_id;
+    bool is_exact_match;
+} dsmil_security_result_t;
+
+/* ============================================================================
+ * Log Search Structures
+ * ============================================================================ */
+
+/**
+ * DSMIL log entry structure
+ */
+typedef struct {
+    dsmil_log_id_t log_id;
+    dsmil_timestamp_t timestamp;
+    uint32_t level;
+    uint32_t facility;
+    char message[1024];
+    char source[64];
+} dsmil_log_entry_t;
+
+/**
+ * DSMIL log search result
+ */
+typedef struct {
+    const dsmil_log_entry_t *entry;
+    size_t index;
+    dsmil_log_id_t matched_id;
+    bool is_exact_match;
+} dsmil_log_result_t;
+
+/* ============================================================================
+ * Main Search Context
+ * ============================================================================ */
+
+/**
+ * DSMIL search index - pre-extracted keys for high-performance search
+ */
+typedef struct {
+    int64_t *keys;                    // Pre-extracted int64_t keys
+    size_t num_elements;              // Number of elements in index
+} dsmil_search_index_t;
+
+/**
+ * DSMIL search context - wraps KEYSTONE anchor table with DSMIL-specific features
+ */
+typedef struct dsmil_search_context {
+    void *keystone_table;           // KEYSTONE anchor table
+    bool avx2_available;              // AVX2 capability detected
+    bool initialized;                 // Context properly initialized
+    uint64_t search_operations;       // Statistics: total searches performed
+    uint64_t cache_hits;              // Statistics: anchor table hits
+    uint64_t memory_usage;            // Statistics: memory usage in bytes
+    char last_error[256];             // Last error message for debugging
+
+    // Internal cache for per-call key extraction optimization
+    const void *last_data_ptr;        // Pointer to last used data array
+    int64_t cached_first_key;         // First key of cached data (guards stale pointer reuse)
+    int64_t cached_last_key;          // Last key of cached data
+    int64_t *cached_keys;             // Cached extracted keys
+    size_t cached_count;              // Number of keys in cache
+    size_t cached_capacity;           // Capacity of cached_keys array
+} dsmil_search_context_t;
+
+/* ============================================================================
+ * Core API Functions
+ * ============================================================================ */
+
+/**
+ * @brief Create a new DSMIL search context
+ *
+ * Initializes KEYSTONE with AVX2 optimizations if available, otherwise
+ * configures for fallback mode.
+ *
+ * @return Pointer to search context, or NULL on failure
+ */
+dsmil_search_context_t* dsmil_search_create(void);
+
+/**
+ * @brief Destroy a DSMIL search context
+ *
+ * Cleans up all resources associated with the search context.
+ *
+ * @param ctx Search context to destroy (can be NULL)
+ */
+void dsmil_search_destroy(dsmil_search_context_t *ctx);
+
+/**
+ * @brief Get last error message from search context
+ *
+ * @param ctx Search context
+ * @return Pointer to error message string (empty if no error)
+ */
+const char* dsmil_search_get_last_error(const dsmil_search_context_t *ctx);
+
+/* ============================================================================
+ * Index Management Functions
+ * ============================================================================ */
+
+/**
+ * @brief Create a pre-extracted index for telemetry events
+ *
+ * @param events Array of telemetry events
+ * @param num_events Number of events
+ * @return Pointer to new index, or NULL on failure
+ */
+dsmil_search_index_t* dsmil_search_index_create_telemetry(const dsmil_telemetry_event_t *events, size_t num_events);
+
+/**
+ * @brief Create a pre-extracted index for security events
+ *
+ * @param events Array of security events
+ * @param num_events Number of events
+ * @return Pointer to new index, or NULL on failure
+ */
+dsmil_search_index_t* dsmil_search_index_create_security(const dsmil_security_event_t *events, size_t num_events);
+
+/**
+ * @brief Create a pre-extracted index for log entries
+ *
+ * @param logs Array of log entries
+ * @param num_logs Number of log entries
+ * @return Pointer to new index, or NULL on failure
+ */
+dsmil_search_index_t* dsmil_search_index_create_logs(const dsmil_log_entry_t *logs, size_t num_logs);
+
+/**
+ * @brief Destroy a pre-extracted index
+ *
+ * @param index Index to destroy
+ */
+void dsmil_search_index_destroy(dsmil_search_index_t *index);
+
+/* ============================================================================
+ * Telemetry Search Functions
+ * ============================================================================ */
+
+/**
+ * @brief Search telemetry events by timestamp
+ *
+ * Uses KEYSTONE to find telemetry events closest to the target timestamp.
+ * Events must be sorted by timestamp for optimal performance.
+ *
+ * @param ctx Search context
+ * @param events Array of telemetry events (sorted by timestamp)
+ * @param num_events Number of events in array
+ * @param target_time Target timestamp to search for
+ * @param result Pointer to store search result
+ * @return DSMIL_SEARCH_SUCCESS on success, error code otherwise
+ */
+int dsmil_search_telemetry_events(
+    dsmil_search_context_t *ctx,
+    const dsmil_telemetry_event_t *events,
+    size_t num_events,
+    dsmil_timestamp_t target_time,
+    dsmil_telemetry_result_t *result
+);
+
+/**
+ * @brief Search telemetry events by timestamp using a pre-extracted index
+ *
+ * Optimized version that avoids key extraction overhead.
+ *
+ * @param ctx Search context
+ * @param index Pre-extracted index
+ * @param events Original array of telemetry events
+ * @param target_time Target timestamp to search for
+ * @param result Pointer to store search result
+ * @return DSMIL_SEARCH_SUCCESS on success, error code otherwise
+ */
+int dsmil_search_telemetry_events_indexed(
+    dsmil_search_context_t *ctx,
+    const dsmil_search_index_t *index,
+    const dsmil_telemetry_event_t *events,
+    dsmil_timestamp_t target_time,
+    dsmil_telemetry_result_t *result
+);
+
+/**
+ * @brief Search telemetry events by device and timestamp range
+ *
+ * Finds all telemetry events for a specific device within a timestamp range.
+ *
+ * @param ctx Search context
+ * @param events Array of telemetry events (sorted by timestamp)
+ * @param num_events Number of events in array
+ * @param device_id Device ID to filter by
+ * @param start_time Start of timestamp range
+ * @param end_time End of timestamp range
+ * @param results Array to store matching events (caller allocated)
+ * @param max_results Maximum number of results to return
+ * @param num_found Pointer to store actual number of results found
+ * @return DSMIL_SEARCH_SUCCESS on success, error code otherwise
+ */
+int dsmil_search_telemetry_by_device_time_range(
+    dsmil_search_context_t *ctx,
+    const dsmil_telemetry_event_t *events,
+    size_t num_events,
+    uint32_t device_id,
+    dsmil_timestamp_t start_time,
+    dsmil_timestamp_t end_time,
+    dsmil_telemetry_result_t *results,
+    size_t max_results,
+    size_t *num_found
+);
+
+/* ============================================================================
+ * Security Search Functions
+ * ============================================================================ */
+
+/**
+ * @brief Search security events by event ID
+ *
+ * Uses KEYSTONE to find security events by their unique identifier.
+ *
+ * @param ctx Search context
+ * @param events Array of security events
+ * @param num_events Number of events in array
+ * @param target_id Target security event ID
+ * @param result Pointer to store search result
+ * @return DSMIL_SEARCH_SUCCESS on success, error code otherwise
+ */
+int dsmil_search_security_events(
+    dsmil_search_context_t *ctx,
+    const dsmil_security_event_t *events,
+    size_t num_events,
+    dsmil_security_id_t target_id,
+    dsmil_security_result_t *result
+);
+
+/**
+ * @brief Search security events by event ID using a pre-extracted index
+ *
+ * Optimized version that avoids key extraction overhead.
+ *
+ * @param ctx Search context
+ * @param index Pre-extracted index
+ * @param events Original array of security events
+ * @param target_id Target security event ID
+ * @param result Pointer to store search result
+ * @return DSMIL_SEARCH_SUCCESS on success, error code otherwise
+ */
+int dsmil_search_security_events_indexed(
+    dsmil_search_context_t *ctx,
+    const dsmil_search_index_t *index,
+    const dsmil_security_event_t *events,
+    dsmil_security_id_t target_id,
+    dsmil_security_result_t *result
+);
+
+/**
+ * @brief Search security events by severity and time range
+ *
+ * Finds security events within a severity range and timestamp window.
+ *
+ * @param ctx Search context
+ * @param events Array of security events (sorted by timestamp)
+ * @param num_events Number of events in array
+ * @param min_severity Minimum severity level (inclusive)
+ * @param max_severity Maximum severity level (inclusive)
+ * @param start_time Start of timestamp range
+ * @param end_time End of timestamp range
+ * @param results Array to store matching events (caller allocated)
+ * @param max_results Maximum number of results to return
+ * @param num_found Pointer to store actual number of results found
+ * @return DSMIL_SEARCH_SUCCESS on success, error code otherwise
+ */
+int dsmil_search_security_by_severity_time_range(
+    dsmil_search_context_t *ctx,
+    const dsmil_security_event_t *events,
+    size_t num_events,
+    uint32_t min_severity,
+    uint32_t max_severity,
+    dsmil_timestamp_t start_time,
+    dsmil_timestamp_t end_time,
+    dsmil_security_result_t *results,
+    size_t max_results,
+    size_t *num_found
+);
+
+/* ============================================================================
+ * Log Search Functions
+ * ============================================================================ */
+
+/**
+ * @brief Search log entries by log ID
+ *
+ * Uses KEYSTONE to find log entries by their unique identifier.
+ *
+ * @param ctx Search context
+ * @param logs Array of log entries
+ * @param num_logs Number of log entries in array
+ * @param target_id Target log entry ID
+ * @param result Pointer to store search result
+ * @return DSMIL_SEARCH_SUCCESS on success, error code otherwise
+ */
+int dsmil_search_log_entries(
+    dsmil_search_context_t *ctx,
+    const dsmil_log_entry_t *logs,
+    size_t num_logs,
+    dsmil_log_id_t target_id,
+    dsmil_log_result_t *result
+);
+
+/**
+ * @brief Search log entries by log ID using a pre-extracted index
+ *
+ * Optimized version that avoids key extraction overhead.
+ *
+ * @param ctx Search context
+ * @param index Pre-extracted index
+ * @param logs Original array of log entries
+ * @param target_id Target log entry ID
+ * @param result Pointer to store search result
+ * @return DSMIL_SEARCH_SUCCESS on success, error code otherwise
+ */
+int dsmil_search_log_entries_indexed(
+    dsmil_search_context_t *ctx,
+    const dsmil_search_index_t *index,
+    const dsmil_log_entry_t *logs,
+    dsmil_log_id_t target_id,
+    dsmil_log_result_t *result
+);
+
+/**
+ * @brief Search log entries by facility and time range
+ *
+ * Finds log entries from specific facilities within a timestamp range.
+ *
+ * @param ctx Search context
+ * @param logs Array of log entries (sorted by timestamp)
+ * @param num_logs Number of log entries in array
+ * @param facility Target facility code
+ * @param start_time Start of timestamp range
+ * @param end_time End of timestamp range
+ * @param results Array to store matching entries (caller allocated)
+ * @param max_results Maximum number of results to return
+ * @param num_found Pointer to store actual number of results found
+ * @return DSMIL_SEARCH_SUCCESS on success, error code otherwise
+ */
+int dsmil_search_logs_by_facility_time_range(
+    dsmil_search_context_t *ctx,
+    const dsmil_log_entry_t *logs,
+    size_t num_logs,
+    uint32_t facility,
+    dsmil_timestamp_t start_time,
+    dsmil_timestamp_t end_time,
+    dsmil_log_result_t *results,
+    size_t max_results,
+    size_t *num_found
+);
+
+/* ============================================================================
+ * tar.zst Streaming Search Functions
+ * ============================================================================ */
+
+#ifdef KEYSTONE_ENABLE_TAR_ZST
+
+/**
+ * @brief Search telemetry events from a .tar.zst archive member
+ *
+ * Streams the named member, parses timestamps, and searches.
+ *
+ * @param ctx Search context
+ * @param archive_path Path to .tar.zst file
+ * @param member_name Name of tar entry to stream and search
+ * @param target_time Target timestamp
+ * @param result Pointer to store search result
+ * @return DSMIL_SEARCH_SUCCESS on success, error code otherwise
+ */
+int dsmil_search_telemetry_events_from_tar_zst(
+    dsmil_search_context_t *ctx,
+    const char *archive_path,
+    const char *member_name,
+    dsmil_timestamp_t target_time,
+    dsmil_telemetry_result_t *result
+);
+
+/**
+ * @brief Search security events from a .tar.zst archive member
+ */
+int dsmil_search_security_events_from_tar_zst(
+    dsmil_search_context_t *ctx,
+    const char *archive_path,
+    const char *member_name,
+    dsmil_security_id_t target_id,
+    dsmil_security_result_t *result
+);
+
+/**
+ * @brief Search log entries from a .tar.zst archive member
+ */
+int dsmil_search_log_entries_from_tar_zst(
+    dsmil_search_context_t *ctx,
+    const char *archive_path,
+    const char *member_name,
+    dsmil_log_id_t target_id,
+    dsmil_log_result_t *result
+);
+
+/**
+ * @brief Batch search multiple members from a .tar.zst archive
+ */
+int dsmil_search_batch_tar_zst(
+    dsmil_search_context_t *ctx,
+    const char *archive_path,
+    const char **member_names,
+    size_t num_members,
+    int64_t *keys,
+    size_t num_keys,
+    dsmil_telemetry_result_t *results
+);
+
+/**
+ * @brief Index text files inside a tar.zst archive into a new trigram index.
+ *
+ * @param archive_path Path to the .tar.zst archive.
+ * @param member_pattern Optional glob filter (e.g. "*.txt", "*.log", or NULL for all).
+ * @param retain_content True to retain full content for exact verification; false for candidate-only.
+ * @param flags Trigram options flags (e.g. KEYSTONE_TRIGRAM_OPT_CASE_INSENSITIVE).
+ * @param out_idx Pointer to receive the created and finalized trigram index.
+ * @return Number of documents indexed on success, or negative error code on failure.
+ */
+int dsmil_trigram_index_tar_zst(
+    const char *archive_path,
+    const char *member_pattern,
+    bool retain_content,
+    uint32_t flags,
+    keystone_trigram_index_t **out_idx
+);
+
+#endif /* KEYSTONE_ENABLE_TAR_ZST */
+
+/* ============================================================================
+ * Utility Functions
+ * ============================================================================ */
+
+/**
+ * @brief Get search performance statistics
+ *
+ * @param ctx Search context
+ * @param total_searches Total number of searches performed
+ * @param cache_hit_rate Cache hit rate (0.0 to 1.0)
+ * @param memory_usage Memory usage in bytes
+ * @param avg_search_time_ns Average search time in nanoseconds
+ * @return DSMIL_SEARCH_SUCCESS on success, error code otherwise
+ */
+int dsmil_search_get_stats(
+    const dsmil_search_context_t *ctx,
+    uint32_t *total_searches,
+    double *cache_hit_rate,
+    uint32_t *memory_usage,
+    double *avg_search_time_ns
+);
+
+/**
+ * @brief Reset search statistics
+ *
+ * @param ctx Search context
+ * @return DSMIL_SEARCH_SUCCESS on success, error code otherwise
+ */
+int dsmil_search_reset_stats(dsmil_search_context_t *ctx);
+
+/**
+ * @brief Check if AVX2 optimizations are available and enabled
+ *
+ * @param ctx Search context
+ * @return true if AVX2 is available and enabled, false otherwise
+ */
+bool dsmil_search_avx2_enabled(const dsmil_search_context_t *ctx);
+
+/**
+ * @brief Get KEYSTONE version information
+ *
+ * @return Version string
+ */
+const char* dsmil_search_get_version(void);
+
+#endif /* DSMIL_KEYSTONE_WRAPPER_H */

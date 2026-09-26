@@ -502,7 +502,8 @@ fn main() {
 
     // Write CSV
     let csv_path = format!(
-        "/home/john/tgrep/bench_suite_{}_{}.csv",
+        "{}/bench_suite_{}_{}.csv",
+        env!("CARGO_MANIFEST_DIR"),
         mode_label,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

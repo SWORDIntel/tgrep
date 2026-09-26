@@ -314,7 +314,8 @@ fn main() {
 
     // Write CSV
     let csv_path = format!(
-        "/home/john/tgrep/bench_results_{}.csv",
+        "{}/bench_results_{}.csv",
+        env!("CARGO_MANIFEST_DIR"),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

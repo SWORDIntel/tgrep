@@ -71,6 +71,11 @@ typedef struct {
     pthread_mutex_t mutex;
 } tgrep_optimization_db_t;
 
+/* The Rust side mirrors this struct as [u8; 80] (src/native.rs). If either
+ * layout drifts, fail the C build here instead of corrupting memory. */
+_Static_assert(sizeof(tgrep_optimization_db_t) == 80,
+               "tgrep_optimization_db_t must stay 80 bytes: Rust mirrors it as [u8; 80]");
+
 /* ── Magic + version for storage format ──────────────────────────── */
 #define TGREP_OPT_MAGIC   0x54475044u  /* "TGPD" */
 #define TGREP_OPT_VERSION 1u
@@ -100,6 +105,12 @@ int tgrep_optimization_init(
     }
     if (storage_path) {
         db->storage_path = strdup(storage_path);
+        if (!db->storage_path) {
+            free(db->entries);
+            db->entries = NULL;
+            pthread_mutex_destroy(&db->mutex);
+            return -1;
+        }
         if (db->entries) {
             tgrep_optimization_load(db);
         }
@@ -153,6 +164,7 @@ static tgrep_optimization_entry_t* get_or_create_entry(
     tgrep_optimization_db_t* db,
     const tgrep_data_signature_t* sig
 ) {
+    if (!db || !db->entries || db->max_entries == 0 || !sig) return NULL;
     tgrep_optimization_entry_t* e = find_entry(db, sig);
     if (e) return e;
     if (db->num_entries >= db->max_entries) {
@@ -201,7 +213,12 @@ void tgrep_optimization_record(
     e->avg_speedup = e->avg_speedup * (1.0 - alpha) + speedup * alpha;
     e->avg_confidence = e->avg_confidence * (1.0 - alpha) + confidence * alpha;
     e->samples++;
-    if (speedup * confidence > e->avg_speedup * e->avg_confidence || e->samples == 1) {
+    if (e->samples == 1) {
+        e->best_pipeline = pipeline;
+        e->optimal_dimensions = dimensions;
+        e->optimal_threads = threads;
+        e->optimal_backend = backend;
+    } else if (speedup * confidence > e->avg_speedup * e->avg_confidence) {
         e->best_pipeline = pipeline;
         e->optimal_dimensions = dimensions;
         e->optimal_threads = threads;
@@ -301,11 +318,18 @@ int tgrep_optimization_save(tgrep_optimization_db_t* db) {
     FILE* fp = fdopen(fd, "wb");
     if (!fp) { close(fd); pthread_mutex_unlock(&db->mutex); return -errno; }
     uint32_t magic = TGREP_OPT_MAGIC, version = TGREP_OPT_VERSION;
-    fwrite(&magic, 4, 1, fp);
-    fwrite(&version, 4, 1, fp);
-    fwrite(&db->num_entries, sizeof(size_t), 1, fp);
-    fwrite(db->entries, sizeof(tgrep_optimization_entry_t), db->num_entries, fp);
-    fclose(fp);
+    if (fwrite(&magic, 4, 1, fp) != 1 ||
+        fwrite(&version, 4, 1, fp) != 1 ||
+        fwrite(&db->num_entries, sizeof(size_t), 1, fp) != 1 ||
+        (db->num_entries > 0 && fwrite(db->entries, sizeof(tgrep_optimization_entry_t), db->num_entries, fp) != db->num_entries)) {
+        fclose(fp);
+        pthread_mutex_unlock(&db->mutex);
+        return -1;
+    }
+    if (fclose(fp) != 0) {
+        pthread_mutex_unlock(&db->mutex);
+        return -errno;
+    }
     pthread_mutex_unlock(&db->mutex);
     return 0;
 }
@@ -338,7 +362,10 @@ int tgrep_optimization_load(tgrep_optimization_db_t* db) {
 /* Get the number of entries in the DB. */
 size_t tgrep_optimization_count(const tgrep_optimization_db_t* db) {
     if (!db) return 0;
-    return db->num_entries;
+    pthread_mutex_lock((pthread_mutex_t*)&db->mutex);
+    size_t count = db->num_entries;
+    pthread_mutex_unlock((pthread_mutex_t*)&db->mutex);
+    return count;
 }
 
 /* Enable or disable learning. */

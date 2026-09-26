@@ -106,6 +106,33 @@ fn delegate_to_rg(args: &[String]) -> ! {
         exit(2);
     });
 
+    // Verify the resolved binary actually claims to be ripgrep before exec'ing
+    // it: TGREP_REAL_RG / rg_path / PATH are attacker-influenceable (env, user
+    // config), and this turns a planted look-alike into a failed search
+    // instead of arbitrary execution.
+    let version = std::process::Command::new(&rg_path)
+        .arg("--version")
+        .output();
+    match version {
+        Ok(out) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if !s.to_lowercase().contains("ripgrep") {
+                eprintln!(
+                    "tgrep: refusing to delegate to {} — does not identify as ripgrep",
+                    rg_path.display()
+                );
+                exit(2);
+            }
+        }
+        _ => {
+            eprintln!(
+                "tgrep: refusing to delegate to {} — --version failed",
+                rg_path.display()
+            );
+            exit(2);
+        }
+    }
+
     let err = std::process::Command::new(&rg_path)
         .args(args)
         .stdin(std::process::Stdio::inherit())

@@ -61,9 +61,9 @@ if $UNINSTALL; then
     rm -f "$BIN_DIR/rg" 2>/dev/null || true
     rm -rf "$CONFIG_DIR" 2>/dev/null || true
     echo "Done. rg now uses the system ripgrep directly."
-    echo "Note: tgrep state directory (~/.local/share/tgrep) is preserved."
+    echo "Note: tgrep state directory (~/.local/state/tgrep) is preserved."
     echo "      Remove it manually if you want to clear all index data:"
-    echo "      rm -rf ~/.local/share/tgrep"
+    echo "      rm -rf ~/.local/state/tgrep"
     exit 0
 fi
 

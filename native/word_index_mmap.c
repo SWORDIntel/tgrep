@@ -101,6 +101,10 @@ int tgrep_word_index_save(void* handle, const char* path) {
     qihse_btree_t* tree = (qihse_btree_t*)handle;
     size_t count = qihse_btree_size(tree);
 
+    /* Empty tree is not an error — segments with only binary files
+     * (NUL bytes) have no word index entries. Skip save entirely. */
+    if (count == 0) return 0;
+
     FILE* f = fopen(path, "wb");
     if (!f) return -1;
 
@@ -115,6 +119,7 @@ int tgrep_word_index_save(void* handle, const char* path) {
     /* Use a range scan from min (NULL) to max (NULL) = full scan */
     qihse_btree_cursor_t* cur = qihse_btree_range_open(tree, NULL, 0, NULL, 0);
     if (!cur) {
+        fprintf(stderr, "tgrep: qwi save diag: range_open returned NULL (count=%zu)\n", count);
         fclose(f);
         return -1;
     }
@@ -140,7 +145,11 @@ int tgrep_word_index_save(void* handle, const char* path) {
 
     fclose(f);
 
-    if (written != count) return -1;
+    if (written != count) {
+        fprintf(stderr, "tgrep: qwi save diag: count=%zu written=%zu diff=%zu\n",
+                count, written, count - written);
+        return -1;
+    }
     return 0;
 }
 
@@ -189,9 +198,10 @@ void* tgrep_word_index_load(const char* path) {
     idx->count = (size_t)idx->header->count;
     idx->entries = (const unsigned char*)base + sizeof(qwi_header_t);
 
-    /* Verify file size matches */
-    size_t expected = sizeof(qwi_header_t) + idx->count * TGREP_QWI_ENTRY_SIZE;
-    if (file_size < expected) {
+    /* Verify file size matches — divide first so count*ENTRY_SIZE cannot wrap:
+     * count entries must actually fit in the mapping beyond the header. */
+    if (file_size < sizeof(qwi_header_t) ||
+        (uint64_t)idx->count > (file_size - sizeof(qwi_header_t)) / TGREP_QWI_ENTRY_SIZE) {
         munmap(base, file_size);
         free(idx);
         return NULL;

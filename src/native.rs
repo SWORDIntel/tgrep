@@ -468,7 +468,10 @@ impl KeystoneIndex {
 
     /// Begin a streaming document for chunked ingestion.
     pub fn begin_document(&mut self, name: Option<&str>) -> Result<DocumentStream, String> {
-        let name_c = name.map(|n| std::ffi::CString::new(n).unwrap());
+        let name_c = match name.map(std::ffi::CString::new).transpose() {
+            Ok(c) => c,
+            Err(_) => return Err("document name contains NUL byte".into()),
+        };
         let name_ptr = name_c
             .as_ref()
             .map(|s| s.as_ptr())
@@ -775,8 +778,14 @@ extern "C" fn replay_trampoline(
     txn_id: u64,
     user_data: *mut c_void,
 ) -> bool {
+    // The C WAL parser consumes attacker-writable files: never trust a
+    // (ptr, len) pair — a null key with nonzero len is UB via from_raw_parts.
     let records = unsafe { &mut *(user_data as *mut Vec<WalReplayRecord>) };
-    let key_slice = unsafe { std::slice::from_raw_parts(key as *const u8, key_len as usize) };
+    if key.is_null() || key_len == 0 {
+        return false; // drop the record; do not build a slice from a bad pair
+    }
+    let key_slice =
+        unsafe { std::slice::from_raw_parts(key as *const u8, key_len as usize) };
     let value_slice = if value.is_null() || value_len == 0 {
         Vec::new()
     } else {
@@ -1229,7 +1238,10 @@ impl OptimizationDatabase {
     /// are loaded automatically.
     pub fn create(max_entries: usize, storage_path: Option<&str>) -> Result<Self, String> {
         let mut db = OptimizationDb { _opaque: [0; 80] };
-        let c_path = storage_path.map(|s| std::ffi::CString::new(s).unwrap());
+        let c_path = match storage_path.map(std::ffi::CString::new).transpose() {
+            Ok(p) => p,
+            Err(_) => return Err("storage_path contains NUL byte".into()),
+        };
         let path_ptr = c_path
             .as_ref()
             .map(|s| s.as_ptr())
@@ -1400,12 +1412,18 @@ impl SearchCache {
         generation: i64,
         file_paths: &[String],
     ) -> i32 {
-        let pattern_c = std::ffi::CString::new(pattern).unwrap();
+        let pattern_c = match std::ffi::CString::new(pattern) {
+            Ok(c) => c,
+            Err(_) => return -1,
+        };
         // Build C string array
-        let cstrings: Vec<std::ffi::CString> = file_paths
-            .iter()
-            .map(|s| std::ffi::CString::new(s.as_str()).unwrap())
-            .collect();
+        let mut cstrings = Vec::with_capacity(file_paths.len());
+        for s in file_paths {
+            match std::ffi::CString::new(s.as_str()) {
+                Ok(c) => cstrings.push(c),
+                Err(_) => return -1,
+            }
+        }
         let ptrs: Vec<*const std::ffi::c_char> = cstrings.iter().map(|s| s.as_ptr()).collect();
         unsafe {
             ffi::tgrep_cache_store_results(
@@ -1423,7 +1441,7 @@ impl SearchCache {
     /// Returns Some(paths) if the cache has entries for this
     /// (pattern, flags, generation), or None if no cache hit.
     pub fn lookup(&self, pattern: &str, flags: i32, generation: i64) -> Option<Vec<String>> {
-        let pattern_c = std::ffi::CString::new(pattern).unwrap();
+        let pattern_c = std::ffi::CString::new(pattern).ok()?;
         let mut out_paths: *mut *mut std::ffi::c_char = std::ptr::null_mut();
         let mut out_count: usize = 0;
         let rc = unsafe {
@@ -1455,7 +1473,10 @@ impl SearchCache {
     /// Invalidate entries for a pattern+flags.
     /// (Generation-based invalidation makes this largely unnecessary.)
     pub fn invalidate(&self, pattern: &str, flags: i32) -> i32 {
-        let pattern_c = std::ffi::CString::new(pattern).unwrap();
+        let pattern_c = match std::ffi::CString::new(pattern) {
+            Ok(c) => c,
+            Err(_) => return -1,
+        };
         unsafe { ffi::tgrep_cache_invalidate(self.handle, pattern_c.as_ptr(), flags) }
     }
 

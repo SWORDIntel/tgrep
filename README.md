@@ -1,4 +1,7 @@
-# tgrep
+# tgrep — persistent-index search, released
+
+**v1.0.0 — first public release** (AGPL-3.0). Security-reviewed: see
+[SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the pre-release audit and hardening.
 
 Persistent trigram-indexed search that drops in as a ripgrep accelerator.
 
@@ -99,7 +102,7 @@ Make sure `~/.local/bin` is in your `PATH` (check your shell config).
 ./install.sh --uninstall
 ```
 
-Restores direct ripgrep access. Index data in `~/.local/share/tgrep` is
+Restores direct ripgrep access. Index data in `~/.local/state/tgrep` is
 preserved — remove it manually if desired.
 
 ## Usage
