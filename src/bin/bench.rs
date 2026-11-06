@@ -67,6 +67,7 @@ fn run_benchmark(
     state_dir: &str,
     extra_args: &[String],
     indexed_only: bool,
+    rg_bin: &str,
 ) -> Vec<BenchmarkResult> {
     let mut results = Vec::new();
 
@@ -83,7 +84,7 @@ fn run_benchmark(
     let (t_time, t_out, _t_err, _t_code) = run_command(&mut tgrep_cmd);
     let t_count = count_matches(&t_out);
 
-    let mut rg_cmd = Command::new("rg");
+    let mut rg_cmd = Command::new(rg_bin);
     rg_cmd.arg("--threads=4").arg("-l").arg(pattern).arg(path);
     let (r_time, r_out, _r_err, _r_code) = run_command(&mut rg_cmd);
     let r_count = count_matches(&r_out);
@@ -156,7 +157,7 @@ fn run_benchmark(
         let (t_time, _, _, _) = run_command(&mut tgrep_cmd);
 
         // Run rg
-        let mut rg_cmd = Command::new("rg");
+        let mut rg_cmd = Command::new(rg_bin);
         rg_cmd.arg("--threads=4").arg("-l").arg(pattern).arg(path);
         let (r_time, _, _, _) = run_command(&mut rg_cmd);
 
@@ -253,8 +254,10 @@ fn main() {
         let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
         format!("{}/.local/share/tgrep", home)
     });
+    let rg_bin = env::var("RG_BIN").unwrap_or_else(|_| "/usr/bin/rg".to_string());
 
     eprintln!("tgrep binary: {}", tgrep_bin);
+    eprintln!("ripgrep bin:  {}", rg_bin);
     eprintln!("state dir:    {}", state_dir);
     eprintln!("pattern:      {}", pattern);
     eprintln!("path:         {}", path);
@@ -272,6 +275,7 @@ fn main() {
         &state_dir,
         &extra_args,
         indexed_only,
+        &rg_bin,
     );
 
     // Split results by tool

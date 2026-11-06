@@ -18,6 +18,7 @@ TRIALS="${1:-10}"
 STATE_DIR="${2:-/tmp/tgrep_qwi_mmap}"
 CORPUS="${3:-/rpool/scratch/tgrep_corpus}"
 TGREP_BIN="$(cd "$(dirname "$0")/.." && pwd)/target/release/tgrep"
+RG_BIN="${RG_BIN:-/usr/bin/rg}"
 
 OUT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CSV="$OUT_DIR/benchmark_results.csv"
@@ -78,7 +79,7 @@ run_trial() {
 
     # Run rg (always fresh, no cache)
     local r_out r_elapsed
-    r_out=$(/usr/bin/time -f "%e" rg $flags -l "$pat" "$CORPUS" -j 4 2>"$TMPF" || true)
+    r_out=$(/usr/bin/time -f "%e" "$RG_BIN" $flags -l "$pat" "$CORPUS" -j 4 2>"$TMPF" || true)
     r_elapsed=$(cat "$TMPF")
     rg_ms=$(awk '{printf "%.0f", $1 * 1000}' <<< "$r_elapsed")
 
@@ -91,6 +92,7 @@ echo "=== tgrep Comprehensive Benchmark ==="
 echo "Trials: $TRIALS"
 echo "State:  $STATE_DIR"
 echo "Corpus: $CORPUS"
+echo "ripgrep: $RG_BIN ($("$RG_BIN" --version | head -1))"
 echo "Output: $CSV"
 echo ""
 
