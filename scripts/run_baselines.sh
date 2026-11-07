@@ -1,13 +1,26 @@
 #!/bin/bash
 # Raw grep baselines: 50 on NVMe, 20 on ZFS. Random patterns. Record for later research.
-set -u
+set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(dirname "$SCRIPT_DIR")"
+if ! IFS= read -r -d '' SCRIPT_PATH < <(readlink -fz -- "${BASH_SOURCE[0]}"); then
+  echo 'Error: could not resolve baseline script path.' >&2
+  exit 2
+fi
+SCRIPT_DIR="${SCRIPT_PATH%/*}"
+REPO_DIR="${SCRIPT_DIR%/*}"
+[[ -n "$REPO_DIR" ]] || REPO_DIR=/
 
-NVME="${TGREP_NVME_CORPUS:-$HOME/Documents/KEYSTONE $HOME/Documents/QIHSE $HOME/Documents/Native-AI-Terminal}"
-ZFS="${TGREP_ZFS_CORPUS:-/fast/scratch/tgrep_corpus/KEYSTONE /fast/scratch/tgrep_corpus/QIHSE /fast/scratch/tgrep_corpus/Native-AI-Terminal}"
-RESULTS="$REPO_DIR/baseline_results_$(date +%Y%m%d_%H%M%S).csv"
+if [[ -n "${TGREP_NVME_CORPUS:-}" ]]; then
+  NVME=("$TGREP_NVME_CORPUS")
+else
+  NVME=("$HOME/Documents/KEYSTONE" "$HOME/Documents/QIHSE" "$HOME/Documents/Native-AI-Terminal")
+fi
+if [[ -n "${TGREP_ZFS_CORPUS:-}" ]]; then
+  ZFS=("$TGREP_ZFS_CORPUS")
+else
+  ZFS=(/fast/scratch/tgrep_corpus/KEYSTONE /fast/scratch/tgrep_corpus/QIHSE /fast/scratch/tgrep_corpus/Native-AI-Terminal)
+fi
+RESULTS=$(mktemp "$REPO_DIR/baseline_results_$(date +%Y%m%d_%H%M%S).XXXXXX.csv")
 
 echo "pool,run,pattern,time_ms,matches" > "$RESULTS"
 
@@ -22,12 +35,14 @@ patterns=(
 )
 
 NUM_PATS=${#patterns[@]}
+RANDOM="${TGREP_BENCH_SEED:-1}"
 
 echo "=== NVMe baselines (50 runs, rpool) ==="
 for i in $(seq 1 50); do
   pat="${patterns[$((RANDOM % NUM_PATS))]}"
   start=$(date +%s%N)
-  m=$(grep -r --binary-files=without-match -c "$pat" $NVME 2>/dev/null | awk -F: '{s+=$NF} END {print s+0}')
+  if m=$(grep -r --binary-files=without-match -c -- "$pat" "${NVME[@]}" | awk -F: '{s+=$NF} END {print s+0}'); then :
+  else status=$?; [[ "$status" -eq 1 ]] || exit "$status"; fi
   end=$(date +%s%N)
   ms=$(( (end - start) / 1000000 ))
   echo "nvme,$i,$pat,$ms,$m" >> "$RESULTS"
@@ -38,13 +53,13 @@ echo "  NVMe done."
 
 echo ""
 echo "=== ZFS baselines (20 runs, fast pool) ==="
-# Drop caches for fairer ZFS reads
-sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+# Filesystem and ZFS ARC cache state are uncontrolled; do not change global kernel cache state.
 
 for i in $(seq 1 20); do
   pat="${patterns[$((RANDOM % NUM_PATS))]}"
   start=$(date +%s%N)
-  m=$(grep -r --binary-files=without-match -c "$pat" $ZFS 2>/dev/null | awk -F: '{s+=$NF} END {print s+0}')
+  if m=$(grep -r --binary-files=without-match -c -- "$pat" "${ZFS[@]}" | awk -F: '{s+=$NF} END {print s+0}'); then :
+  else status=$?; [[ "$status" -eq 1 ]] || exit "$status"; fi
   end=$(date +%s%N)
   ms=$(( (end - start) / 1000000 ))
   echo "zfs,$i,$pat,$ms,$m" >> "$RESULTS"

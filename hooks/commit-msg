@@ -1,26 +1,27 @@
 #!/bin/bash
-# commit-msg hook: strip Devin/AI attribution lines from commit messages.
-#
-# Removes lines matching:
-#   Generated with [Devin](...)
-#   Co-Authored-By: Devin <...>
-#   Co-Authored-By: ...devin-ai-integration...
-#
-# Install: cp hooks/commit-msg .git/hooks/commit-msg && chmod +x .git/hooks/commit-msg
-
+# Strip Devin attribution trailers while preserving commit text on filter errors.
+set -eu
+if [ "$#" -ne 1 ]; then
+    echo "Usage: commit-msg MESSAGE_FILE" >&2
+    exit 2
+fi
 msg_file="$1"
-tmp=$(mktemp)
+case "$msg_file" in
+    /*) ;;
+    *) msg_file="$PWD/$msg_file" ;;
+esac
+tmp=$(mktemp -- "${msg_file}.XXXXXX")
+trap 'rm -f -- "$tmp"' EXIT
 
-# Strip attribution lines
-grep -v -i \
-  -e 'Generated with \[Devin\]' \
-  -e 'Co-Authored-By: Devin' \
-  -e 'devin-ai-integration\|devin\.ai' \
-  "$msg_file" > "$tmp"
-
-# Remove trailing blank lines, ensure single trailing newline
+if grep -v -i -E \
+    -e '^[[:blank:]]*Generated with \[Devin\]' \
+    -e '^[[:blank:]]*Co-Authored-By:.*(Devin|devin-ai-integration|devin\.ai)' \
+    -- "$msg_file" > "$tmp"; then
+    :
+else
+    status=$?
+    [ "$status" -eq 1 ] || exit "$status"
+fi
 perl -0777 -i -pe 's/\n+$/\n/' "$tmp"
-
-cp "$tmp" "$msg_file"
-rm -f "$tmp"
-exit 0
+chmod --reference="$msg_file" -- "$tmp"
+mv -- "$tmp" "$msg_file"

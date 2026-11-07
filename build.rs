@@ -1,7 +1,17 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=TGREP_SIMD_FLAGS");
+    for directory in [
+        "native",
+        "vendor/KEYSTONE/include",
+        "vendor/QIHSE/include",
+        "vendor/QIHSE/persistence",
+        "vendor/KEYSTONE/src",
+        "vendor/QIHSE/src",
+    ] {
+        println!("cargo:rerun-if-changed={directory}");
+    }
     // Detect SIMD flags from environment (set by compile.sh) or fall back to SSE4.2
-    let simd_flags = std::env::var("TGREP_SIMD_FLAGS")
-        .unwrap_or_else(|_| "-msse4.2".to_string());
+    let simd_flags = std::env::var("TGREP_SIMD_FLAGS").unwrap_or_else(|_| "-msse4.2".to_string());
 
     let mut build = cc::Build::new();
     build
@@ -52,6 +62,7 @@ fn main() {
         "native/keystone_wrapper.c",
         "native/qihse_wrapper.c",
         "native/qihse_wal_wrapper.c",
+        "native/qihse_opt_wrapper.c",
         "native/qihse_cache_wrapper.c",
         "native/hash_wrapper.c",
         "native/word_index_mmap.c",

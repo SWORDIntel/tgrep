@@ -1,0 +1,6 @@
+trial,first,prefetch_enabled_ms,prefetch_disabled_ms,files_matched
+1,enabled,287.783,174.725,151
+2,disabled,153.847,185.970,151
+3,enabled,179.005,150.305,151
+4,disabled,157.623,151.766,151
+5,enabled,167.744,145.107,151

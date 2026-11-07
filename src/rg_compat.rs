@@ -21,9 +21,7 @@ use std::process::exit;
 
 /// Flags that tgrep can handle in rg-compat mode.
 /// Any flag NOT in this set causes delegation to real rg.
-const SUPPORTED_SHORT_FLAGS: &[char] = &[
-    'w', 'l', 'c', 'n', 'q', 'i', 'S', 'F', 'e', 'j', 'g', 'H', 'I',
-];
+const SUPPORTED_SHORT_FLAGS: &[char] = &['w', 'l', 'c', 'n', 'q', 'F', 'e', 'H'];
 
 const SUPPORTED_LONG_FLAGS: &[&str] = &[
     "--word-regexp",
@@ -31,33 +29,37 @@ const SUPPORTED_LONG_FLAGS: &[&str] = &[
     "--count",
     "--line-number",
     "--quiet",
-    "--ignore-case",
-    "--smart-case",
     "--fixed-strings",
     "--regexp",
-    "--threads",
-    "--hidden",
-    "--glob",
     "--with-filename",
-    "--no-filename",
     "--no-line-number",
 ];
 
 /// Flags that take an argument (value follows the flag).
 const FLAGS_WITH_ARGS_SHORT: &[char] = &['e', 'j', 'g'];
 
-const FLAGS_WITH_ARGS_LONG: &[&str] = &[
-    "--regexp",
-    "--threads",
-    "--glob",
-];
+const FLAGS_WITH_ARGS_LONG: &[&str] = &["--regexp", "--threads", "--glob"];
 
 /// Find the real rg binary path.
 /// Checks TGREP_REAL_RG env var, then searches PATH for a non-tgrep rg.
 fn find_real_rg() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let self_metadata = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok());
+    let is_self = |path: &std::path::Path| {
+        self_metadata.as_ref().is_some_and(|this| {
+            std::fs::metadata(path).ok().is_some_and(|candidate| {
+                candidate.dev() == this.dev() && candidate.ino() == this.ino()
+            })
+        })
+    };
     // 1. Environment variable (set by installer wrapper)
     if let Ok(path) = std::env::var("TGREP_REAL_RG") {
-        if !path.is_empty() && std::path::Path::new(&path).exists() {
+        if !path.is_empty()
+            && std::path::Path::new(&path).exists()
+            && !is_self(std::path::Path::new(&path))
+        {
             return Some(PathBuf::from(path));
         }
     }
@@ -67,7 +69,10 @@ fn find_real_rg() -> Option<PathBuf> {
         let config_path = format!("{}/.config/tgrep/rg_path", home);
         if let Ok(path) = std::fs::read_to_string(&config_path) {
             let path = path.trim();
-            if !path.is_empty() && std::path::Path::new(path).exists() {
+            if !path.is_empty()
+                && std::path::Path::new(path).exists()
+                && !is_self(std::path::Path::new(path))
+            {
                 return Some(PathBuf::from(path));
             }
         }
@@ -82,7 +87,7 @@ fn find_real_rg() -> Option<PathBuf> {
             }
             let rg_path = format!("{}/rg", dir);
             let candidate = std::path::Path::new(&rg_path);
-            if candidate.exists() {
+            if candidate.exists() && !is_self(candidate) {
                 // Don't find ourselves
                 if let Some(self_path) = &self_exe {
                     if std::fs::canonicalize(candidate).ok()
@@ -106,10 +111,8 @@ fn delegate_to_rg(args: &[String]) -> ! {
         exit(2);
     });
 
-    // Verify the resolved binary actually claims to be ripgrep before exec'ing
-    // it: TGREP_REAL_RG / rg_path / PATH are attacker-influenceable (env, user
-    // config), and this turns a planted look-alike into a failed search
-    // instead of arbitrary execution.
+    // The configured command is trusted. This probe catches accidental path
+    // mistakes; it does not establish the executable's integrity.
     let version = std::process::Command::new(&rg_path)
         .arg("--version")
         .output();
@@ -140,7 +143,11 @@ fn delegate_to_rg(args: &[String]) -> ! {
         .stderr(std::process::Stdio::inherit())
         .exec();
 
-    eprintln!("tgrep: failed to exec real rg ({}): {}", rg_path.display(), err);
+    eprintln!(
+        "tgrep: failed to exec real rg ({}): {}",
+        rg_path.display(),
+        err
+    );
     exit(2);
 }
 
@@ -177,12 +184,15 @@ fn check_supported_flags(args: &[String]) -> bool {
                 arg.as_str()
             };
 
-            if !supported_long.contains(flag) {
+            if !supported_long.contains(flag) || (arg.contains('=') && !args_long.contains(flag)) {
                 return false;
             }
 
             // If this flag takes an argument and no '=' was used, consume next arg
             if arg.find('=').is_none() && args_long.contains(flag) {
+                if i + 1 >= args.len() {
+                    return false;
+                }
                 i += 1; // skip the value
             }
             i += 1;
@@ -190,7 +200,7 @@ fn check_supported_flags(args: &[String]) -> bool {
         }
 
         // Short flags (may be combined: -wl)
-        if arg.starts_with('-') && arg.len() > 1 && !arg[1..].starts_with(char::is_numeric) {
+        if arg.starts_with('-') && arg.len() > 1 {
             let chars: Vec<char> = arg[1..].chars().collect();
             let mut ci = 0;
             while ci < chars.len() {
@@ -205,6 +215,9 @@ fn check_supported_flags(args: &[String]) -> bool {
                         break;
                     }
                     // Value is next arg
+                    if i + 1 >= args.len() {
+                        return false;
+                    }
                     i += 1;
                     break;
                 }
@@ -224,9 +237,7 @@ fn check_supported_flags(args: &[String]) -> bool {
 /// Parse the supported rg flags into a SearchConfig.
 /// Returns (config, should_use_tgrep) where should_use_tgrep is false if
 /// the search doesn't benefit from indexing.
-fn parse_rg_args(
-    args: &[String],
-) -> (crate::search::SearchConfig, bool) {
+fn parse_rg_args(args: &[String]) -> (crate::search::SearchConfig, bool) {
     let mut pattern: Option<String> = None;
     let mut paths: Vec<String> = Vec::new();
     let mut fixed_strings = false;
@@ -276,10 +287,16 @@ fn parse_rg_args(
 
             match flag {
                 "--word-regexp" => word_regexp = true,
-                "--files-with-matches" => files_with_matches = true,
-                "--count" => count = true,
+                "--files-with-matches" => {
+                    files_with_matches = true;
+                    count = false;
+                }
+                "--count" => {
+                    count = true;
+                    files_with_matches = false;
+                }
                 "--line-number" => line_number = true,
-                "--no-line-number" => _no_line_number = true,
+                "--no-line-number" => line_number = false,
                 "--quiet" => quiet = true,
                 "--ignore-case" => ignore_case = true,
                 "--smart-case" => smart_case = true,
@@ -317,15 +334,21 @@ fn parse_rg_args(
         }
 
         // Short flags (may be combined: -wl)
-        if arg.starts_with('-') && arg.len() > 1 && !arg[1..].starts_with(char::is_numeric) {
+        if arg.starts_with('-') && arg.len() > 1 {
             let chars: Vec<char> = arg[1..].chars().collect();
             let mut ci = 0;
             while ci < chars.len() {
                 let c = chars[ci];
                 match c {
                     'w' => word_regexp = true,
-                    'l' => files_with_matches = true,
-                    'c' => count = true,
+                    'l' => {
+                        files_with_matches = true;
+                        count = false;
+                    }
+                    'c' => {
+                        count = true;
+                        files_with_matches = false;
+                    }
                     'n' => line_number = true,
                     'q' => quiet = true,
                     'i' => ignore_case = true,
@@ -383,13 +406,24 @@ fn parse_rg_args(
         i += 1;
     }
 
+    // With -e, every positional argument names a path.
+    if !patterns.is_empty() {
+        if let Some(path) = pattern.take() {
+            paths.insert(0, path);
+        }
+    }
+
     // If -e was used, patterns are from -e; otherwise use positional pattern
     let final_pattern = if !patterns.is_empty() {
         // Join multiple -e patterns with | (like rg does)
         if patterns.len() == 1 {
             patterns[0].clone()
         } else {
-            patterns.join("|")
+            patterns
+                .iter()
+                .map(|p| format!("(?:{})", p))
+                .collect::<Vec<_>>()
+                .join("|")
         }
     } else {
         pattern.unwrap_or_default()
@@ -406,7 +440,7 @@ fn parse_rg_args(
                 ignore_case,
                 word_regexp,
                 files_with_matches,
-                line_number: line_number && !_no_line_number,
+                line_number,
                 count,
                 quiet,
                 patterns,
@@ -427,7 +461,16 @@ fn parse_rg_args(
     //   - Patterns with no usable trigrams (streaming)
     // But we still try tgrep for everything — it falls back to streaming
     // internally, and the cache helps even for case-insensitive.
-    let benefits = true;
+    use std::io::IsTerminal;
+    // Multiple roots can expose the same file through distinct display paths.
+    // Delegate to preserve ripgrep output multiplicity and spelling.
+    let benefits = paths.len() <= 1
+        && !(fixed_strings && patterns.len() > 1)
+        && !(paths.is_empty() && !std::io::stdin().is_terminal())
+        && !final_pattern.contains('\n')
+        && !paths
+            .iter()
+            .any(|p| p == "-" || !std::path::Path::new(p).is_dir());
 
     (
         crate::search::SearchConfig {
@@ -438,16 +481,50 @@ fn parse_rg_args(
             ignore_case,
             word_regexp,
             files_with_matches,
-            line_number: line_number && !_no_line_number,
+            line_number,
             count,
             quiet,
-            patterns,
+            patterns: Vec::new(),
             explain: false,
             indexed_only: false,
             list_files: false,
         },
         benefits,
     )
+}
+
+/// Delegate configurations whose effects the indexed frontend cannot represent.
+fn supports_rg_config() -> bool {
+    let configured = std::env::var("RIPGREP_CONFIG_PATH")
+        .ok()
+        .filter(|p| !p.is_empty());
+    let Some(path) = configured else {
+        return !std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".ripgreprc").exists())
+            .unwrap_or(false);
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let mut case_flags = 0;
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with('#'))
+    {
+        match line {
+            "--hidden" => {}
+            "--smart-case" | "-S" | "--ignore-case" | "-i" => {
+                case_flags += 1;
+            }
+            _ if line.starts_with("--glob=") => {}
+            _ if line
+                .strip_prefix("--threads=")
+                .is_some_and(|n| n.parse::<usize>().is_ok()) => {}
+            _ => return false,
+        }
+    }
+    case_flags <= 1
 }
 
 /// Check if a tgrep index exists for the given search paths.
@@ -482,7 +559,7 @@ pub fn run_as_rg(args: &[String]) -> ! {
     }
 
     // 2. Check for unsupported flags → delegate to real rg
-    if !check_supported_flags(&rg_args) {
+    if !check_supported_flags(&rg_args) || !supports_rg_config() {
         delegate_to_rg(&rg_args);
     }
 
@@ -502,4 +579,125 @@ pub fn run_as_rg(args: &[String]) -> ! {
     crate::search::run_search(config);
     // run_search calls exit() internally, but the compiler needs this
     exit(0);
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    fn a(s: &[&str]) -> Vec<String> {
+        s.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    fn explicit_pattern_preserves_first_path() {
+        let (c, _) = parse_rg_args(&a(&["-e", "needle", "/scratch/root"]));
+        assert_eq!(c.paths, vec![PathBuf::from("/scratch/root")]);
+        assert_eq!(c.pattern, "needle");
+        assert!(c.patterns.is_empty());
+    }
+    #[test]
+    fn ignored_flags_must_delegate() {
+        for args in [
+            &["-g", "*.txt", "needle"][..],
+            &["--hidden", "needle"],
+            &["-I", "needle"],
+            &["-j", "2", "needle"],
+            &["-i", "-S", "Needle"],
+        ] {
+            assert!(!check_supported_flags(&a(args)), "{:?}", args);
+        }
+    }
+    #[test]
+    fn valued_boolean_must_delegate() {
+        assert!(!check_supported_flags(&a(&["--quiet=bad", "needle"])));
+    }
+    #[test]
+    fn missing_value_must_delegate() {
+        assert!(!check_supported_flags(&a(&["-e"])));
+        assert!(!check_supported_flags(&a(&["--regexp"])));
+    }
+    #[test]
+    fn numeric_flag_must_delegate() {
+        assert!(!check_supported_flags(&a(&["-1", "needle"])));
+    }
+    #[test]
+    fn fixed_multiple_patterns_must_delegate() {
+        let (_, use_tgrep) = parse_rg_args(&a(&["-F", "-e", "foo", "-e", "bar"]));
+        assert!(!use_tgrep);
+    }
+    #[test]
+    fn line_number_order_is_preserved() {
+        let (c, _) = parse_rg_args(&a(&["--no-line-number", "-n", "needle"]));
+        assert!(c.line_number);
+    }
+    #[test]
+    fn explicit_stdin_must_delegate() {
+        let (_, use_tgrep) = parse_rg_args(&a(&["needle", "-"]));
+        assert!(!use_tgrep);
+    }
+
+    #[test]
+    fn explicit_self_binary_must_not_recurse() {
+        let original: [Option<std::ffi::OsString>; 3] = [
+            std::env::var_os("TGREP_REAL_RG"),
+            std::env::var_os("PATH"),
+            std::env::var_os("HOME"),
+        ];
+        let executable = std::env::current_exe().unwrap();
+        let alias = std::env::temp_dir().join(format!("hax-rg-self-{}", std::process::id()));
+        std::os::unix::fs::symlink(&executable, &alias).unwrap();
+        std::env::set_var("PATH", "");
+        std::env::set_var("HOME", "/tmp/hax-q1-rust-search-audit/no-home");
+        let results = [executable, alias.clone()].map(|path| {
+            std::env::set_var("TGREP_REAL_RG", path);
+            find_real_rg().is_none()
+        });
+        for (key, value) in ["TGREP_REAL_RG", "PATH", "HOME"].into_iter().zip(original) {
+            if let Some(v) = value {
+                std::env::set_var(key, v)
+            } else {
+                std::env::remove_var(key)
+            }
+        }
+        std::fs::remove_file(alias).unwrap();
+        assert_eq!(results, [true, true]);
+    }
+}
+
+#[cfg(test)]
+mod output_mode_tests {
+    use super::*;
+    #[test]
+    fn final_count_or_files_flag_selects_one_mode() {
+        for (flags, files) in [
+            (vec!["-c", "-l"], true),
+            (vec!["-l", "-c"], false),
+            (vec!["--count", "--files-with-matches"], true),
+            (vec!["--files-with-matches", "--count"], false),
+            (vec!["-cl"], true),
+            (vec!["-lc"], false),
+        ] {
+            let mut args: Vec<String> = flags.into_iter().map(String::from).collect();
+            args.push("needle".into());
+            let (config, _) = parse_rg_args(&args);
+            assert_eq!(config.files_with_matches, files, "{:?}", args);
+            assert_eq!(config.count, !files, "{:?}", args);
+        }
+    }
+}
+
+#[cfg(test)]
+mod multiple_root_tests {
+    use super::*;
+    #[test]
+    fn multiple_root_aliases_delegate_without_collapsing_paths() {
+        let root = std::env::temp_dir();
+        let args = vec![
+            "needle".to_string(),
+            root.to_string_lossy().into_owned(),
+            format!("{}/.", root.display()),
+        ];
+        let (config, indexed) = parse_rg_args(&args);
+        assert_eq!(config.paths.len(), 2);
+        assert!(!indexed);
+    }
 }

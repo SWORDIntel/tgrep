@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LicenseRef-SRSL-1.1 */
 /**
  * qihse_opt_wrapper.c — tgrep FFI wrapper for QIHSE optimization DB.
  *
@@ -14,16 +15,17 @@
  * Thread-safe via a single mutex.
  */
 
-#include <stdint.h>
-#include <stddef.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
-#include <time.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <unistd.h>
+#include <math.h>
 #include <pthread.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 /* ── Pipeline type (matches QIHSE enum) ──────────────────────────── */
 typedef enum {
@@ -35,53 +37,48 @@ typedef enum {
 
 /* ── Data signature ──────────────────────────────────────────────── */
 typedef struct {
-    uint64_t data_hash;       /* hash of the data (e.g. trigram key set) */
-    size_t   array_size;      /* size of the array (e.g. posting list length) */
-    int      data_type;       /* 0 = int64, 1 = uint64, etc. */
-    double   entropy;         /* entropy of the data distribution */
-    double   gap_variance;    /* variance of gaps between elements */
+    uint64_t data_hash;  /* hash of the data (e.g. trigram key set) */
+    size_t array_size;   /* size of the array (e.g. posting list length) */
+    int data_type;       /* 0 = int64, 1 = uint64, etc. */
+    double entropy;      /* entropy of the data distribution */
+    double gap_variance; /* variance of gaps between elements */
 } tgrep_data_signature_t;
 
 /* ── Optimization entry ───────────────────────────────────────────── */
 typedef struct {
     tgrep_data_signature_t signature;
-    int      best_pipeline;      /* tgrep_pipeline_type_t */
-    size_t   optimal_dimensions; /* recommended dimension count */
-    double   avg_speedup;        /* EMA of speedup vs baseline */
-    double   avg_confidence;     /* EMA of confidence */
-    size_t   samples;            /* number of recorded samples */
-    uint64_t last_updated;       /* unix timestamp */
-    int      use_anchor_search;  /* whether anchor search is recommended */
-    size_t   optimal_anchor_count;
-    double   anchor_hit_rate;
-    double   anchor_speedup;
-    int      workload_type;
+    int best_pipeline;         /* tgrep_pipeline_type_t */
+    size_t optimal_dimensions; /* recommended dimension count */
+    double avg_speedup;        /* EMA of speedup vs baseline */
+    double avg_confidence;     /* EMA of confidence */
+    size_t samples;            /* number of recorded samples */
+    uint64_t last_updated;     /* unix timestamp */
+    int use_anchor_search;     /* whether anchor search is recommended */
+    size_t optimal_anchor_count;
+    double anchor_hit_rate;
+    double anchor_speedup;
+    int workload_type;
     /* tgrep-specific extensions */
-    int      optimal_threads;    /* recommended thread count */
-    int      optimal_backend;    /* 0=scalar, 1=SSE4.2, 2=AVX2, 3=AVX512 */
+    int optimal_threads; /* recommended thread count */
+    int optimal_backend; /* 0=scalar, 1=SSE4.2, 2=AVX2, 3=AVX512 */
 } tgrep_optimization_entry_t;
 
 /* ── Optimization DB ──────────────────────────────────────────────── */
 typedef struct {
-    tgrep_optimization_entry_t* entries;
-    size_t   num_entries;
-    size_t   max_entries;
-    char*    storage_path;
-    int      enable_learning;
+    tgrep_optimization_entry_t *entries;
+    size_t num_entries;
+    size_t max_entries;
+    char *storage_path;
+    int enable_learning;
     pthread_mutex_t mutex;
 } tgrep_optimization_db_t;
 
-/* The Rust side mirrors this struct as [u8; 80] (src/native.rs). If either
- * layout drifts, fail the C build here instead of corrupting memory. */
-_Static_assert(sizeof(tgrep_optimization_db_t) == 80,
-               "tgrep_optimization_db_t must stay 80 bytes: Rust mirrors it as [u8; 80]");
-
 /* ── Magic + version for storage format ──────────────────────────── */
-#define TGREP_OPT_MAGIC   0x54475044u  /* "TGPD" */
+#define TGREP_OPT_MAGIC   0x54475044u /* "TGPD" */
 #define TGREP_OPT_VERSION 1u
 
 /* Forward declarations */
-int tgrep_optimization_load(tgrep_optimization_db_t* db);
+int tgrep_optimization_load(tgrep_optimization_db_t *db);
 
 /* ══════════════════════════════════════════════════════════════════
  * Lifecycle
@@ -89,19 +86,22 @@ int tgrep_optimization_load(tgrep_optimization_db_t* db);
 
 /* Initialize an optimization DB. Returns 0 on success.
  * storage_path: path to the persistence file (may be NULL for in-memory). */
-int tgrep_optimization_init(
-    tgrep_optimization_db_t* db,
-    size_t max_entries,
-    const char* storage_path
-) {
-    if (!db) return -1;
+int tgrep_optimization_init(tgrep_optimization_db_t *db, size_t max_entries,
+                            const char *storage_path)
+{
+    if (!db)
+        return -1;
     memset(db, 0, sizeof(*db));
     db->max_entries = max_entries;
     db->enable_learning = 1;
-    pthread_mutex_init(&db->mutex, NULL);
+    if (pthread_mutex_init(&db->mutex, NULL) != 0)
+        return -1;
     if (max_entries > 0) {
         db->entries = calloc(max_entries, sizeof(tgrep_optimization_entry_t));
-        if (!db->entries) return -1;
+        if (!db->entries) {
+            pthread_mutex_destroy(&db->mutex);
+            return -1;
+        }
     }
     if (storage_path) {
         db->storage_path = strdup(storage_path);
@@ -119,8 +119,10 @@ int tgrep_optimization_init(
 }
 
 /* Destroy an optimization DB. NULL-safe. */
-void tgrep_optimization_destroy(tgrep_optimization_db_t* db) {
-    if (!db) return;
+void tgrep_optimization_destroy(tgrep_optimization_db_t *db)
+{
+    if (!db)
+        return;
     pthread_mutex_lock(&db->mutex);
     free(db->entries);
     free(db->storage_path);
@@ -133,40 +135,64 @@ void tgrep_optimization_destroy(tgrep_optimization_db_t* db) {
     memset(db, 0, sizeof(*db));
 }
 
+/* Keep the mutex and its containing object at a stable, C-aligned address. */
+tgrep_optimization_db_t *tgrep_optimization_create(size_t max_entries, const char *storage_path)
+{
+    tgrep_optimization_db_t *db = malloc(sizeof(*db));
+    if (!db)
+        return NULL;
+    if (tgrep_optimization_init(db, max_entries, storage_path) != 0) {
+        free(db);
+        return NULL;
+    }
+    return db;
+}
+
+void tgrep_optimization_free(tgrep_optimization_db_t *db)
+{
+    if (!db)
+        return;
+    tgrep_optimization_destroy(db);
+    free(db);
+}
+
 /* ══════════════════════════════════════════════════════════════════
  * Entry lookup
  * ══════════════════════════════════════════════════════════════════ */
 
-static uint64_t hash_signature(const tgrep_data_signature_t* sig) {
+static uint64_t hash_signature(const tgrep_data_signature_t *sig)
+{
     uint64_t h = sig->data_hash;
     h = h * 31 + (uint64_t)sig->array_size;
     h = h * 31 + (uint64_t)sig->data_type;
-    h = h * 31 + (uint64_t)(sig->entropy * 1000.0);
-    h = h * 31 + (uint64_t)(sig->gap_variance * 1000.0);
     return h;
 }
 
-static tgrep_optimization_entry_t* find_entry(
-    tgrep_optimization_db_t* db,
-    const tgrep_data_signature_t* sig
-) {
+static tgrep_optimization_entry_t *find_entry(tgrep_optimization_db_t *db,
+                                              const tgrep_data_signature_t *sig)
+{
     uint64_t h = hash_signature(sig);
     for (size_t i = 0; i < db->num_entries; i++) {
         if (hash_signature(&db->entries[i].signature) == h &&
-            memcmp(&db->entries[i].signature, sig, sizeof(*sig)) == 0) {
+            db->entries[i].signature.data_hash == sig->data_hash &&
+            db->entries[i].signature.array_size == sig->array_size &&
+            db->entries[i].signature.data_type == sig->data_type &&
+            db->entries[i].signature.entropy == sig->entropy &&
+            db->entries[i].signature.gap_variance == sig->gap_variance) {
             return &db->entries[i];
         }
     }
     return NULL;
 }
 
-static tgrep_optimization_entry_t* get_or_create_entry(
-    tgrep_optimization_db_t* db,
-    const tgrep_data_signature_t* sig
-) {
-    if (!db || !db->entries || db->max_entries == 0 || !sig) return NULL;
-    tgrep_optimization_entry_t* e = find_entry(db, sig);
-    if (e) return e;
+static tgrep_optimization_entry_t *get_or_create_entry(tgrep_optimization_db_t *db,
+                                                       const tgrep_data_signature_t *sig)
+{
+    if (!db || !db->entries || db->max_entries == 0 || !sig)
+        return NULL;
+    tgrep_optimization_entry_t *e = find_entry(db, sig);
+    if (e)
+        return e;
     if (db->num_entries >= db->max_entries) {
         /* Evict oldest */
         size_t oldest = 0;
@@ -195,23 +221,30 @@ static tgrep_optimization_entry_t* get_or_create_entry(
  * confidence: 0.0–1.0 confidence in the result
  * threads: thread count used
  * backend: 0=scalar, 1=SSE4.2, 2=AVX2, 3=AVX512 */
-void tgrep_optimization_record(
-    tgrep_optimization_db_t* db,
-    const tgrep_data_signature_t* sig,
-    int pipeline,
-    size_t dimensions,
-    double speedup,
-    double confidence,
-    int threads,
-    int backend
-) {
-    if (!db || !db->enable_learning || !sig) return;
+void tgrep_optimization_record(tgrep_optimization_db_t *db, const tgrep_data_signature_t *sig,
+                               int pipeline, size_t dimensions, double speedup, double confidence,
+                               int threads, int backend)
+{
+    if (!db || !sig || !isfinite(sig->entropy) || !isfinite(sig->gap_variance))
+        return;
     pthread_mutex_lock(&db->mutex);
-    tgrep_optimization_entry_t* e = get_or_create_entry(db, sig);
-    if (!e) { pthread_mutex_unlock(&db->mutex); return; }
-    double alpha = 0.1;  /* EMA factor */
-    e->avg_speedup = e->avg_speedup * (1.0 - alpha) + speedup * alpha;
-    e->avg_confidence = e->avg_confidence * (1.0 - alpha) + confidence * alpha;
+    if (!db->enable_learning) {
+        pthread_mutex_unlock(&db->mutex);
+        return;
+    }
+    tgrep_optimization_entry_t *e = get_or_create_entry(db, sig);
+    if (!e) {
+        pthread_mutex_unlock(&db->mutex);
+        return;
+    }
+    double alpha = 0.1; /* EMA factor */
+    if (e->samples == 0) {
+        e->avg_speedup = speedup;
+        e->avg_confidence = confidence;
+    } else {
+        e->avg_speedup = e->avg_speedup * (1.0 - alpha) + speedup * alpha;
+        e->avg_confidence = e->avg_confidence * (1.0 - alpha) + confidence * alpha;
+    }
     e->samples++;
     if (e->samples == 1) {
         e->best_pipeline = pipeline;
@@ -234,31 +267,29 @@ void tgrep_optimization_record(
 
 /* Result struct for optimized config lookup */
 typedef struct {
-    int      found;             /* 1 if a matching entry with enough samples was found */
-    int      best_pipeline;
-    size_t   optimal_dimensions;
-    double   avg_speedup;
-    double   avg_confidence;
-    size_t   samples;
-    int      use_anchor_search;
-    size_t   optimal_anchor_count;
-    int      optimal_threads;
-    int      optimal_backend;
+    int found; /* 1 if a matching entry with enough samples was found */
+    int best_pipeline;
+    size_t optimal_dimensions;
+    double avg_speedup;
+    double avg_confidence;
+    size_t samples;
+    int use_anchor_search;
+    size_t optimal_anchor_count;
+    int optimal_threads;
+    int optimal_backend;
 } tgrep_optimized_config_t;
 
 /* Get the optimized config for a data signature.
  * Requires at least min_samples (default 5) recorded samples.
  * Returns 1 if found, 0 if no recommendation available. */
-int tgrep_optimization_get_config(
-    tgrep_optimization_db_t* db,
-    const tgrep_data_signature_t* sig,
-    size_t min_samples,
-    tgrep_optimized_config_t* out
-) {
-    if (!db || !sig || !out) return 0;
+int tgrep_optimization_get_config(tgrep_optimization_db_t *db, const tgrep_data_signature_t *sig,
+                                  size_t min_samples, tgrep_optimized_config_t *out)
+{
+    if (!db || !sig || !out || !isfinite(sig->entropy) || !isfinite(sig->gap_variance))
+        return 0;
     memset(out, 0, sizeof(*out));
     pthread_mutex_lock(&db->mutex);
-    tgrep_optimization_entry_t* e = find_entry(db, sig);
+    tgrep_optimization_entry_t *e = find_entry(db, sig);
     int found = 0;
     if (e) {
         if (e->samples >= min_samples) {
@@ -283,18 +314,22 @@ int tgrep_optimization_get_config(
  * Anchor performance recording
  * ══════════════════════════════════════════════════════════════════ */
 
-void tgrep_optimization_record_anchor(
-    tgrep_optimization_db_t* db,
-    const tgrep_data_signature_t* sig,
-    size_t anchor_count,
-    double hit_rate,
-    double speedup,
-    int workload_type
-) {
-    if (!db || !db->enable_learning || !sig) return;
+void tgrep_optimization_record_anchor(tgrep_optimization_db_t *db,
+                                      const tgrep_data_signature_t *sig, size_t anchor_count,
+                                      double hit_rate, double speedup, int workload_type)
+{
+    if (!db || !sig || !isfinite(sig->entropy) || !isfinite(sig->gap_variance))
+        return;
     pthread_mutex_lock(&db->mutex);
-    tgrep_optimization_entry_t* e = get_or_create_entry(db, sig);
-    if (!e) { pthread_mutex_unlock(&db->mutex); return; }
+    if (!db->enable_learning) {
+        pthread_mutex_unlock(&db->mutex);
+        return;
+    }
+    tgrep_optimization_entry_t *e = get_or_create_entry(db, sig);
+    if (!e) {
+        pthread_mutex_unlock(&db->mutex);
+        return;
+    }
     e->use_anchor_search = 1;
     e->optimal_anchor_count = anchor_count;
     e->anchor_hit_rate = hit_rate;
@@ -309,19 +344,29 @@ void tgrep_optimization_record_anchor(
  * Persistence
  * ══════════════════════════════════════════════════════════════════ */
 
-/* Save the optimization DB to disk. Returns 0 on success. */
-int tgrep_optimization_save(tgrep_optimization_db_t* db) {
-    if (!db || !db->storage_path) return -1;
+/* Optional, non-atomic learned metadata: rebuild the file after a failed save.
+ * Returns 0 on success. */
+int tgrep_optimization_save(tgrep_optimization_db_t *db)
+{
+    if (!db || !db->storage_path)
+        return -1;
     pthread_mutex_lock(&db->mutex);
     int fd = open(db->storage_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) { pthread_mutex_unlock(&db->mutex); return -errno; }
-    FILE* fp = fdopen(fd, "wb");
-    if (!fp) { close(fd); pthread_mutex_unlock(&db->mutex); return -errno; }
+    if (fd < 0) {
+        pthread_mutex_unlock(&db->mutex);
+        return -errno;
+    }
+    FILE *fp = fdopen(fd, "wb");
+    if (!fp) {
+        close(fd);
+        pthread_mutex_unlock(&db->mutex);
+        return -errno;
+    }
     uint32_t magic = TGREP_OPT_MAGIC, version = TGREP_OPT_VERSION;
-    if (fwrite(&magic, 4, 1, fp) != 1 ||
-        fwrite(&version, 4, 1, fp) != 1 ||
+    if (fwrite(&magic, 4, 1, fp) != 1 || fwrite(&version, 4, 1, fp) != 1 ||
         fwrite(&db->num_entries, sizeof(size_t), 1, fp) != 1 ||
-        (db->num_entries > 0 && fwrite(db->entries, sizeof(tgrep_optimization_entry_t), db->num_entries, fp) != db->num_entries)) {
+        (db->num_entries > 0 && fwrite(db->entries, sizeof(tgrep_optimization_entry_t),
+                                       db->num_entries, fp) != db->num_entries)) {
         fclose(fp);
         pthread_mutex_unlock(&db->mutex);
         return -1;
@@ -335,42 +380,72 @@ int tgrep_optimization_save(tgrep_optimization_db_t* db) {
 }
 
 /* Load the optimization DB from disk. Returns 0 on success. */
-int tgrep_optimization_load(tgrep_optimization_db_t* db) {
-    if (!db || !db->storage_path) return -1;
+int tgrep_optimization_load(tgrep_optimization_db_t *db)
+{
+    if (!db || !db->storage_path)
+        return -1;
     pthread_mutex_lock(&db->mutex);
     int fd = open(db->storage_path, O_RDONLY);
-    if (fd < 0) { pthread_mutex_unlock(&db->mutex); return -errno; }
-    FILE* fp = fdopen(fd, "rb");
-    if (!fp) { close(fd); pthread_mutex_unlock(&db->mutex); return -errno; }
+    if (fd < 0) {
+        pthread_mutex_unlock(&db->mutex);
+        return -errno;
+    }
+    FILE *fp = fdopen(fd, "rb");
+    if (!fp) {
+        close(fd);
+        pthread_mutex_unlock(&db->mutex);
+        return -errno;
+    }
     uint32_t magic, version;
     size_t n;
     if (fread(&magic, 4, 1, fp) != 1 || fread(&version, 4, 1, fp) != 1 ||
         magic != TGREP_OPT_MAGIC || version != TGREP_OPT_VERSION) {
-        fclose(fp); pthread_mutex_unlock(&db->mutex); return -1;
+        fclose(fp);
+        pthread_mutex_unlock(&db->mutex);
+        return -1;
     }
     if (fread(&n, sizeof(size_t), 1, fp) != 1) {
-        fclose(fp); pthread_mutex_unlock(&db->mutex); return -1;
+        fclose(fp);
+        pthread_mutex_unlock(&db->mutex);
+        return -1;
     }
-    db->num_entries = (n > db->max_entries) ? db->max_entries : n;
-    size_t read_count = fread(db->entries, sizeof(tgrep_optimization_entry_t), db->num_entries, fp);
-    (void)read_count; /* partial read is acceptable */
+    if (n > db->max_entries || n > SIZE_MAX / sizeof(*db->entries)) {
+        fclose(fp);
+        pthread_mutex_unlock(&db->mutex);
+        return -1;
+    }
+    tgrep_optimization_entry_t *staged = n ? malloc(n * sizeof(*staged)) : NULL;
+    if (n && (!staged || fread(staged, sizeof(*staged), n, fp) != n)) {
+        free(staged);
+        fclose(fp);
+        pthread_mutex_unlock(&db->mutex);
+        return -1;
+    }
+    if (n)
+        memcpy(db->entries, staged, n * sizeof(*staged));
+    db->num_entries = n;
+    free(staged);
     fclose(fp);
     pthread_mutex_unlock(&db->mutex);
     return 0;
 }
 
 /* Get the number of entries in the DB. */
-size_t tgrep_optimization_count(const tgrep_optimization_db_t* db) {
-    if (!db) return 0;
-    pthread_mutex_lock((pthread_mutex_t*)&db->mutex);
+size_t tgrep_optimization_count(const tgrep_optimization_db_t *db)
+{
+    if (!db)
+        return 0;
+    pthread_mutex_lock((pthread_mutex_t *)&db->mutex);
     size_t count = db->num_entries;
-    pthread_mutex_unlock((pthread_mutex_t*)&db->mutex);
+    pthread_mutex_unlock((pthread_mutex_t *)&db->mutex);
     return count;
 }
 
 /* Enable or disable learning. */
-void tgrep_optimization_set_learning(tgrep_optimization_db_t* db, int enable) {
-    if (!db) return;
+void tgrep_optimization_set_learning(tgrep_optimization_db_t *db, int enable)
+{
+    if (!db)
+        return;
     pthread_mutex_lock(&db->mutex);
     db->enable_learning = enable;
     pthread_mutex_unlock(&db->mutex);

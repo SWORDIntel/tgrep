@@ -1,5 +1,10 @@
 # tgrep Implementation Plan
 
+This is the original implementation plan. Statements about wildcard dependencies, empty wrappers,
+and missing APIs describe the starting point. The current manifest defines multiple binaries;
+use `--bin tgrep` for direct CLI examples and `--bin bench` for the paired benchmark.
+The planned `compare_rg` binary and `src/preindex.rs` are not present in the current tree.
+
 ## Prerequisites
 
 ### Pin Cargo.toml dependencies
@@ -180,10 +185,12 @@ Read manifest.json, report:
 
 ### Verification
 ```bash
+# Use the same explicit state location for the build and inspection commands below
+export TGREP_STATE_DIR=/rpool/data/db/tgrep
 # Build index on the strong corpus
-cargo run --release -- index build /rpool/scratch/tgrep_corpus
+cargo run --release --bin tgrep -- index build /rpool/scratch/tgrep_corpus
 # Check status
-cargo run --release -- index status
+cargo run --release --bin tgrep -- index status
 # Verify segments exist
 ls /rpool/data/db/tgrep/segments/
 # Verify manifest
@@ -226,18 +233,18 @@ cat /rpool/data/db/tgrep/manifest.json
 ### Verification
 ```bash
 # Search for known patterns (must find them)
-cargo run --release -- 'rareneedle_tgrep_test_42' /rpool/scratch/tgrep_corpus
+cargo run --release --bin tgrep -- 'rareneedle_tgrep_test_42' /rpool/scratch/tgrep_corpus
 # Compare with rg
 rg 'rareneedle_tgrep_test_42' /rpool/scratch/tgrep_corpus
 # Result counts must match
 
 # Search for common patterns
-cargo run --release -- 'struct' /rpool/scratch/tgrep_corpus -c
+cargo run --release --bin tgrep -- 'struct' /rpool/scratch/tgrep_corpus -c
 rg 'struct' /rpool/scratch/tgrep_corpus -c
 # Compare
 
 # Search for absent pattern (must be fast — trigram rejection)
-time cargo run -- release -- 'ZZZZZ_NO_MATCH_ZZZZZ' /rpool/scratch/tgrep_corpus
+time cargo run --release --bin tgrep -- 'ZZZZZ_NO_MATCH_ZZZZZ' /rpool/scratch/tgrep_corpus
 time rg 'ZZZZZ_NO_MATCH_ZZZZZ' /rpool/scratch/tgrep_corpus
 ```
 

@@ -1,3 +1,9 @@
+# Historical research sketches
+
+These are speculative ideas, not reproducible benchmark results or verified root causes.
+Commands and pseudocode describe possible work; they are not a runnable tgrep build recipe.
+See `RESEARCH_BRIEF.md` and `BENCHMARKS.md` for scope and recorded methodology limits.
+
 # SITREP
 The tgrep indexer is currently 10–25× slower than expected on a 26K‐file corpus (1.15 GB, ZFS, SSE4.2), due to a missing **.qwi** (word-index) file and fallback to slow 
 trigram-only search. The objective is to restore and exceed prior performance (10×–100× speedups over ripgrep) while matching its semantics. The critical blocker is the `.qwi` 
@@ -43,8 +49,8 @@ compaction: it limits “number of SSTables” consulted. A strategy: compute a 
     ``` io_uring excels at overlapping I/O. Fallback to `posix_fadvise` on older kernels (choose at runtime). - *4d. Readahead vs fadvise:* On Linux, `readahead(fd, off, len)` 
   internally calls `vfs_fadvise(..., POSIX_FADV_WILLNEED)`. In practice `readahead()` is a thin wrapper with extra error checks. We can optionally use `readahead()` for 
   sequential access; but results should be similar. Test both on ZFS/ext4.
-- **5. Index-trust expansion (P1):** For unchanged files, skip content I/O. Store file `mtime+size` in the index. If `-l` (files-only) is requested and the trigram index says 
-“contains term” and file unchanged, declare match without reading file. For `-c` (count), store per-file match counts or line offsets in index. For example:
+- **5. Index-trust expansion (P1):** For unchanged files, skip content I/O. Store file `mtime+size` in the index. For `-l` (files-only), always verify trigram candidates against file content.
+Unchanged metadata does not make trigram intersection an exact literal match. For `-c` (count), store per-file match counts or line offsets in index. For example:
   ```cpp if (file.mtime == index_entry.mtime && file.size == index_entry.size) { if (mode == COUNT) { print index_entry.count; } else if (mode == FILES) { print file.name; } 
       continue; // skip file I/O
   }
@@ -75,8 +81,8 @@ segments concurrently. Ensure not to oversubscribe: cap threads to 4–8. Exampl
       }));
   }
   for (auto &fut : futures) segments.push_back(fut.get()); ``` This N-folds index load time (up to I/O limits). Use `io_uring` if implemented (see item 4). - **12. Candidate 
-ranking & early termination (P3):** Similar to 4a ranking. After intersection, verify highest-score candidates first. For `-l` or `-q` modes (“exists” or list-only), stop once 
-one match is found. For `-c`, stop after exhausting all candidates. This prunes work when many candidates have matches. Tradeoff: output order may change (but sorting by path can 
+ranking & early termination (P3):** Similar to 4a ranking. After intersection, verify highest-score candidates first. Only quiet existence mode (`-q`) can stop after a match, subject to required error semantics.
+Files-only mode (`-l`) must enumerate every matching file. For `-c`, stop after exhausting all candidates. This prunes work when many candidates have matches. Tradeoff: output order may change (but sorting by path can
 restore consistent order). - **13. Incremental index updates (P4):** Maintain a small metadata (WAL) of the last build state. On rebuild, only re-index files that changed (mtime 
 or size). Append these to new segment(s) and mark old segments stale for those files. Periodically run compaction to purge stale entries. Use a simple WAL log to record partial 
 builds for crash recovery. Implementing this gives near-instant updates on a few changed files (<5 s for 100 files vs ~10 min full rebuild). Test by touching a few files and 
@@ -94,7 +100,7 @@ hashing the root path. On startup, detect if a valid index exists (matching corp
   portable paths).
 # CONTINGENCY (FLANK)
 - *QIHSE Save Fails:* If `.qwi` still fails, fall back temporarily to non-word mode (document in logs) and alert the user. Use verbose logging to capture `errno`. As a 
-workaround, disable word-index mode (`--no-word-index`) until fixed. - *AVX Detection:* If runtime CPU check mis-detects, add a fallback to the SSE4.2 codepath. For ARM64, ensure 
+workaround, use a documented fallback; `--no-word-index` is not an implemented CLI option. - *AVX Detection:* If runtime CPU check mis-detects, add a fallback to the SSE4.2 codepath. For ARM64, ensure
 NEON codepath is compiled or disabled gracefully. - *io_uring Unavailable:* On kernels <5.1 or if `io_uring_setup` fails, detect at startup and revert to synchronous `pread` with 
 aggressive `posix_fadvise`. - *Excessive Memory Use:* New features (bitmaps, bloom filters, bigram index) enlarge memory. Monitor RSS; if too high, allow user to disable optional 
 features via flags. - *Ranked Prefetch Wrong Order:* If rankings cause missed matches (due to ordering assumptions), revert to normal order. Always verify correctness (output 
@@ -104,7 +110,7 @@ must match `rg`). - *Failed Compaction:* If segment merging introduces errors, k
 pthreads/C++11 for threading; QIHSE and Keystone libraries at latest stable versions. - **Security:** Follow POSIX best practices (no unsafe `mmap(PROT_WRITE|PROT_EXEC)`). 
 Validate all file paths (no symlink/hardlink attacks on index file location). Avoid any `system()` calls with user data. - **CVEs/Lint:** Use up-to-date compilers and libs to 
 avoid known issues. Run `scan-build` and `clang-tidy` on code changes. Check that IO routines handle truncated reads. - **Permissions:** Index directories under user home (not 
-root). If changing ZFS dataset settings, require sudo. - **Data Handling:** Index contains only file paths and trigram data; no PII. Comply with XDG spec for configuration and 
+root). If changing ZFS dataset settings, require sudo. - **Data Handling:** Paths, token indexes, and query caches can reveal sensitive information; restrict state access. Comply with XDG spec for configuration and
 cache locations.
 # VALIDATION
 - **Regression Tests:** Run `tgrep` and `rg -j4` on the same corpus with all flags (`-l -c -n`, case-insensitive, regex, fixed string) on diverse patterns (use the 19-pattern 

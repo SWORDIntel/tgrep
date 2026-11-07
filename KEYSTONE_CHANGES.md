@@ -1,6 +1,12 @@
 # KEYSTONE Changes for tgrep
 
-## Current State
+## Historical proposal
+
+This is the original API-change proposal, not a current inventory of missing interfaces. The
+roadmap records subsequent implementation. Reconcile code examples with the current public header
+before reuse; this document does not establish bounded-memory behavior or measured speedups.
+
+## Original State
 
 KEYSTONE's trigram index (`keystone_trigram.c`) has:
 - In-memory immutable index with hash-table-backed posting lists
@@ -290,7 +296,8 @@ int keystone_trigram_index_finalize(keystone_trigram_index_t* idx) {
 ```
 
 Remove `counting_sort_doc_ids`, `compare_uint32`, and the `counts`
-allocation. Save ~111 seconds on the 1 GiB benchmark corpus.
+allocation. Measure the effect on the 1 GiB corpus; the original full build time does not establish
+that sorting alone costs ~111 seconds.
 
 ### Change 6: Memory budget reporting
 

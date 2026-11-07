@@ -8,8 +8,8 @@
 # Default prefix: ~/.local
 #
 # What it does:
-#   1. Builds tgrep in release mode (cargo build --release)
-#   2. Finds the real ripgrep (rg) binary
+#   1. Checks destination ownership and locates genuine ripgrep
+#   2. Builds tgrep in release mode using compile.sh
 #   3. Installs tgrep to $PREFIX/bin/tgrep
 #   4. Creates an rg wrapper at $PREFIX/bin/rg that routes to tgrep
 #   5. Stores the real rg path for delegation
@@ -34,6 +34,10 @@ WANT_ZFS=""      # "" = ask (TTY only), "yes", "no"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --prefix)
+            if [[ "$#" -lt 2 || -z "$2" ]]; then
+                echo 'Error: --prefix requires a nonempty directory.' >&2
+                exit 2
+            fi
             PREFIX="$2"
             shift 2
             ;;
@@ -75,126 +79,232 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if ! IFS= read -r -d '' PREFIX < <(readlink -mz -- "$PREFIX"); then
+    echo 'Error: could not resolve install prefix; files preserved.' >&2
+    exit 2
+fi
 BIN_DIR="$PREFIX/bin"
 CONFIG_DIR="$HOME/.config/tgrep"
+RECEIPT="$BIN_DIR/.tgrep-install.sha256"
+FILES=("$BIN_DIR/tgrep" "$BIN_DIR/rg")
 
-# ── Uninstall ────────────────────────────────────────────────────────
+file_hash() {
+    local result
+    result=$(sha256sum < "$1") || return 1
+    printf '%s\n' "${result%% *}"
+}
 
+verify_installation() {
+    local i actual_hash
+    local -a installed_hashes
+    if [[ ! -f "$RECEIPT" || -L "$RECEIPT" ]]; then
+        echo "Error: no verified installation receipt at $RECEIPT; files preserved." >&2
+        return 1
+    fi
+    mapfile -t installed_hashes < "$RECEIPT"
+    if [[ "${#installed_hashes[@]}" -ne 2 ]]; then
+        echo 'Error: malformed installation receipt; files preserved.' >&2
+        return 1
+    fi
+    for i in 0 1; do
+        if [[ ! "${installed_hashes[$i]}" =~ ^[a-f0-9]{64}$ || ! -f "${FILES[$i]}" || -L "${FILES[$i]}" ]]; then
+            echo "Error: unverified installed file ${FILES[$i]}; files preserved." >&2
+            return 1
+        fi
+        if ! actual_hash=$(file_hash "${FILES[$i]}"); then
+            echo "Error: could not verify ${FILES[$i]}; files preserved." >&2
+            return 1
+        fi
+        if [[ "$actual_hash" != "${installed_hashes[$i]}" ]]; then
+            echo "Error: installed file changed: ${FILES[$i]}; files preserved." >&2
+            return 1
+        fi
+    done
+}
+
+has_destination_files() {
+    [[ -e "${FILES[0]}" || -L "${FILES[0]}" || -e "${FILES[1]}" || -L "${FILES[1]}" || -e "$RECEIPT" || -L "$RECEIPT" ]]
+}
+
+check_directory_path() {
+    local path="$1"
+    while [[ ! -e "$path" && ! -L "$path" ]]; do
+        path="${path%/*}"
+        [[ -n "$path" ]] || path=/
+    done
+    if [[ ! -d "$path" ]]; then
+        echo "Error: directory path is blocked by $path; files preserved." >&2
+        return 1
+    fi
+}
+
+# Legacy installs and changed files require manual review; never infer ownership from names.
 if $UNINSTALL; then
-    echo "Uninstalling tgrep..."
-    rm -f "$BIN_DIR/tgrep" 2>/dev/null || true
-    rm -f "$BIN_DIR/rg" 2>/dev/null || true
-    rm -rf "$CONFIG_DIR" 2>/dev/null || true
-    echo "Done. rg now uses the system ripgrep directly."
-    echo "Note: tgrep state directory (~/.local/state/tgrep) is preserved."
-    echo "      Remove it manually if you want to clear all index data:"
-    echo "      rm -rf ~/.local/state/tgrep"
+    verify_installation || exit 2
+    if rm -f -- "${FILES[@]}"; then
+        rm -f -- "$RECEIPT"
+    else
+        status=$?
+        printf 'Error: uninstall partially completed; manual review is required. Ownership receipt retained: %s\n' "$RECEIPT" >&2
+        exit "$status"
+    fi
+    echo 'Removed verified tgrep binaries. Configuration and index data are preserved.'
     exit 0
 fi
 
-# ── Install ──────────────────────────────────────────────────────────
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-echo "=== tgrep installer ==="
-echo ""
-
-# 1. Build tgrep (using compile.sh for CPU auto-detection)
-echo "[1/5] Building tgrep (release mode, auto-detecting CPU features)..."
-cd "$SCRIPT_DIR"
-./compile.sh --release
-if [ ! -f "target/release/tgrep" ]; then
-    echo "Error: tgrep binary not found after build" >&2
-    exit 1
+check_directory_path "$BIN_DIR" || exit 2
+check_directory_path "$CONFIG_DIR" || exit 2
+OWNED_INSTALL=false
+if has_destination_files; then
+    verify_installation || exit 2
+    OWNED_INSTALL=true
 fi
-echo "      Build complete."
-echo ""
-
-# 2. Find real rg
-echo "[2/5] Locating real ripgrep..."
+if ! IFS= read -r -d '' SCRIPT_PATH < <(readlink -fz -- "${BASH_SOURCE[0]}"); then
+    echo 'Error: could not resolve installer script path; files preserved.' >&2
+    exit 2
+fi
+SCRIPT_DIR="${SCRIPT_PATH%/*}"
+[[ -n "$SCRIPT_DIR" ]] || SCRIPT_DIR=/
 REAL_RG=""
+RG_VERSION=""
 
-# Try `which rg` but skip our own wrapper
-for candidate in $(which -a rg 2>/dev/null || true); do
-    # Skip if this is our own wrapper (contains TGREP_REAL_RG anywhere)
-    if grep -q "TGREP_REAL_RG" "$candidate" 2>/dev/null; then
-        continue
+try_ripgrep() {
+    local candidate version_output first_line marker_status=0
+    IFS= read -r -d '' candidate < <(readlink -fz -- "$1") || return 1
+    [[ -f "$candidate" && -x "$candidate" && -r "$candidate" ]] || return 1
+    # Exclude the destination by canonical path and inode, including hard-link aliases.
+    if [[ "$candidate" == "${FILES[1]}" || "$candidate" -ef "${FILES[1]}" ||
+          "$candidate" == "${FILES[0]}" || "$candidate" -ef "${FILES[0]}" ||
+          "$candidate" -ef "$SCRIPT_DIR/target/release/tgrep" ]]; then
+        return 1
     fi
-    # Skip if this is the tgrep binary
-    if [ "$(readlink -f "$candidate" 2>/dev/null)" = "$(readlink -f "$SCRIPT_DIR/target/release/tgrep" 2>/dev/null)" ]; then
-        continue
+    grep -aqF -- 'TGREP_REAL_RG' "$candidate" || marker_status=$?
+    [[ "$marker_status" -eq 1 ]] || return 1
+    if ! version_output=$("$candidate" --version 2>/dev/null); then
+        return 1
     fi
+    first_line="${version_output%%$'\n'*}"
+    if [[ ! "$first_line" =~ ^ripgrep[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+)([[:space:]-].*)?$ ]]; then
+        return 1
+    fi
+    RG_VERSION="${BASH_REMATCH[1]}"
     REAL_RG="$candidate"
-    break
-done
+}
 
-# Fallback: check common locations
-if [ -z "$REAL_RG" ]; then
-    for path in /usr/bin/rg /usr/local/bin/rg /opt/homebrew/bin/rg /snap/bin/rg; do
-        if [ -x "$path" ]; then
-            REAL_RG="$path"
-            break
-        fi
+# Check all candidates before building or creating destination/configuration files.
+while IFS= read -r candidate; do
+    if try_ripgrep "$candidate"; then break; fi
+done < <(which -a rg 2>/dev/null || true)
+if [[ -z "$REAL_RG" ]]; then
+    for candidate in /usr/bin/rg /usr/local/bin/rg /opt/homebrew/bin/rg /snap/bin/rg; do
+        if try_ripgrep "$candidate"; then break; fi
     done
 fi
+if [[ -z "$REAL_RG" ]]; then
+    echo 'Error: no independent ripgrep binary passed --version validation; files preserved.' >&2
+    exit 2
+fi
+printf 'Found ripgrep %s: %s\n' "$RG_VERSION" "$REAL_RG"
 
-if [ -z "$REAL_RG" ]; then
-    echo "Error: Could not find ripgrep (rg) binary." >&2
-    echo "       Install ripgrep first, then re-run this installer." >&2
+WRAPPER_TMP=""
+RECEIPT_TMP=""
+RECEIPT_READY=false
+PUBLICATION_PHASE=prepublish
+finish_install() {
+    local status="$1" keep_receipt=false
+    if [[ "$status" -ne 0 ]]; then
+        case "$PUBLICATION_PHASE" in
+            prepublish)
+                printf 'Error: installation failed before binary publication (status %d).\n' "$status" >&2
+                ;;
+            tgrep)
+                printf 'Error: publication failed while installing tgrep; destination may be partially updated (status %d).\n' "$status" >&2
+                ;;
+            rg)
+                printf 'Error: tgrep was installed; rg and ownership receipt may be incomplete (status %d).\n' "$status" >&2
+                ;;
+            receipt)
+                printf 'Error: both binaries were installed; ownership receipt publication failed (status %d).\n' "$status" >&2
+                ;;
+            config)
+                printf 'Error: binaries and ownership receipt are installed; configuration failed (status %d).\n' "$status" >&2
+                ;;
+            complete)
+                printf 'Error: a post-install action failed; binary installation completed (status %d).\n' "$status" >&2
+                ;;
+        esac
+        if $RECEIPT_READY && [[ "$PUBLICATION_PHASE" != complete ]]; then
+            printf 'Staged ownership receipt retained: %s\n' "$RECEIPT_TMP" >&2
+            keep_receipt=true
+        fi
+    fi
+    if [[ -n "$WRAPPER_TMP" ]] && ! rm -f -- "$WRAPPER_TMP"; then
+        printf 'Warning: could not remove installer temporary file: %s\n' "$WRAPPER_TMP" >&2
+    fi
+    if ! $keep_receipt && [[ -n "$RECEIPT_TMP" ]]; then
+        if ! rm -f -- "$RECEIPT_TMP"; then
+            printf 'Warning: could not remove installer temporary receipt: %s\n' "$RECEIPT_TMP" >&2
+        fi
+    fi
+    return "$status"
+}
+trap 'finish_install "$?"' EXIT
+
+cd "$SCRIPT_DIR"
+echo 'Building tgrep (release mode, auto-detecting CPU features)...'
+./compile.sh --release
+if [[ ! -f target/release/tgrep ]]; then
+    echo 'Error: tgrep binary not found after build.' >&2
     exit 1
 fi
 
-# Verify it's actually ripgrep
-if ! "$REAL_RG" --version 2>/dev/null | head -1 | grep -q "ripgrep"; then
-    echo "Warning: $REAL_RG doesn't appear to be ripgrep." >&2
-    echo "         Proceeding anyway..." >&2
+# A build can take time; reject destinations that changed since the initial checks.
+if $OWNED_INSTALL; then
+    verify_installation || exit 2
+elif has_destination_files; then
+    echo 'Error: destination files appeared during the build; files preserved.' >&2
+    exit 2
 fi
 
-echo "      Found: $REAL_RG ($("$REAL_RG" --version 2>/dev/null | head -1))"
-echo ""
+shell_quote() {
+    printf "'%s'" "${1//\'/\'\\\'\'}"
+}
+WRAPPER_TMP=$(mktemp)
+{
+    printf '%s\n' '#!/bin/sh' \
+        '# tgrep rg wrapper — auto-generated by tgrep install.sh' \
+        '# Routes rg commands to tgrep (indexed) or real ripgrep (fallback).' \
+        '# To uninstall: run install.sh --uninstall'
+    printf 'export TGREP_REAL_RG=%s\n' "$(shell_quote "$REAL_RG")"
+    printf 'exec %s "$@"\n' "$(shell_quote "${FILES[0]}")"
+} > "$WRAPPER_TMP"
+RECEIPT_TMP=$(mktemp)
+file_hash target/release/tgrep > "$RECEIPT_TMP"
+file_hash "$WRAPPER_TMP" >> "$RECEIPT_TMP"
+RECEIPT_READY=true
 
-# 3. Install tgrep binary
-echo "[3/5] Installing tgrep to $BIN_DIR/..."
 mkdir -p "$BIN_DIR"
-cp "target/release/tgrep" "$BIN_DIR/tgrep"
-chmod +x "$BIN_DIR/tgrep"
-echo "      Installed: $BIN_DIR/tgrep"
-echo ""
+PUBLICATION_PHASE=tgrep
+install -m 0755 target/release/tgrep "${FILES[0]}"
+PUBLICATION_PHASE=rg
+install -m 0755 "$WRAPPER_TMP" "${FILES[1]}"
+PUBLICATION_PHASE=receipt
+install -m 0600 "$RECEIPT_TMP" "$RECEIPT"
+PUBLICATION_PHASE=config
 
-# 4. Create rg wrapper
-echo "[4/5] Creating rg wrapper at $BIN_DIR/rg..."
-cat > "$BIN_DIR/rg" << WRAPPER
-#!/bin/sh
-# tgrep rg wrapper — auto-generated by tgrep install.sh
-# Routes rg commands to tgrep (indexed) or real ripgrep (fallback).
-# To uninstall: run install.sh --uninstall
-export TGREP_REAL_RG="$REAL_RG"
-exec "$BIN_DIR/tgrep" "\$@"
-WRAPPER
-chmod +x "$BIN_DIR/rg"
-echo "      Created: $BIN_DIR/rg"
-echo ""
-
-# 5. Store config
-echo "[5/5] Storing configuration..."
-mkdir -p "$CONFIG_DIR"
-echo "$REAL_RG" > "$CONFIG_DIR/rg_path"
-echo "      Config: $CONFIG_DIR/rg_path"
-echo ""
-
-# Verify PATH
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
-    echo "Warning: $BIN_DIR is not in your PATH." >&2
-    echo "         Add this line to your shell config (~/.bashrc or ~/.zshrc):" >&2
-    echo "         export PATH=\"$BIN_DIR:\$PATH\"" >&2
-    echo ""
+# Existing configuration can belong to another installation; do not replace it.
+if [[ -e "$CONFIG_DIR/rg_path" || -L "$CONFIG_DIR/rg_path" ]]; then
+    echo "Preserved existing configuration: $CONFIG_DIR/rg_path"
+else
+    mkdir -p "$CONFIG_DIR"
+    (set -C; printf '%s\n' "$REAL_RG" > "$CONFIG_DIR/rg_path")
 fi
 
-echo "=== Installation complete ==="
-echo ""
-echo "tgrep is now installed. The 'rg' command will use tgrep's index"
-echo "when available, and fall back to real ripgrep for everything else."
-echo ""
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    printf 'Add %s to your PATH to use the rg wrapper.\n' "$BIN_DIR"
+fi
+PUBLICATION_PHASE=complete
+echo 'Installation complete. Existing configuration and index data are preserved.'
 
 # ── 6. Optional: ZFS-backed index dataset ────────────────────────────
 

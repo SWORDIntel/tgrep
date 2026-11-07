@@ -3,7 +3,7 @@ Version: 1.0.0
 Section: utils
 Priority: optional
 Architecture: amd64
-Depends: libc6 (>= 2.31), libgcc-s1 (>= 3.0) | libgcc1
+Depends: libc6 (>= 2.39), libgcc-s1 (>= 3.0) | libgcc1
 Suggests: ripgrep
 Recommends: zfsutils-linux
 Maintainer: SWORDIntel <noreply@github.com>
@@ -17,4 +17,4 @@ Description: Persistent trigram-indexed search, a drop-in ripgrep accelerator
  The index lives under ~/.local/state/tgrep; a compressed ZFS dataset
  (zfs create -o compression=zstd) is the recommended location on ZFS systems.
  .
- Licensed under GNU AGPL-3.0.
+ See the accompanying LICENSE file for the applicable source licence.

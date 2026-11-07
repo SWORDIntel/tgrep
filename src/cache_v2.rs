@@ -61,8 +61,8 @@ struct CacheKey {
 
 pub struct SearchCacheV2 {
     entries: Vec<CacheEntry>,
-    index: HashMap<CacheKey, usize>, // key → index in entries
-    file_list: Option<FileListCache>, // for path ↔ ID resolution
+    index: HashMap<CacheKey, usize>,       // key → index in entries
+    file_list: Option<FileListCache>,      // for path ↔ ID resolution
     file_path_index: HashMap<String, u32>, // path → file ID
 }
 
@@ -98,14 +98,9 @@ impl SearchCacheV2 {
         self.entries.iter().map(|e| e.file_ids.len()).sum()
     }
 
-    /// Lookup cached results for a query.
-    /// Returns resolved file paths, or None on miss.
-    pub fn lookup(
-        &self,
-        pattern: &str,
-        flags: i32,
-        generation: i64,
-    ) -> Option<Vec<String>> {
+    /// Resolve cached candidate paths for a query, or return None on miss.
+    /// Callers must verify live membership and content; file lists can change.
+    pub fn lookup(&self, pattern: &str, flags: i32, generation: i64) -> Option<Vec<String>> {
         let key = CacheKey {
             pattern: pattern.to_string(),
             flags,
@@ -116,17 +111,16 @@ impl SearchCacheV2 {
 
         // Resolve file IDs to paths
         let flc = self.file_list.as_ref()?;
-        let paths: Vec<String> = entry
+        entry
             .file_ids
             .iter()
-            .filter_map(|&id| flc.files.get(id as usize).map(|f| f.path.clone()))
-            .collect();
-        Some(paths)
+            .map(|&id| flc.files.get(id as usize).map(|f| f.path.clone()))
+            .collect()
     }
 
     /// Store results for a query. Converts paths to file IDs.
-    /// If a path isn't in the file list, it's skipped (with a warning
-    /// to stderr in debug mode).
+    /// Paths must all resolve to file IDs. An incomplete result invalidates
+    /// any existing entry for this query.
     pub fn store_results(
         &mut self,
         pattern: &str,
@@ -141,10 +135,26 @@ impl SearchCacheV2 {
         };
 
         // Convert paths to file IDs
-        let file_ids: Vec<u32> = file_paths
+        let file_ids = file_paths
             .iter()
-            .filter_map(|p| self.file_path_index.get(p).copied())
-            .collect();
+            .map(|p| self.file_path_index.get(p).copied())
+            .collect::<Option<Vec<u32>>>();
+        let Some(file_ids) = file_ids else {
+            if let Some(idx) = self.index.remove(&key) {
+                self.entries.swap_remove(idx);
+                if let Some(moved) = self.entries.get(idx) {
+                    self.index.insert(
+                        CacheKey {
+                            pattern: moved.pattern.clone(),
+                            flags: moved.flags,
+                            generation: moved.generation,
+                        },
+                        idx,
+                    );
+                }
+            }
+            return;
+        };
 
         let cached_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -203,6 +213,13 @@ impl SearchCacheV2 {
 
     /// Save cache to a .qsc file (v2 format).
     pub fn save(&self, path: &str) -> Result<(), String> {
+        if self.entries.len() > u32::MAX as usize
+            || self.entries.iter().any(|entry| {
+                entry.pattern.len() > u16::MAX as usize || entry.file_ids.len() > u32::MAX as usize
+            })
+        {
+            return Err("cache entry exceeds format limits".to_string());
+        }
         let path = Path::new(path);
         // Exclusive, pid-suffixed temp: never follows a pre-planted symlink and
         // never clobbers a concurrent writer's temp.
@@ -213,6 +230,16 @@ impl SearchCacheV2 {
             .create_new(true)
             .open(&tmp)
             .map_err(|e| format!("create {}: {}", tmp.display(), e))?;
+
+        struct TempGuard(Option<PathBuf>);
+        impl Drop for TempGuard {
+            fn drop(&mut self) {
+                if let Some(path) = &self.0 {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let mut temporary = TempGuard(Some(tmp.clone()));
 
         // Header
         f.write_all(&TGSC_MAGIC.to_le_bytes())
@@ -242,11 +269,9 @@ impl SearchCacheV2 {
 
             // file IDs
             let fc = entry.file_ids.len() as u32;
-            f.write_all(&fc.to_le_bytes())
-                .map_err(|e| e.to_string())?;
+            f.write_all(&fc.to_le_bytes()).map_err(|e| e.to_string())?;
             for &id in &entry.file_ids {
-                f.write_all(&id.to_le_bytes())
-                    .map_err(|e| e.to_string())?;
+                f.write_all(&id.to_le_bytes()).map_err(|e| e.to_string())?;
             }
         }
 
@@ -254,8 +279,8 @@ impl SearchCacheV2 {
         drop(f);
 
         // Atomic rename
-        std::fs::rename(&tmp, path)
-            .map_err(|e| format!("rename: {}", e))?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename: {}", e))?;
+        temporary.0 = None;
 
         Ok(())
     }
@@ -284,11 +309,16 @@ impl SearchCacheV2 {
         }
 
         let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        match version {
+        let result = match version {
             TGSC_VERSION_1 => self.load_v1(&data),
             TGSC_VERSION_2 => self.load_v2(&data),
             _ => Err(format!("unsupported version: {}", version)),
+        };
+        if result.is_err() {
+            self.entries.clear();
+            self.index.clear();
         }
+        result
     }
 
     fn load_v2(&mut self, data: &[u8]) -> Result<bool, String> {
@@ -296,9 +326,8 @@ impl SearchCacheV2 {
         if data.len() < pos + 4 {
             return Err("truncated header".to_string());
         }
-        let entry_count = u32::from_le_bytes([
-            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-        ]) as usize;
+        let entry_count =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
 
         self.entries.clear();
@@ -326,18 +355,29 @@ impl SearchCacheV2 {
             if pos + 4 + 8 + 8 > data.len() {
                 return Err("truncated entry header".to_string());
             }
-            let flags = i32::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-            ]);
+            let flags =
+                i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
             pos += 4;
             let generation = i64::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
             ]);
             pos += 8;
             let cached_at = i64::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
             ]);
             pos += 8;
 
@@ -345,9 +385,8 @@ impl SearchCacheV2 {
             if pos + 4 > data.len() {
                 return Err("truncated file count".to_string());
             }
-            let fc = u32::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-            ]) as usize;
+            let fc = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
             pos += 4;
 
             if pos + fc * 4 > data.len() {
@@ -355,9 +394,8 @@ impl SearchCacheV2 {
             }
             let mut file_ids = Vec::with_capacity(fc.min((data.len() - pos) / 4));
             for _ in 0..fc {
-                let id = u32::from_le_bytes([
-                    data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                ]);
+                let id =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 pos += 4;
                 file_ids.push(id);
             }
@@ -392,8 +430,14 @@ impl SearchCacheV2 {
 
         // row_count is usize (8 bytes on 64-bit)
         let row_count = usize::from_le_bytes([
-            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-            data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
         ]);
         pos += 8;
 
@@ -402,50 +446,63 @@ impl SearchCacheV2 {
 
         for _ in 0..row_count {
             if pos + 4 > data.len() {
-                break;
+                return Err("truncated v1 entry".to_string());
             }
-            let pat_len = u32::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-            ]) as usize;
+            let pat_len =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                    as usize;
             pos += 4;
             if pos + pat_len > data.len() {
-                break;
+                return Err("truncated v1 entry".to_string());
             }
-            let pattern = String::from_utf8_lossy(&data[pos..pos + pat_len]).to_string();
+            let pattern = String::from_utf8(data[pos..pos + pat_len].to_vec())
+                .map_err(|e| format!("bad utf8: {}", e))?;
             pos += pat_len;
 
             if pos + 4 + 8 > data.len() {
-                break;
+                return Err("truncated v1 entry".to_string());
             }
-            let flags = i32::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-            ]);
+            let flags =
+                i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
             pos += 4;
             let generation = i64::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
             ]);
             pos += 8;
 
             if pos + 4 > data.len() {
-                break;
+                return Err("truncated v1 entry".to_string());
             }
-            let fp_len = u32::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-            ]) as usize;
+            let fp_len =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                    as usize;
             pos += 4;
             if pos + fp_len > data.len() {
-                break;
+                return Err("truncated v1 entry".to_string());
             }
-            let file_path = String::from_utf8_lossy(&data[pos..pos + fp_len]).to_string();
+            let file_path = String::from_utf8(data[pos..pos + fp_len].to_vec())
+                .map_err(|e| format!("bad utf8: {}", e))?;
             pos += fp_len;
 
             if pos + 8 > data.len() {
-                break;
+                return Err("truncated v1 entry".to_string());
             }
             let cached_at = i64::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
             ]);
             pos += 8;
 
@@ -466,10 +523,13 @@ impl SearchCacheV2 {
         self.index.clear();
 
         for (key, (cached_at, paths)) in groups {
-            let file_ids: Vec<u32> = paths
+            let file_ids = paths
                 .iter()
-                .filter_map(|p| self.file_path_index.get(p).copied())
-                .collect();
+                .map(|p| self.file_path_index.get(p).copied())
+                .collect::<Option<Vec<u32>>>();
+            let Some(file_ids) = file_ids else {
+                continue;
+            };
             let idx = self.entries.len();
             self.entries.push(CacheEntry {
                 pattern: key.pattern.clone(),
@@ -638,13 +698,158 @@ mod tests {
     fn test_store_replaces_existing() {
         let mut cache = make_test_cache();
 
-        // Store with empty file list — file IDs will be empty
+        cache.file_path_index.insert("/a/b".to_string(), 0);
+        cache.file_path_index.insert("/c/d".to_string(), 1);
+
         cache.store_results("foo", 0, 1, &["/a/b".to_string()]);
         assert_eq!(cache.entry_count(), 1);
-        assert_eq!(cache.entries[0].file_ids.len(), 0);
+        assert_eq!(cache.entries[0].file_ids, vec![0]);
 
         // Store again — should replace, not duplicate
         cache.store_results("foo", 0, 1, &["/c/d".to_string()]);
         assert_eq!(cache.entry_count(), 1);
+        assert_eq!(cache.entries[0].file_ids, vec![1]);
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    fn cache() -> SearchCacheV2 {
+        SearchCacheV2 {
+            entries: Vec::new(),
+            index: HashMap::new(),
+            file_list: Some(FileListCache {
+                roots: vec!["/scratch".into()],
+                built_at: 0,
+                hidden: false,
+                files: vec![crate::build::CachedFileMeta {
+                    path: "/scratch/known".into(),
+                    size: 0,
+                    mtime_ns: 0,
+                    inode: 0,
+                    device: 0,
+                }],
+            }),
+            file_path_index: HashMap::from([("/scratch/known".into(), 0)]),
+        }
+    }
+    fn temp(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "hax-cache-v2-audit-{}-{}",
+            std::process::id(),
+            name
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+    fn row(pattern: &str, path: &str) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend((pattern.len() as u32).to_le_bytes());
+        d.extend(pattern.as_bytes());
+        d.extend(0i32.to_le_bytes());
+        d.extend(1i64.to_le_bytes());
+        d.extend((path.len() as u32).to_le_bytes());
+        d.extend(path.as_bytes());
+        d.extend(0i64.to_le_bytes());
+        d
+    }
+    #[test]
+    fn unknown_path_must_not_become_incomplete_hit() {
+        let mut c = cache();
+        c.store_results(
+            "needle",
+            0,
+            1,
+            &["/scratch/known".into(), "/scratch/new".into()],
+        );
+        assert_eq!(c.lookup("needle", 0, 1), None);
+    }
+    #[test]
+    fn invalid_file_id_must_be_a_miss() {
+        let mut c = cache();
+        c.store_results("needle", 0, 1, &["/scratch/known".into()]);
+        c.entries[0].file_ids.push(99);
+        assert_eq!(c.lookup("needle", 0, 1), None);
+    }
+    #[test]
+    fn truncated_v1_must_not_publish_partial_query() {
+        let p = temp("v1").join("cache.qsc");
+        let mut d = Vec::new();
+        d.extend(TGSC_MAGIC.to_le_bytes());
+        d.extend(1u32.to_le_bytes());
+        d.extend(2usize.to_le_bytes());
+        d.extend(row("needle", "/scratch/known"));
+        d.extend(3u32.to_le_bytes());
+        d.extend(b"nee");
+        std::fs::write(&p, d).unwrap();
+        let mut c = cache();
+        assert!(c.load(p.to_str().unwrap()).is_err());
+        assert!(c.lookup("needle", 0, 1).is_none());
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn overlong_pattern_must_roundtrip_or_be_rejected() {
+        let p = temp("length").join("cache.qsc");
+        let mut c = cache();
+        let q = "x".repeat(65536);
+        c.store_results(&q, 0, 1, &["/scratch/known".into()]);
+        if c.save(p.to_str().unwrap()).is_ok() {
+            let mut loaded = cache();
+            loaded.load(p.to_str().unwrap()).unwrap();
+            assert_eq!(loaded.lookup(&q, 0, 1), Some(vec!["/scratch/known".into()]));
+        }
+        std::fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn failed_save_must_not_poison_retry() {
+        let dir = temp("retry");
+        let p = dir.join("cache.qsc");
+        std::fs::create_dir(&p).unwrap();
+        let c = cache();
+        assert!(c.save(p.to_str().unwrap()).is_err());
+        std::fs::remove_dir(&p).unwrap();
+        assert!(c.save(p.to_str().unwrap()).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn incomplete_update_invalidates_existing_entry_and_preserves_other_key() {
+        let mut c = cache();
+        c.store_results("first", 0, 1, &["/scratch/known".into()]);
+        c.store_results("second", 0, 1, &["/scratch/known".into()]);
+        c.store_results("first", 0, 1, &["/scratch/new".into()]);
+        assert!(c.lookup("first", 0, 1).is_none());
+        assert_eq!(
+            c.lookup("second", 0, 1),
+            Some(vec!["/scratch/known".into()])
+        );
+        let dir = temp("invalidate");
+        let path = dir.join("cache.qsc");
+        c.save(path.to_str().unwrap()).unwrap();
+        let mut loaded = cache();
+        loaded.load(path.to_str().unwrap()).unwrap();
+        assert!(loaded.lookup("first", 0, 1).is_none());
+        assert_eq!(
+            loaded.lookup("second", 0, 1),
+            Some(vec!["/scratch/known".into()])
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn v1_unresolvable_member_invalidates_entire_query() {
+        let dir = temp("v1_missing_member");
+        let path = dir.join("cache.qsc");
+        let mut data = Vec::new();
+        data.extend(TGSC_MAGIC.to_le_bytes());
+        data.extend(1u32.to_le_bytes());
+        data.extend(2usize.to_le_bytes());
+        data.extend(row("needle", "/scratch/known"));
+        data.extend(row("needle", "/scratch/new"));
+        std::fs::write(&path, data).unwrap();
+        let mut c = cache();
+        c.load(path.to_str().unwrap()).unwrap();
+        assert!(c.lookup("needle", 0, 1).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -17,12 +17,24 @@ set -euo pipefail
 TRIALS="${1:-10}"
 STATE_DIR="${2:-/tmp/tgrep_qwi_mmap}"
 CORPUS="${3:-/rpool/scratch/tgrep_corpus}"
-TGREP_BIN="$(cd "$(dirname "$0")/.." && pwd)/target/release/tgrep"
+if [[ ! "$TRIALS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: trials must be a positive integer" >&2
+    exit 2
+fi
+if ! IFS= read -r -d '' SCRIPT_PATH < <(readlink -fz -- "${BASH_SOURCE[0]}"); then
+    echo 'Error: could not resolve benchmark script path.' >&2
+    exit 2
+fi
+OUT_DIR="${SCRIPT_PATH%/*}"
+[[ -n "$OUT_DIR" ]] || OUT_DIR=/
+REPO_DIR="${OUT_DIR%/*}"
+[[ -n "$REPO_DIR" ]] || REPO_DIR=/
+TGREP_BIN="$REPO_DIR/target/release/tgrep"
 RG_BIN="${RG_BIN:-/usr/bin/rg}"
 
-OUT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CSV="$OUT_DIR/benchmark_results.csv"
-TMPF="/tmp/tgrep_bench_$$.txt"
+TMPF=$(mktemp)
+trap 'rm -f "$TMPF"' EXIT
 
 # Verify tgrep is built
 if [ ! -x "$TGREP_BIN" ]; then
@@ -64,24 +76,49 @@ run_trial() {
     local name="$1" cat="$2" pat="$3" flags="$4" trial="$5" cond="$6"
     local tgrep_ms rg_ms files
 
-    # Clear cache for cold runs
+    # Cold denotes the application result cache, not filesystem or ZFS ARC cache.
     if [ "$cond" = "cold" ]; then
-        TGREP_STATE_DIR="$STATE_DIR" "$TGREP_BIN" cache clear 2>/dev/null || true
+        TGREP_STATE_DIR="$STATE_DIR" "$TGREP_BIN" cache clear
     fi
 
-    # Run tgrep (exit 1 = no match, which is valid)
-    local t_out t_elapsed
-    t_out=$(TGREP_STATE_DIR="$STATE_DIR" /usr/bin/time -f "%e" \
-        "$TGREP_BIN" $flags -l "$pat" "$CORPUS" 2>"$TMPF" || true)
-    t_elapsed=$(cat "$TMPF")
-    tgrep_ms=$(awk '{printf "%.0f", $1 * 1000}' <<< "$t_elapsed")
-    files=$(echo "$t_out" | wc -l)
+    local t_out r_out t_status r_status
+    if t_out=$(TGREP_STATE_DIR="$STATE_DIR" /usr/bin/time -q -o "$TMPF" -f "%e" \
+        "$TGREP_BIN" $flags -l "$pat" "$CORPUS"); then
+        t_status=0
+    else
+        t_status=$?
+    fi
+    if [ "$t_status" -gt 1 ]; then
+        echo "Error: tgrep failed with status $t_status for $name" >&2
+        return 2
+    fi
+    tgrep_ms=$(awk '{printf "%.0f", $1 * 1000}' "$TMPF")
 
-    # Run rg (always fresh, no cache)
-    local r_out r_elapsed
-    r_out=$(/usr/bin/time -f "%e" "$RG_BIN" $flags -l "$pat" "$CORPUS" -j 4 2>"$TMPF" || true)
-    r_elapsed=$(cat "$TMPF")
-    rg_ms=$(awk '{printf "%.0f", $1 * 1000}' <<< "$r_elapsed")
+    if r_out=$(/usr/bin/time -q -o "$TMPF" -f "%e" \
+        "$RG_BIN" $flags -l "$pat" "$CORPUS" -j 4); then
+        r_status=0
+    else
+        r_status=$?
+    fi
+    if [ "$r_status" -gt 1 ]; then
+        echo "Error: rg failed with status $r_status for $name" >&2
+        return 2
+    fi
+    rg_ms=$(awk '{printf "%.0f", $1 * 1000}' "$TMPF")
+    local t_sorted r_sorted
+    if ! t_sorted=$(printf '%s' "$t_out" | LC_ALL=C sort) ||
+        ! r_sorted=$(printf '%s' "$r_out" | LC_ALL=C sort); then
+        echo "Error: could not compare results for $name" >&2
+        return 2
+    fi
+    if [ "$t_status" -ne "$r_status" ] || [ "$t_sorted" != "$r_sorted" ]; then
+        echo "Error: result mismatch for $name" >&2
+        return 2
+    fi
+    files=0
+    if [ -n "$t_out" ]; then
+        files=$(printf '%s\n' "$t_out" | wc -l)
+    fi
 
     echo "$name,$cat,$trial,$cond,$tgrep_ms,$rg_ms,$files" >> "$CSV"
     printf "  %s [%s] trial %d %s: tgrep=%sms rg=%sms files=%s\n" \

@@ -1,7 +1,7 @@
 // tgrep vs ripgrep paired benchmark runner
 //
 // Runs tgrep and rg alternately for N trials per pattern, verifies result
-// equality on the first trial, and reports timing statistics.
+// equality on every trial, and reports timing statistics.
 //
 // Usage:
 //   cargo run --release --bin bench -- <pattern> <path> [trials] [--extra-args...]
@@ -29,8 +29,8 @@ impl BenchmarkResult {
     fn to_csv(&self) -> String {
         format!(
             "{},{},{},{},{},{}",
-            self.tool,
-            self.pattern,
+            csv_field(&self.tool),
+            csv_field(&self.pattern),
             self.trial,
             self.time_ms,
             self.match_count,
@@ -39,24 +39,40 @@ impl BenchmarkResult {
     }
 }
 
-fn run_command(cmd: &mut Command) -> (u64, String, String, i32) {
-    let start = Instant::now();
-    let output = cmd.output();
-    let elapsed = start.elapsed().as_millis() as u64;
-
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            (elapsed, stdout, stderr, out.status.code().unwrap_or(-1))
-        }
-        Err(e) => (elapsed, String::new(), e.to_string(), -1),
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
     }
 }
 
-fn count_matches(output: &str) -> usize {
-    // For -l mode: count lines (each line is a file with a match)
-    output.lines().filter(|l| !l.is_empty()).count()
+fn run_command(cmd: &mut Command) -> Result<(u64, Vec<u8>), String> {
+    let start = Instant::now();
+    let output = cmd.output().map_err(|e| format!("{cmd:?}: {e}"))?;
+    let elapsed = start.elapsed().as_millis() as u64;
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err(format!(
+            "{cmd:?}: {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok((elapsed, output.stdout))
+}
+
+fn files(output: &[u8]) -> Vec<&[u8]> {
+    let mut names: Vec<_> = output
+        .split(|&b| b == b'\n')
+        .filter(|s| !s.is_empty())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+// Both lists are sorted by files().
+fn results_match(tgrep: &[&[u8]], rg: &[&[u8]], indexed_only: bool) -> bool {
+    tgrep == rg || (indexed_only && tgrep.iter().all(|name| rg.binary_search(name).is_ok()))
 }
 
 fn run_benchmark(
@@ -68,120 +84,63 @@ fn run_benchmark(
     extra_args: &[String],
     indexed_only: bool,
     rg_bin: &str,
-) -> Vec<BenchmarkResult> {
+) -> Result<Vec<BenchmarkResult>, String> {
     let mut results = Vec::new();
-
-    // First trial: verify result equality
-    eprintln!("=== Verifying result equality ===");
-
-    let mut tgrep_cmd = Command::new(tgrep_bin);
-    tgrep_cmd
-        .env("TGREP_STATE_DIR", state_dir)
-        .arg("-l")
-        .arg(pattern)
-        .arg(path)
-        .args(extra_args);
-    let (t_time, t_out, _t_err, _t_code) = run_command(&mut tgrep_cmd);
-    let t_count = count_matches(&t_out);
-
-    let mut rg_cmd = Command::new(rg_bin);
-    rg_cmd.arg("--threads=4").arg("-l").arg(pattern).arg(path);
-    let (r_time, r_out, _r_err, _r_code) = run_command(&mut rg_cmd);
-    let r_count = count_matches(&r_out);
-
-    // Compare results
-    let t_sorted: Vec<&str> = t_out.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>();
-    let r_sorted: Vec<&str> = r_out.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>();
-    let mut t_sorted = t_sorted.clone();
-    let mut r_sorted = r_sorted.clone();
-    t_sorted.sort();
-    r_sorted.sort();
-
-    if indexed_only && t_sorted != r_sorted {
-        eprintln!(
-            "  NOTE (indexed-only): tgrep={} matches, rg={} matches (diff expected — unindexed files skipped)",
-            t_count, r_count
-        );
-    } else if t_sorted == r_sorted {
-        eprintln!("  PASS: {} matches, results identical", t_count);
-    } else {
-        eprintln!("  FAIL: tgrep={} matches, rg={} matches", t_count, r_count);
-        let t_set: std::collections::HashSet<&str> = t_sorted.iter().copied().collect();
-        let r_set: std::collections::HashSet<&str> = r_sorted.iter().copied().collect();
-        let only_tgrep: Vec<&&str> = t_sorted.iter().filter(|s| !r_set.contains(*s)).collect();
-        let only_rg: Vec<&&str> = r_sorted.iter().filter(|s| !t_set.contains(*s)).collect();
-        if !only_rg.is_empty() {
-            eprintln!("  In rg but not tgrep (first 5):");
-            for f in only_rg.iter().take(5) {
-                eprintln!("    {}", f);
-            }
-        }
-        if !only_tgrep.is_empty() {
-            eprintln!("  In tgrep but not rg (first 5):");
-            for f in only_tgrep.iter().take(5) {
-                eprintln!("    {}", f);
-            }
-        }
-        eprintln!("  Continuing benchmark anyway...");
-    }
-
-    results.push(BenchmarkResult {
-        tool: "tgrep".into(),
-        pattern: pattern.into(),
-        trial: 1,
-        time_ms: t_time,
-        match_count: t_count,
-        peak_rss_kb: None,
-    });
-    results.push(BenchmarkResult {
-        tool: "rg".into(),
-        pattern: pattern.into(),
-        trial: 1,
-        time_ms: r_time,
-        match_count: r_count,
-        peak_rss_kb: None,
-    });
-
-    eprintln!("  trial 1: tgrep={}ms rg={}ms", t_time, r_time);
-
-    // Remaining trials: alternate tgrep and rg
-    for trial in 2..=trials {
-        // Run tgrep
+    for trial in 1..=trials {
         let mut tgrep_cmd = Command::new(tgrep_bin);
         tgrep_cmd
             .env("TGREP_STATE_DIR", state_dir)
             .arg("-l")
+            .args(extra_args)
+            .arg("--")
             .arg(pattern)
-            .arg(path)
-            .args(extra_args);
-        let (t_time, _, _, _) = run_command(&mut tgrep_cmd);
-
-        // Run rg
+            .arg(path);
         let mut rg_cmd = Command::new(rg_bin);
-        rg_cmd.arg("--threads=4").arg("-l").arg(pattern).arg(path);
-        let (r_time, _, _, _) = run_command(&mut rg_cmd);
+        rg_cmd
+            .arg("--threads=4")
+            .arg("-l")
+            .args(extra_args.iter().filter(|a| a.as_str() != "--indexed-only"))
+            .arg("--")
+            .arg(pattern)
+            .arg(path);
 
-        eprintln!("  trial {}: tgrep={}ms rg={}ms", trial, t_time, r_time);
-
-        results.push(BenchmarkResult {
-            tool: "tgrep".into(),
-            pattern: pattern.into(),
-            trial,
-            time_ms: t_time,
-            match_count: t_count,
-            peak_rss_kb: None,
-        });
-        results.push(BenchmarkResult {
-            tool: "rg".into(),
-            pattern: pattern.into(),
-            trial,
-            time_ms: r_time,
-            match_count: r_count,
-            peak_rss_kb: None,
-        });
+        let (t_result, r_result) = if trial % 2 == 1 {
+            (run_command(&mut tgrep_cmd)?, run_command(&mut rg_cmd)?)
+        } else {
+            let r = run_command(&mut rg_cmd)?;
+            (run_command(&mut tgrep_cmd)?, r)
+        };
+        let (t_time, t_out) = t_result;
+        let (r_time, r_out) = r_result;
+        let t_files = files(&t_out);
+        let r_files = files(&r_out);
+        if !results_match(&t_files, &r_files, indexed_only) {
+            return Err(format!(
+                "trial {trial}: result mismatch: tgrep={} files, rg={} files",
+                t_files.len(),
+                r_files.len()
+            ));
+        }
+        if indexed_only && t_files != r_files {
+            eprintln!("  trial {trial}: indexed-only subset: tgrep={} files, rg={} files; workloads differ",
+                t_files.len(), r_files.len());
+        }
+        eprintln!("  trial {trial}: tgrep={t_time}ms rg={r_time}ms");
+        for (tool, time_ms, match_count) in [
+            ("tgrep", t_time, t_files.len()),
+            ("rg", r_time, r_files.len()),
+        ] {
+            results.push(BenchmarkResult {
+                tool: tool.into(),
+                pattern: pattern.into(),
+                trial,
+                time_ms,
+                match_count,
+                peak_rss_kb: None,
+            });
+        }
     }
-
-    results
+    Ok(results)
 }
 
 fn compute_stats(times: &[u64]) -> (u64, u64, u64, u64, f64) {
@@ -193,15 +152,20 @@ fn compute_stats(times: &[u64]) -> (u64, u64, u64, u64, f64) {
 
     let min = sorted[0];
     let max = sorted[sorted.len() - 1];
-    let median = sorted[sorted.len() / 2];
+    let middle = sorted.len() / 2;
+    let median = if sorted.len() % 2 == 0 {
+        sorted[middle - 1] + (sorted[middle] - sorted[middle - 1]) / 2
+    } else {
+        sorted[middle]
+    };
     let p95_idx = ((sorted.len() as f64) * 0.95).ceil() as usize;
     let p95 = sorted[(p95_idx - 1).min(sorted.len() - 1)];
-    let mean = sorted.iter().sum::<u64>() as f64 / sorted.len() as f64;
+    let mean = sorted.iter().map(|&n| n as f64).sum::<f64>() / sorted.len() as f64;
 
     (min, median, p95, max, mean)
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         eprintln!(
@@ -218,23 +182,41 @@ fn main() {
 
     let pattern = &args[1];
     let path = &args[2];
-    let trials: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
-
-    // Collect extra args after "--"
-    let extra_args: Vec<String> = {
-        let mut extra = Vec::new();
-        let mut skip = true;
-        for a in &args[4..] {
-            if skip && a == "--" {
-                skip = false;
-                continue;
-            }
-            if !skip {
-                extra.push(a.clone());
-            }
+    let mut next = 3;
+    let trials = match args.get(next).filter(|s| s.as_str() != "--") {
+        Some(value) => {
+            next += 1;
+            value.parse::<usize>()?
         }
-        extra
+        None => 10,
     };
+    if trials == 0 {
+        return Err("trials must be positive".into());
+    }
+    let extra_args = if next < args.len() {
+        if args[next] != "--" {
+            return Err("extra arguments must follow --".into());
+        }
+        args[next + 1..].to_vec()
+    } else {
+        Vec::new()
+    };
+    for arg in &extra_args {
+        if !matches!(
+            arg.as_str(),
+            "--indexed-only"
+                | "-F"
+                | "--fixed-strings"
+                | "-S"
+                | "--smart-case"
+                | "-i"
+                | "--ignore-case"
+                | "-w"
+                | "--word-regexp"
+        ) {
+            return Err(format!("unsupported benchmark search option: {arg}").into());
+        }
+    }
 
     // Check for --indexed-only flag
     let indexed_only = extra_args.iter().any(|a| a == "--indexed-only");
@@ -276,7 +258,7 @@ fn main() {
         &extra_args,
         indexed_only,
         &rg_bin,
-    );
+    )?;
 
     // Split results by tool
     let mut tgrep_times: Vec<u64> = Vec::new();
@@ -307,7 +289,7 @@ fn main() {
         "rg", r_min, r_med, r_p95, r_max, r_mean
     );
 
-    if r_med > 0 {
+    if !indexed_only && r_med > 0 && t_med > 0 {
         let speedup = t_med as f64 / r_med as f64;
         if speedup < 1.0 {
             eprintln!("  tgrep is {:.1}x FASTER than rg (median)", 1.0 / speedup);
@@ -322,7 +304,7 @@ fn main() {
         env!("CARGO_MANIFEST_DIR"),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
     let mut csv = String::new();
@@ -332,7 +314,78 @@ fn main() {
         csv.push_str(&r.to_csv());
         csv.push('\n');
     }
-    let _ = std::fs::write(&csv_path, &csv);
+    std::fs::write(&csv_path, &csv)?;
     eprintln!();
     eprintln!("Raw CSV: {}", csv_path);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[test]
+    fn child_failure_with_output_is_an_error() {
+        let error = run_command(&mut fixture(
+            "printf 'same\n'; printf fixture-error >&2; exit 2",
+        ))
+        .unwrap_err();
+        assert!(error.contains("exit status: 2"), "{error}");
+        assert!(error.contains("fixture-error"), "{error}");
+    }
+
+    #[test]
+    fn signalled_child_is_an_error() {
+        let error = run_command(&mut fixture("kill -TERM $$")).unwrap_err();
+        assert!(error.contains("signal"), "{error}");
+    }
+
+    #[test]
+    fn no_match_status_is_a_valid_empty_result() {
+        let (_, output) = run_command(&mut fixture("exit 1")).unwrap();
+        assert!(output.is_empty());
+        assert_eq!(files(&output).len(), 0);
+    }
+
+    #[test]
+    fn comparison_uses_filenames_and_requires_real_indexed_subset() {
+        let left = files(b"second\nfirst\n");
+        let same = files(b"first\nsecond\n");
+        let different = files(b"first\nother\n");
+        assert!(results_match(&left, &same, false));
+        assert!(!results_match(&left, &different, false));
+        assert!(!results_match(&left, &different, true));
+        assert!(results_match(&files(b"first\n"), &same, true));
+        assert!(!results_match(&files(b"absent\n"), &same, true));
+    }
+
+    #[test]
+    fn csv_quotes_pattern_delimiters_quotes_and_line_breaks() {
+        let result = BenchmarkResult {
+            tool: "tgrep".into(),
+            pattern: "one,\"two\"\nthree".into(),
+            trial: 1,
+            time_ms: 7,
+            match_count: 2,
+            peak_rss_kb: None,
+        };
+        assert_eq!(result.to_csv(), "tgrep,\"one,\"\"two\"\"\nthree\",1,7,2,");
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("one\rtwo"), "\"one\rtwo\"");
+    }
+
+    #[test]
+    fn even_median_and_large_mean_do_not_overflow() {
+        assert_eq!(compute_stats(&[4, 2]).1, 3);
+        let stats = compute_stats(&[u64::MAX, u64::MAX - 2]);
+        assert_eq!(stats.1, u64::MAX - 1);
+        assert!(stats.4.is_finite());
+        assert_eq!(compute_stats(&[0, u64::MAX]).1, u64::MAX / 2);
+    }
 }

@@ -357,38 +357,41 @@ keystone_result_t dsmil_hash_index_search_all(
 int dsmil_hash_index_save(dsmil_hash_index_t* idx, const char* path) {
     if (!idx || !path) return -1;
 
-    FILE* f = fopen(path, "wb");
-    if (!f) return -1;
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return -1;
 
-    /* Header: magic(4) + version(4) + count(8) + is_sorted(4) */
-    const char magic[4] = {'T','G','H','I'};
+    int rc = -1;
+    const char magic[4] = {'T', 'G', 'H', 'I'};
     uint32_t version = 1;
-    fwrite(magic, 1, 4, f);
-    fwrite(&version, 4, 1, f);
-    fwrite(&idx->count, sizeof(size_t), 1, f);
-    fwrite(&idx->is_sorted, sizeof(int), 1, f);
-
-    /* Hashes array */
-    fwrite(idx->hashes, sizeof(int64_t), idx->count, f);
-    /* Offsets array */
-    fwrite(idx->offsets, sizeof(uint64_t), idx->count, f);
-    /* String lengths array */
-    fwrite(idx->string_lens, sizeof(size_t), idx->count, f);
-
-    /* String data: all strings concatenated */
-    for (size_t i = 0; i < idx->count; i++) {
-        fwrite(idx->strings[i], 1, idx->string_lens[i], f);
+    if (fwrite(magic, 1, 4, f) != 4 || fwrite(&version, 4, 1, f) != 1 ||
+        fwrite(&idx->count, sizeof(size_t), 1, f) != 1 ||
+        fwrite(&idx->is_sorted, sizeof(int), 1, f) != 1 ||
+        fwrite(idx->hashes, sizeof(int64_t), idx->count, f) != idx->count ||
+        fwrite(idx->offsets, sizeof(uint64_t), idx->count, f) != idx->count ||
+        fwrite(idx->string_lens, sizeof(size_t), idx->count, f) != idx->count) {
+        goto out;
     }
-
-    fclose(f);
-    return 0;
+    for (size_t i = 0; i < idx->count; i++) {
+        if (fwrite(idx->strings[i], 1, idx->string_lens[i], f) != idx->string_lens[i]) {
+            goto out;
+        }
+    }
+    rc = 0;
+out:
+    if (fclose(f) != 0)
+        rc = -1;
+    return rc;
 }
 
-dsmil_hash_index_t* dsmil_hash_index_load(const char* path) {
-    if (!path) return NULL;
+dsmil_hash_index_t *dsmil_hash_index_load(const char *path)
+{
+    if (!path)
+        return NULL;
 
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return NULL;
 
     /* Header */
     char magic[4];

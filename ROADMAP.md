@@ -1,9 +1,9 @@
 # tgrep Roadmap
 
-## Status: Phase 11 + v2 cache + rg-compat + speculative prefetch + compile.sh
+## Historical implementation status: Phase 11 and subsequent extensions
 
 ```
-[██████████████████████████████████████████████████████] 100%
+Implementation-phase snapshot: complete. The future-work checkboxes below are tracked separately.
 ```
 
 ## Post-Phase 11: v2 Cache Optimization
@@ -36,6 +36,8 @@
 - [x] Rust WordIndexBuilder + MmapWordIndex safe wrappers in src/native.rs
 - [x] Build .qwi sidecars alongside .thi during indexing
 - [x] Search prefers .qwi (mmap+binary search), falls back to .thi
+- [x] Grow QWI lookup results with actual matches; avoid loading legacy .thi for
+      ordinary tokens when QWI is unavailable by using trigram candidates
 - [x] 60 tests pass (58 existing + 2 new word index tests)
 
 #### QIHSE Word Index vs KEYSTONE Hash Index (26K file corpus, 75 segments)
@@ -123,7 +125,7 @@ Benchmark data confirms: cold search latency is 170–870ms, of which the
 index lookup is <50ms and file I/O verification is the remainder. The
 speculation opportunity is to overlap I/O with computation.
 
-### Level 1: Speculative file prefetch (high impact, easy) — DONE
+### Level 1: Speculative file prefetch (opt-in; benefit unproven)
 
 - [x] After index intersection, issue `posix_fadvise(FADV_WILLNEED)` for
       ALL candidate files immediately, before verification begins
@@ -132,13 +134,18 @@ speculation opportunity is to overlap I/O with computation.
 - [x] By the time verification starts, most files are already in page cache
 - [x] Rollback is free: wasted prefetch is harmless (page cache evicts
       naturally)
-- [ ] Benchmark: measure 30–50% cold search latency reduction estimate
+- [x] Exploratory paired A/B measured page-cache-cold, ARC-warm search on a
+      199-file corpus: prefetch median 167.744 ms, disabled 151.766 ms; no
+      benefit observed, and the 30–50% estimate is unsupported
+- [ ] Measure on a representative corpus with filesystem and ZFS ARC/device
+      cache state controlled; current host lacks the historical corpus
 - [x] Does not help `-w -l` index-trust path (skips file reading entirely)
 - [x] Helps cold `-l` without index-trust, and all content-output modes
       (`-n`, default)
 
-Implementation: `speculative_prefetch()` in `src/search.rs`, called after
-candidate intersection, before `parallel_search()`. Uses `libc::open()`
+Implementation: `speculative_prefetch()` in `src/search.rs`, opt-in with
+`TGREP_PREFETCH=1`, called after candidate intersection, before
+`parallel_search()`. Uses `libc::open()`
 with `O_NONBLOCK` + `libc::posix_fadvise(FADV_WILLNEED)` + `libc::close()`.
 
 ### Level 2: Incremental speculative prefetch (medium impact, moderate)
@@ -173,6 +180,9 @@ with `O_NONBLOCK` + `libc::posix_fadvise(FADV_WILLNEED)` + `libc::close()`.
 - [ ] Gain would be microseconds, not milliseconds — low priority
 
 ## Future: Hardware-Aware SIMD Dispatch (AVX2/AVX-512)
+
+The following SIMD analysis describes the default build flags; `compile.sh` now supplies
+`TGREP_SIMD_FLAGS` to `build.rs`. Proposed Cargo features below are not currently declared.
 
 KEYSTONE has runtime CPU feature detection (`keystone_detect_cpu_features`)
 and multiple SIMD code paths for AVX2, AVX-512, and SSE4.2. However,
@@ -252,8 +262,9 @@ Mitigation options:
 3. **Runtime dispatch with dlopen** — compile AVX-512 code to a separate
    object, load at runtime if CPU supports it. Most complex, most portable.
 
-Recommended: option 2 (Cargo feature flag) for simplicity. Users on
-AVX-512 machines build with `cargo build --release --features avx512`.
+Recommended: option 2 (Cargo feature flag) for simplicity. If this feature is implemented later,
+users could select it explicitly. The current build uses
+`./compile.sh --release --simd avx512` and requires compatible hardware.
 
 ## Future: Unused KEYSTONE Algorithms
 
@@ -485,11 +496,15 @@ of each, with applicability to tgrep's bottlenecks.
 | Pattern | tgrep median | rg median | Speedup |
 |---------|-------------|-----------|---------|
 | RareNeedle (absent, full mode) | 114ms | 630ms | **5.5x faster** |
-| KeystoneTrigram (absent, full mode) | ~118ms | ~640ms | **4.7x faster** |
+| KeystoneTrigram (absent, full mode) | ~118ms | ~640ms | **~5.4x (computed)** |
 | Struct (238 matches, full mode) | 148ms | 686ms | **4.6x faster** |
 | terminal (2011, streaming) | 1347ms | 782ms | 1.7x slower |
-| RareNeedle (absent, indexed-only) | ~55ms | ~640ms | **20.4x faster** |
+| RareNeedle (absent, indexed-only) | ~55ms | ~640ms | **~11.6x (computed)** |
 | Struct (238 matches, indexed-only) | ~80ms | ~680ms | **8.5x faster** |
+
+The ~5.4x and ~11.6x ratios are computed from the displayed approximate historical timings,
+640/118 and 640/55. The original reports of 4.7x and 20.4x do not reconcile with those numbers;
+these arithmetic corrections are not new measurements.
 
 ### Phase 8: KEYSTONE Hash Index Fast Path
 - [x] `dsmil_hash_index_search_all` — return all matching doc IDs (not just first)
@@ -510,13 +525,13 @@ of each, with applicability to tgrep's bottlenecks.
 
 | Pattern | tgrep median | rg median | Speedup |
 |---------|-------------|-----------|---------|
-| `-w Terminal` (679 matches) | 122ms | 4395ms | **374x faster** |
-| `-w Struct` (77 matches) | 68ms | 4510ms | **499x faster** |
-| `-w main` (1901 matches) | 11ms | 5926ms | **1069x faster** |
-| `-w nonexistent_xyz` (absent) | 141ms | 5407ms | **670x faster** |
+| `-w Terminal` (679 matches) | 122ms | 4395ms | **36.0x faster** |
+| `-w Struct` (77 matches) | 68ms | 4510ms | **66.3x faster** |
+| `-w main` (1901 matches) | 11ms | 5926ms | **538.7x faster** |
+| `-w nonexistent_xyz` (absent) | 141ms | 5407ms | **38.3x faster** |
 
 **Key findings:**
-- Hash index fast path is 374x–1069x faster than `rg -w` for whole-word queries
+- Historical median ratios for the hash-index path are 36–539x versus `rg -w`
 - Tokenization uses ASCII word boundaries (alphanumeric + underscore)
 - Hash index is persisted as `.thi` sidecar files (~10MB total for 75 segments)
 - Falls back to trigram path for multi-word patterns or case-insensitive queries
@@ -603,9 +618,11 @@ dependencies while preserving the optimization DB semantics.
 - Rare/absent patterns: 7.3–9.5x faster than rg (avg 8.44x)
 - Broad patterns: 4.9–8.8x faster than rg (avg 6.43x)
 - Case-insensitive: within 10% of rg (streaming fallback, expected)
-- Word search regression: hash index .thi files grew to 339MB (was 10MB) due to
-  900K unique tokens per segment. Loading 339MB per search is slower than rg's
-  direct scan. Future fix: mmap-based hash index or per-token bucket lookup.
+- Historical word-search regression: hash index .thi files grew to 339MB (was
+  10MB) due to 900K unique tokens per segment. Follow-up code now grows mmap-QWI
+  result buffers with actual matches and uses trigram candidates rather than
+  loading legacy .thi files for ordinary tokens when QWI is unavailable. The
+  historical benchmark corpus is unavailable, so the speed impact is unmeasured.
 - All 18 patterns produce identical results to rg (correctness verified)
 
 ## Dependency Graph
@@ -678,3 +695,25 @@ Phase 11 (full suite + optimize) [DONE]
 4. **ZFS ARC invalidation** — cold-cache benchmarks on ZFS can't use `drop_caches`. Mitigation: export/drop the ARC dataset or use a fresh dataset.
 
 5. **Large file handling** — files > 64 MiB should be scan-only, not indexed. Mitigation: cap indexed file size, mark large files in segment metadata.
+
+## Open correctness work from the Q1 audit
+
+- [x] Enforce builder resource settings: discovery concurrency, a cooperative total allocation
+  budget, and aggregate logical read/write throttling. Bounded parallel discovery is implemented;
+  source reads and segment serialization now avoid redundant allocation/encoding. The default
+  memory value resolves from total and available Linux RAM plus cgroup v2 headroom; automatic I/O
+  uses a short state-filesystem probe and any lower matching cgroup v2 cap at each build start.
+  Explicit quantities override them. Process-level logical read/write counters now pace
+  the build at file and publication boundaries; individual operations can burst. A
+  sampled resident-memory guard checks before files and serialization and triggers
+  earlier flushing. Per-file and flush reservations use conservative estimates
+  (6x source bytes plus path/record overhead; 4x KEYSTONE memory plus 2x batch
+  source bytes). Native libraries do not expose complete allocation counters, so
+  transient peaks can exceed these cooperative estimates. These are not OS or
+  process-wide limits.
+- [x] Resolve Rust FFI stream/iterator ownership and keep native optimization mutexes in stable,
+  correctly aligned storage. Rust lifetime tests and native sanitizer checks pass.
+- [x] Reconcile current source and package license declarations. The historical Debian binary's
+  exact source provenance remains unknown and is documented; do not distribute it as a verified
+  build. Its original metadata advertised libc 2.31 although the ELF requires GLIBC 2.39; the
+  package metadata was corrected to 2.39. New packages derive dependencies from the staged ELF.

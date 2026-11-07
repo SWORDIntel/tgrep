@@ -8,12 +8,12 @@ case "$1" in
         echo "tgrep installed."
         echo ""
         echo "Build an index to accelerate searches:"
-        echo "  tgrep index build $HOME"
+        echo '  tgrep index build "$HOME"'
         echo ""
         echo "ZFS tip: on a ZFS system, the index is best kept on a compressed"
         echo "dataset (transparent ~2-3x compression, ARC-cached reads):"
         echo "  sudo zfs create -o compression=zstd -o atime=off \\"
-        echo "      -o mountpoint=\$HOME/.local/state/tgrep <pool>/tgrep"
+        echo '      -o mountpoint="$HOME/.local/state/tgrep" <pool>/tgrep'
         echo ""
         echo "Status and maintenance:"
         echo "  tgrep index status"

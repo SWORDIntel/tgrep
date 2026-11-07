@@ -7,7 +7,7 @@ use grep_printer::{SummaryBuilder, SummaryKind};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::SearcherBuilder;
 
-use crate::build::{default_state_dir, load_file_list_cache, CachedFileMeta};
+use crate::build::default_state_dir;
 use crate::store::{self, SegmentReader};
 
 // ── Public configuration ────────────────────────────────────────────
@@ -69,6 +69,10 @@ fn parse_ripgrep_config() -> RipgrepConfig {
         Err(_) => return RipgrepConfig::default(),
     };
 
+    parse_ripgrep_config_content(&content)
+}
+
+fn parse_ripgrep_config_content(content: &str) -> RipgrepConfig {
     let mut cfg = RipgrepConfig::default();
     for line in content.lines() {
         let line = line.trim();
@@ -83,8 +87,18 @@ fn parse_ripgrep_config() -> RipgrepConfig {
         };
 
         match flag {
-            "--smart-case" | "-S" => cfg.smart_case = true,
-            "--ignore-case" | "-i" => cfg.ignore_case = true,
+            "--smart-case" | "-S" => {
+                cfg.smart_case = true;
+                cfg.ignore_case = false;
+            }
+            "--ignore-case" | "-i" => {
+                cfg.ignore_case = true;
+                cfg.smart_case = false;
+            }
+            "--case-sensitive" | "-s" => {
+                cfg.smart_case = false;
+                cfg.ignore_case = false;
+            }
             "--hidden" => cfg.hidden = true,
             "--glob" => {
                 if let Some(v) = value {
@@ -102,6 +116,14 @@ fn parse_ripgrep_config() -> RipgrepConfig {
         }
     }
     cfg
+}
+
+fn effective_case_mode(cli_smart: bool, cli_ignore: bool, config: &RipgrepConfig) -> (bool, bool) {
+    if cli_smart || cli_ignore {
+        (cli_smart, cli_ignore)
+    } else {
+        (config.smart_case, config.ignore_case)
+    }
 }
 
 // ── Query plan ──────────────────────────────────────────────────────
@@ -149,7 +171,12 @@ pub fn plan_query(
 
     // Hash index fast path: if --word-regexp is set and the pattern is a
     // single word (all word characters), use the hash index for O(1) lookup.
-    if word_regexp && is_single_word(&literal) && literal.len() >= 2 {
+    let exact_literal = fixed
+        || regex_syntax::Parser::new()
+            .parse(pattern)
+            .ok()
+            .is_some_and(|hir| matches!(hir.kind(), regex_syntax::hir::HirKind::Literal(_)));
+    if word_regexp && exact_literal && is_single_word(&literal) && literal.len() >= 2 {
         return QueryPlan::HashIndex {
             token: literal.into_bytes(),
         };
@@ -172,59 +199,20 @@ fn is_single_word(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// Extract the longest literal substring from a regex pattern using
-/// `regex-syntax`'s `Parser` and AST traversal.
+/// Find a mandatory exact-case literal in the parsed regex. An alternative
+/// or optional branch cannot establish a required literal.
 fn extract_regex_literal(pattern: &str) -> Option<String> {
-    use regex_syntax::ast::parse::Parser;
-    use regex_syntax::ast::{Ast, LiteralKind};
-
-    let mut parser = Parser::new();
-    let ast = parser.parse(pattern).ok()?;
-
-    let mut best: Option<String> = None;
-
-    fn visit(node: &Ast, best: &mut Option<String>) {
-        match node {
-            Ast::Literal(lit) => {
-                if lit.kind == LiteralKind::Verbatim {
-                    let s = format!("{}", lit.c);
-                    if s.len() > best.as_ref().map_or(0, |b| b.len()) {
-                        *best = Some(s);
-                    }
-                }
-            }
-            Ast::Concat(concat) => {
-                let mut current = String::new();
-                for item in &concat.asts {
-                    match item {
-                        Ast::Literal(lit) if lit.kind == LiteralKind::Verbatim => {
-                            current.push(lit.c);
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    if current.len() > best.as_ref().map_or(0, |s| s.len()) {
-                        *best = Some(current.clone());
-                    }
-                    current.clear();
-                    visit(item, best);
-                }
-                if current.len() > best.as_ref().map_or(0, |s| s.len()) {
-                    *best = Some(current);
-                }
-            }
-            Ast::Group(g) => visit(&g.ast, best),
-            Ast::Alternation(alts) => {
-                for alt in &alts.asts {
-                    visit(alt, best);
-                }
-            }
-            _ => {}
+    use regex_syntax::hir::{Hir, HirKind};
+    fn mandatory(node: &Hir) -> Option<String> {
+        match node.kind() {
+            HirKind::Literal(lit) => String::from_utf8(lit.0.to_vec()).ok(),
+            HirKind::Capture(capture) => mandatory(&capture.sub),
+            HirKind::Repetition(repetition) if repetition.min > 0 => mandatory(&repetition.sub),
+            HirKind::Concat(parts) => parts.iter().filter_map(mandatory).max_by_key(|s| s.len()),
+            _ => None,
         }
     }
-
-    visit(&ast, &mut best);
-    best
+    mandatory(&regex_syntax::Parser::new().parse(pattern).ok()?)
 }
 
 /// Extract unique trigrams from a byte slice.
@@ -244,27 +232,94 @@ pub fn extract_unique_trigrams(data: &[u8]) -> Vec<u32> {
     result
 }
 
-/// Check if a pattern is all lowercase ASCII (for smart-case determination).
-fn is_all_lowercase_ascii(s: &str) -> bool {
-    s.chars().all(|c| !c.is_ascii_uppercase())
+/// A decoded uppercase literal proves smart-case matching is case-sensitive.
+/// Syntax such as hex digits, Unicode property names and flags does not.
+/// Class-only uppercase remains conservative: without proof, avoid raw-byte pruning.
+fn smart_case_may_ignore_case(pattern: &str, fixed: bool) -> bool {
+    if fixed {
+        return !pattern.chars().any(char::is_uppercase);
+    }
+    fn has_uppercase_literal(ast: &regex_syntax::ast::Ast) -> bool {
+        use regex_syntax::ast::Ast;
+        match ast {
+            Ast::Literal(literal) => literal.c.is_uppercase(),
+            Ast::Repetition(repetition) => has_uppercase_literal(&repetition.ast),
+            Ast::Group(group) => has_uppercase_literal(&group.ast),
+            Ast::Alternation(alternation) => alternation.asts.iter().any(has_uppercase_literal),
+            Ast::Concat(concat) => concat.asts.iter().any(has_uppercase_literal),
+            _ => false,
+        }
+    }
+    regex_syntax::ast::parse::Parser::new()
+        .parse(pattern)
+        .map(|ast| !has_uppercase_literal(&ast))
+        .unwrap_or(true)
+}
+
+/// Snapshot legacy roots before opening the manifest. A rebuild binds its old
+/// roots before changing progress roots; manifest-owned roots take precedence.
+fn load_index_snapshot(
+    state_dir: &Path,
+    read_manifest: impl FnOnce(&Path) -> Option<store::Manifest>,
+) -> (Option<store::Manifest>, Option<Vec<String>>) {
+    let legacy = crate::build::read_build_metadata(state_dir)
+        .ok()
+        .and_then(|value| {
+            let assumed_completed = match value.get("status") {
+                None => true,
+                Some(serde_json::Value::String(status)) if status == "completed" => false,
+                _ => return None,
+            };
+            let roots = value
+                .get("roots")?
+                .as_array()?
+                .iter()
+                .map(|root| root.as_str().map(String::from))
+                .collect::<Option<Vec<_>>>()?;
+            Some((roots, assumed_completed))
+        });
+    let manifest = read_manifest(state_dir);
+    let roots = manifest.as_ref().and_then(|manifest| {
+        let (roots, assumed_completed) = match manifest.roots.as_ref() {
+            Some(roots) => (roots, false),
+            None => {
+                let (roots, assumed) = legacy.as_ref()?;
+                (roots, *assumed)
+            }
+        };
+        if (roots.is_empty() && !manifest.segments.is_empty())
+            || roots
+                .iter()
+                .any(|root| root.is_empty() || !Path::new(root).is_absolute())
+        {
+            return None;
+        }
+        if assumed_completed {
+            eprintln!("tgrep: assuming legacy root-only metadata describes a completed build");
+        }
+        Some(roots.clone())
+    });
+    if manifest.is_some() && roots.is_none() {
+        eprintln!("tgrep: index root metadata is unavailable or ambiguous");
+    }
+    (manifest, roots)
 }
 
 // ── Search entry point ──────────────────────────────────────────────
 
 pub fn run_search(config: SearchConfig) {
-    // Build the combined pattern: if multiple -e patterns, join with |
-    let pattern = if config.patterns.is_empty() {
-        config.pattern.clone()
+    let mut patterns = vec![config.pattern.clone()];
+    patterns.extend(config.patterns.iter().cloned());
+    let pattern = patterns
+        .iter()
+        .map(|p| format!("(?:{})", p))
+        .collect::<Vec<_>>()
+        .join("|");
+    let plan_pattern = if patterns.len() == 1 {
+        patterns[0].as_str()
     } else {
-        let mut all = vec![config.pattern.clone()];
-        all.extend(config.patterns.iter().cloned());
-        all.join("|")
+        ""
     };
-
-    if pattern.is_empty() {
-        eprintln!("tgrep: no pattern given");
-        exit(2);
-    }
 
     // Default to current dir if no paths given
     let paths: Vec<PathBuf> = if config.paths.is_empty() {
@@ -276,8 +331,8 @@ pub fn run_search(config: SearchConfig) {
     // Parse ripgrep config and merge with CLI flags (CLI takes precedence)
     let rg_cfg = parse_ripgrep_config();
 
-    let smart_case = config.smart_case || rg_cfg.smart_case;
-    let ignore_case = config.ignore_case || rg_cfg.ignore_case;
+    let (smart_case, ignore_case) =
+        effective_case_mode(config.smart_case, config.ignore_case, &rg_cfg);
     // WalkBuilder::hidden(true) means "skip hidden files".
     // rg_cfg.hidden = true means user wants --hidden (include hidden files).
     // So we invert: include hidden files when rg_cfg.hidden is true.
@@ -286,12 +341,13 @@ pub fn run_search(config: SearchConfig) {
     let threads = rg_cfg.threads;
 
     // Determine if the search is effectively case-insensitive.
-    // Smart-case: case-insensitive when pattern is all lowercase ASCII.
-    let case_insensitive = ignore_case || (smart_case && is_all_lowercase_ascii(&pattern));
+    // Smart-case examines decoded literals; syntax letters cannot prove exact case.
+    let case_insensitive =
+        ignore_case || (smart_case && smart_case_may_ignore_case(&pattern, config.fixed_strings));
 
     // Plan the query
     let plan = plan_query(
-        &pattern,
+        plan_pattern,
         config.fixed_strings,
         case_insensitive,
         config.word_regexp,
@@ -299,25 +355,55 @@ pub fn run_search(config: SearchConfig) {
 
     // Load the manifest and open segments
     let state_dir = default_state_dir();
-    let manifest = store::load_manifest(&state_dir);
+    let (manifest, root_snapshot) = load_index_snapshot(&state_dir, store::load_manifest);
+    let can_use_index = root_snapshot.is_some();
+    if config.indexed_only && !can_use_index {
+        eprintln!(
+            "tgrep: --indexed-only requires an index with a meaningful absolute root mapping"
+        );
+        exit(2);
+    }
+    let indexed_roots = root_snapshot.unwrap_or_default();
+    let mut plan = if can_use_index {
+        plan
+    } else {
+        QueryPlan::Streaming
+    };
     let segments_dir = state_dir.join("segments");
 
-    let readers: Vec<SegmentReader> = match &manifest {
-        Some(m) => m
-            .segments
-            .iter()
-            .filter_map(|name| {
-                let path = segments_dir.join(name);
-                SegmentReader::open(&path).ok()
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let mut readers: Vec<SegmentReader> = Vec::new();
+    if let Some(manifest) = manifest.as_ref().filter(|_| can_use_index) {
+        for name in &manifest.segments {
+            match SegmentReader::open(&segments_dir.join(name)) {
+                Ok(reader) => readers.push(reader),
+                Err(error) => {
+                    eprintln!("tgrep: failed to read index segment {}: {}", name, error);
+                    if config.indexed_only {
+                        exit(2);
+                    }
+                    readers.clear();
+                    plan = QueryPlan::Streaming;
+                    break;
+                }
+            }
+        }
+    }
+    if readers.iter().any(|reader| {
+        reader
+            .iter_docs()
+            .any(|doc| doc.root_id as usize >= indexed_roots.len())
+    }) {
+        eprintln!("tgrep: index records refer to unavailable root metadata");
+        if config.indexed_only {
+            exit(2);
+        }
+        readers.clear();
+        plan = QueryPlan::Streaming;
+    }
 
     // Phase 11: Search-result cache (v2: grouped entries with file IDs).
-    // Cache key: (pattern, flags, manifest_generation).
-    // Cache invalidation is automatic — a new build increments the
-    // generation, so old entries don't match.
+    // Query flags and generation scope candidate-ordering hints.
+    // Filesystem traversal and content verification remain authoritative.
     let manifest_generation = manifest.as_ref().map(|m| m.generation as i64).unwrap_or(0);
     let cache_flags = crate::native::compute_cache_flags(
         case_insensitive,
@@ -330,31 +416,17 @@ pub fn run_search(config: SearchConfig) {
         let _ = cache.load(cache_path.to_str().unwrap_or(""));
     }
 
-    // Cache lookup: only for -l (files_with_matches) mode, where we can
-    // return cached file paths directly without re-verifying.
-    if config.files_with_matches && cache.is_some() {
-        if let Some(ref cache) = cache {
-            if let Some(cached_paths) = cache.lookup(&pattern, cache_flags, manifest_generation) {
-                if config.explain {
-                    eprintln!(
-                        "tgrep: cache HIT ({} files, gen={})",
-                        cached_paths.len(),
-                        manifest_generation
-                    );
-                }
-                for p in &cached_paths {
-                    println!("{}", p);
-                }
-                if !cached_paths.is_empty() {
-                    exit(0);
-                } else {
-                    exit(1);
-                }
-            }
-        }
-    }
+    // Cached paths are ordering hints; live traversal and verification determine results.
+    let cached_hints = cache
+        .as_ref()
+        .and_then(|cache| cache.lookup(&pattern, cache_flags, manifest_generation))
+        .unwrap_or_default();
     if config.explain && cache.is_some() {
-        eprintln!("tgrep: cache MISS (gen={})", manifest_generation);
+        eprintln!(
+            "tgrep: cache hints={} (gen={})",
+            cached_hints.len(),
+            manifest_generation
+        );
     }
 
     if config.explain {
@@ -429,7 +501,7 @@ pub fn run_search(config: SearchConfig) {
                 if case_insensitive {
                     eprintln!("tgrep: plan = streaming (case-insensitive, trigram index is case-sensitive)");
                 } else {
-                    eprintln!("tgrep: plan = streaming (no usable trigrams)");
+                    eprintln!("tgrep: plan = streaming (no safe index plan)");
                 }
             }
         }
@@ -445,7 +517,7 @@ pub fn run_search(config: SearchConfig) {
         .word(config.word_regexp)
         .multi_line(true);
 
-    let matcher = match builder.build(&pattern) {
+    let matcher = match builder.build_many(&patterns) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("tgrep: invalid pattern: {}", e);
@@ -495,34 +567,51 @@ pub fn run_search(config: SearchConfig) {
         }
     }
 
-    // Determine which roots were indexed (stored in build.json).
-    let indexed_roots: Vec<String> = {
-        let build_path = state_dir.join("build.json");
-        fs::read_to_string(&build_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| {
-                v.get("roots").and_then(|r| r.as_array()).map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
-                        .collect()
-                })
-            })
-            .unwrap_or_default()
+    let (visible_files, walk_errors) = match collect_all_files(&paths, walk_hidden, &globs, threads)
+    {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("tgrep: {}", error);
+            exit(2);
+        }
     };
+    let mut visible_map: std::collections::HashMap<PathBuf, Vec<PathBuf>> =
+        std::collections::HashMap::new();
+    for path in &visible_files {
+        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        visible_map.entry(canonical).or_default().push(path.clone());
+    }
 
     // Compute the candidate set from indexed segments
     let indexed_candidates: Vec<(PathBuf, u64)> = match &plan {
         QueryPlan::Indexed { grams } => intersect_postings(&readers, grams, &indexed_roots),
         QueryPlan::HashIndex { token } => {
-            // Prefer QIHSE-backed B+ tree index (.qwi) when available;
-            // fall back to KEYSTONE hash index (.thi) for legacy segments.
-            let qwi = qihse_word_index_candidates(&readers, &segments_dir, token, &indexed_roots);
-            if !qwi.is_empty() {
-                qwi
-            } else {
-                hash_index_candidates(&readers, &segments_dir, token, &indexed_roots)
-            }
+            // Prefer the mmap-backed QWI sidecar. For ordinary (>= 3 byte)
+            // words, fall back directly to trigram postings instead of loading
+            // legacy `.thi` hash tables into memory; those sidecars can be
+            // hundreds of MiB. Very short tokens have no trigrams, so use the
+            // legacy hash index only for that case before scanning unchanged
+            // indexed paths.
+            qihse_word_index_candidates(&readers, &segments_dir, token, &indexed_roots)
+                .or_else(|| {
+                    let grams = extract_unique_trigrams(token);
+                    if grams.is_empty() {
+                        hash_index_candidates(&readers, &segments_dir, token, &indexed_roots)
+                    } else {
+                        Some(intersect_postings(&readers, &grams, &indexed_roots))
+                    }
+                })
+                .unwrap_or_else(|| {
+                    let unchanged = collect_unchanged_indexed_paths(&readers, &indexed_roots);
+                    visible_files
+                        .iter()
+                        .filter(|p| {
+                            let canonical = fs::canonicalize(p).unwrap_or_else(|_| (*p).clone());
+                            unchanged.contains(&canonical)
+                        })
+                        .map(|p| (p.clone(), 0))
+                        .collect()
+                })
         }
         QueryPlan::Streaming => Vec::new(),
     };
@@ -538,80 +627,29 @@ pub fn run_search(config: SearchConfig) {
         && !indexed_roots.is_empty();
 
     let indexed_paths: std::collections::HashSet<PathBuf> = if need_indexed_paths {
-        collect_all_indexed_paths(&readers, &indexed_roots)
+        collect_unchanged_indexed_paths(&readers, &indexed_roots)
     } else {
         std::collections::HashSet::new()
     };
 
-    // Determine which files to stream-scan:
-    // - If streaming plan: all files under the search paths
-    // - If indexed plan: only files NOT in the index (truly unindexed/new)
-    //   Indexed non-candidates are skipped (known non-matches).
-    //   Uses file list cache to skip filesystem walk when possible.
-    // - If indexed_only flag: skip streaming entirely
-    let stream_files: Vec<PathBuf> = if config.indexed_only {
-        Vec::new()
-    } else {
-        match &plan {
-            QueryPlan::Streaming => collect_all_files(&paths, walk_hidden, &globs, threads),
-            QueryPlan::Indexed { .. } | QueryPlan::HashIndex { .. } => {
-                collect_unindexed_files_fast(
-                    &paths,
-                    &indexed_paths,
-                    walk_hidden,
-                    &globs,
-                    threads,
-                    &state_dir,
-                )
-            }
-        }
-    };
-
-    // Filter indexed candidates to only those under the requested search paths.
-    // This is needed when searching a subdirectory of an indexed root.
-    let indexed_candidates: Vec<(PathBuf, u64)> = indexed_candidates
-        .into_iter()
-        .filter(|(p, _)| paths.iter().any(|search_path| p.starts_with(search_path)))
-        .collect();
-
-    // Index-trust optimization: for -l mode with HashIndex plan,
-    // skip content verification for indexed candidates whose mtime
-    // matches the file list cache (file hasn't changed since indexing).
-    // Changed files still get verified via parallel_search.
-    let trusted_paths: Vec<PathBuf> = if config.files_with_matches
-        && matches!(plan, QueryPlan::HashIndex { .. })
-        && !indexed_candidates.is_empty()
-    {
-        trust_indexed_candidates(&indexed_candidates, &state_dir, config.explain)
-    } else {
-        Vec::new()
-    };
-
-    // Output trusted paths directly (confirmed matches from the index,
-    // no content verification needed). Printed before verified results
-    // to match the existing indexed-candidates-first ordering.
-    if !trusted_paths.is_empty() {
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        for p in &trusted_paths {
-            let _ = writeln!(out, "{}", p.display());
-        }
+    let indexed_candidates = expand_visible_aliases(
+        indexed_candidates
+            .into_iter()
+            .map(|(path, _)| fs::canonicalize(&path).unwrap_or(path)),
+        &visible_map,
+    );
+    let indexed_candidate_count = indexed_candidates.len();
+    let mut all_files = indexed_candidates;
+    if !config.indexed_only {
+        all_files.extend(visible_files.into_iter().filter(|path| {
+            let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            matches!(plan, QueryPlan::Streaming) || !indexed_paths.contains(&canonical)
+        }));
     }
-
-    // Build the list of files that still need verification:
-    // untrusted indexed candidates + stream files
-    let trusted_set: std::collections::HashSet<&PathBuf> = trusted_paths.iter().collect();
-    let untrusted_indexed: Vec<PathBuf> = indexed_candidates
-        .iter()
-        .map(|(p, _)| p)
-        .filter(|p| !trusted_set.contains(p))
-        .cloned()
-        .collect();
-
-    let all_files: Vec<PathBuf> = untrusted_indexed
-        .into_iter()
-        .chain(stream_files.into_iter())
-        .collect();
+    let mut seen = std::collections::HashSet::new();
+    all_files.retain(|path| seen.insert(path.as_os_str().to_os_string()));
+    let hints: std::collections::HashSet<&str> = cached_hints.iter().map(String::as_str).collect();
+    all_files.sort_by_key(|path| !hints.contains(path.to_string_lossy().as_ref()));
 
     // Debug: list files that would be searched
     if config.list_files {
@@ -621,7 +659,7 @@ pub fn run_search(config: SearchConfig) {
         eprintln!(
             "Total: {} files ({} indexed candidates)",
             all_files.len(),
-            indexed_candidates.len()
+            indexed_candidate_count
         );
         exit(0);
     }
@@ -634,14 +672,15 @@ pub fn run_search(config: SearchConfig) {
     // verification. By the time we read each file, it's likely already
     // in page cache. Wasted prefetch (files that don't match) is
     // harmless — the page cache evicts naturally.
-    // Disable with TGREP_NO_PREFETCH=1 for A/B benchmarking.
-    if !all_files.is_empty() && std::env::var("TGREP_NO_PREFETCH").is_err() {
+    // Keep speculative prefetch opt-in until representative cold-storage
+    // benchmarks show a benefit. The available ARC-warm trial was slower.
+    if !all_files.is_empty() && speculative_prefetch_enabled() {
         speculative_prefetch(&all_files);
     }
 
     // Parallel search (only for files that need verification)
     let search_start = std::time::Instant::now();
-    let (mut match_found, mut matched_paths) = parallel_search(
+    let (match_found, matched_paths, search_errors) = parallel_search(
         &all_files,
         &matcher,
         config.line_number,
@@ -651,16 +690,6 @@ pub fn run_search(config: SearchConfig) {
         threads,
     );
     let search_elapsed = search_start.elapsed();
-
-    // Merge trusted paths (from index-trust optimization) into results.
-    // Trusted paths were already printed to stdout above; add them to
-    // matched_paths for caching and exit-code correctness.
-    if !trusted_paths.is_empty() {
-        match_found = true;
-        let mut all_matched = trusted_paths.clone();
-        all_matched.extend(matched_paths.drain(..));
-        matched_paths = all_matched;
-    }
 
     // Phase 11: Store results in cache for future lookups.
     // Only cache -l (files_with_matches) mode results.
@@ -690,8 +719,8 @@ pub fn run_search(config: SearchConfig) {
         let sig = crate::native::compute_query_signature(grams, total_postings);
         // Speedup vs baseline (rough heuristic: indexed search vs full scan).
         // Confidence is 1.0 for exact-match verification.
-        let speedup = if !all_files.is_empty() && !indexed_candidates.is_empty() {
-            (all_files.len() as f64) / (indexed_candidates.len().max(1) as f64)
+        let speedup = if !all_files.is_empty() && indexed_candidate_count > 0 {
+            (all_files.len() as f64) / (indexed_candidate_count.max(1) as f64)
         } else {
             1.0
         };
@@ -721,6 +750,11 @@ pub fn run_search(config: SearchConfig) {
     }
 
     // Match ripgrep exit codes: 0 = match found, 1 = no match, 2 = error
+    if walk_errors || search_errors {
+        if !(config.quiet && match_found) {
+            exit(2);
+        }
+    }
     if match_found {
         exit(0);
     } else {
@@ -733,6 +767,7 @@ struct FileResult {
     _path: PathBuf,
     matched: bool,
     output: Vec<u8>,
+    error: Option<String>,
 }
 
 /// Speculative file prefetch (SPECTRE-inspired Level 1).
@@ -773,6 +808,14 @@ fn speculative_prefetch(files: &[PathBuf]) {
     }
 }
 
+fn speculative_prefetch_enabled() -> bool {
+    prefetch_setting_enabled(std::env::var_os("TGREP_PREFETCH").as_deref())
+}
+
+fn prefetch_setting_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
 /// Search files in parallel using scoped threads.
 /// Returns (true if any match was found, list of matching file paths).
 fn parallel_search(
@@ -783,9 +826,9 @@ fn parallel_search(
     count: bool,
     quiet: bool,
     num_threads: usize,
-) -> (bool, Vec<PathBuf>) {
+) -> (bool, Vec<PathBuf>, bool) {
     if files.is_empty() {
-        return (false, Vec::new());
+        return (false, Vec::new(), false);
     }
 
     // For quiet mode, use atomic flag for early exit
@@ -811,10 +854,11 @@ fn parallel_search(
             .filter(|r| r.matched)
             .map(|r| r._path.clone())
             .collect();
-        output_results(&results, files_with_matches, count, quiet);
+        let errors = output_results(&results, files_with_matches, count, quiet);
         return (
             found.load(std::sync::atomic::Ordering::Relaxed),
             matched_paths,
+            errors,
         );
     }
 
@@ -855,11 +899,11 @@ fn parallel_search(
         .map(|r| r._path.clone())
         .collect();
 
-    output_results(&all_results, files_with_matches, count, quiet);
-
+    let errors = output_results(&all_results, files_with_matches, count, quiet);
     (
         found.load(std::sync::atomic::Ordering::Relaxed),
         matched_paths,
+        errors,
     )
 }
 
@@ -888,11 +932,13 @@ fn search_chunk(
                 _path: path.clone(),
                 matched: false,
                 output: Vec::new(),
+                error: None,
             });
             continue;
         }
 
         let mut output_buf: Vec<u8> = Vec::new();
+        let mut error = None;
 
         let matched = if files_with_matches || count || quiet {
             // Use Summary printer writing to a buffer
@@ -909,7 +955,11 @@ fn search_chunk(
                 .build_no_color(&mut output_buf);
 
             let mut sink = printer.sink_with_path(matcher, path);
-            if searcher.search_path(matcher, path, &mut sink).is_ok() {
+            let result = searcher.search_path(matcher, path, &mut sink);
+            if let Err(e) = &result {
+                error = Some(format!("{}: {}", path.display(), e));
+            }
+            if result.is_ok() {
                 let m = sink.has_match();
                 if m {
                     found.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -923,7 +973,11 @@ fn search_chunk(
             let mut printer = grep_printer::StandardBuilder::new().build_no_color(&mut output_buf);
 
             let mut sink = printer.sink_with_path(matcher, path);
-            if searcher.search_path(matcher, path, &mut sink).is_ok() {
+            let result = searcher.search_path(matcher, path, &mut sink);
+            if let Err(e) = &result {
+                error = Some(format!("{}: {}", path.display(), e));
+            }
+            if result.is_ok() {
                 let m = sink.has_match();
                 if m {
                     found.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -938,6 +992,7 @@ fn search_chunk(
             _path: path.clone(),
             matched,
             output: output_buf,
+            error,
         });
     }
 
@@ -945,9 +1000,21 @@ fn search_chunk(
 }
 
 /// Output results in order.
-fn output_results(results: &[FileResult], _files_with_matches: bool, count: bool, quiet: bool) {
+fn output_results(
+    results: &[FileResult],
+    _files_with_matches: bool,
+    count: bool,
+    quiet: bool,
+) -> bool {
+    let mut errors = false;
+    for result in results {
+        if let Some(error) = &result.error {
+            eprintln!("tgrep: {}", error);
+            errors = true;
+        }
+    }
     if quiet {
-        return;
+        return errors;
     }
 
     let stdout = io::stdout();
@@ -955,9 +1022,13 @@ fn output_results(results: &[FileResult], _files_with_matches: bool, count: bool
 
     for r in results {
         if r.matched || count {
-            let _ = out.write_all(&r.output);
+            if let Err(error) = out.write_all(&r.output) {
+                eprintln!("tgrep: stdout: {}", error);
+                return true;
+            }
         }
     }
+    errors
 }
 
 // ── Posting intersection ────────────────────────────────────────────
@@ -1004,12 +1075,9 @@ fn intersect_postings(
             let root_idx = doc.root_id as usize;
             if root_idx < indexed_roots.len() {
                 let root = PathBuf::from(&indexed_roots[root_idx]);
-                let rel = String::from_utf8_lossy(&doc.path);
-                let full_path = root.join(rel.as_ref());
+                use std::os::unix::ffi::OsStringExt;
+                let full_path = root.join(std::ffi::OsString::from_vec(doc.path.to_vec()));
                 candidates.push((full_path, doc.byte_length));
-            } else {
-                let path = PathBuf::from(String::from_utf8_lossy(&doc.path).to_string());
-                candidates.push((path, doc.byte_length));
             }
         }
     }
@@ -1025,9 +1093,9 @@ fn hash_index_candidates(
     segments_dir: &Path,
     token: &[u8],
     indexed_roots: &[String],
-) -> Vec<(PathBuf, u64)> {
+) -> Option<Vec<(PathBuf, u64)>> {
     if readers.is_empty() || token.is_empty() {
-        return Vec::new();
+        return None;
     }
 
     // Parallel load + search across segments to avoid serial I/O bottleneck.
@@ -1054,8 +1122,8 @@ fn hash_index_candidates(
         })
         .collect();
 
-    if work.is_empty() {
-        return Vec::new();
+    if work.len() != readers.len() || work.is_empty() {
+        return None;
     }
 
     // Chunk work across threads (4 threads, like the search itself)
@@ -1084,23 +1152,33 @@ fn hash_index_candidates(
                             continue;
                         }
                     };
-                    let doc_ids = hash_index.search_all(token_owned);
+                    let doc_ids = match hash_index.search_all(token_owned) {
+                        Ok(ids) => ids,
+                        Err(error) => {
+                            errors.lock().unwrap().push(error);
+                            continue;
+                        }
+                    };
                     if doc_ids.is_empty() {
                         continue;
                     }
                     let reader = &readers[*reader_idx];
                     let docs = reader.get_docs_bulk(&doc_ids);
+                    if docs.iter().any(Option::is_none) {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push("word index refers to a missing document".to_string());
+                        continue;
+                    }
                     for doc in docs.into_iter().flatten() {
                         let root_idx = doc.root_id as usize;
                         if root_idx < indexed_roots.len() {
                             let root = PathBuf::from(&indexed_roots[root_idx]);
-                            let rel = String::from_utf8_lossy(&doc.path);
-                            let full_path = root.join(rel.as_ref());
+                            use std::os::unix::ffi::OsStringExt;
+                            let full_path =
+                                root.join(std::ffi::OsString::from_vec(doc.path.to_vec()));
                             local.push((full_path, doc.byte_length));
-                        } else {
-                            let path =
-                                PathBuf::from(String::from_utf8_lossy(&doc.path).to_string());
-                            local.push((path, doc.byte_length));
                         }
                     }
                 }
@@ -1109,11 +1187,17 @@ fn hash_index_candidates(
         }
     });
 
-    for e in errors.into_inner().unwrap() {
-        eprintln!("tgrep: warning: hash index load failed: {}", e);
+    let errors = errors.into_inner().unwrap();
+    let complete = errors.is_empty();
+    for e in errors {
+        eprintln!("tgrep: warning: hash index unavailable: {}", e);
     }
 
-    results.into_inner().unwrap()
+    if complete {
+        Some(results.into_inner().unwrap())
+    } else {
+        None
+    }
 }
 
 /// Look up whole-token candidates via the per-segment QIHSE B+ tree indexes.
@@ -1128,9 +1212,9 @@ fn qihse_word_index_candidates(
     segments_dir: &Path,
     token: &[u8],
     indexed_roots: &[String],
-) -> Vec<(PathBuf, u64)> {
+) -> Option<Vec<(PathBuf, u64)>> {
     if readers.is_empty() || token.is_empty() {
-        return Vec::new();
+        return None;
     }
 
     use std::sync::Mutex;
@@ -1155,8 +1239,8 @@ fn qihse_word_index_candidates(
         })
         .collect();
 
-    if work.is_empty() {
-        return Vec::new();
+    if work.len() != readers.len() || work.is_empty() {
+        return None;
     }
 
     let num_threads = 4usize.min(work.len());
@@ -1186,28 +1270,44 @@ fn qihse_word_index_candidates(
                     };
                     // Hard cap: qwi.size() tracks the file's entry count, but the
                     // usable output is doc ids (u32). Bound the C-side buffer too.
-                    let max_results = qwi.size().min(1 << 22).max(1024);
-                    let doc_ids_u64 = qwi.search(token_owned, max_results);
+                    let max_results = qwi.size().min(1 << 22).max(1);
+                    let doc_ids_u64 = match qwi.search(token_owned, max_results) {
+                        Ok(ids) => ids,
+                        Err(error) => {
+                            errors.lock().unwrap().push(error);
+                            continue;
+                        }
+                    };
+                    if doc_ids_u64.len() >= max_results
+                        || doc_ids_u64.iter().any(|&id| id > u32::MAX as u64)
+                    {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push("word-index results exceed supported bounds".to_string());
+                        continue;
+                    }
                     if doc_ids_u64.is_empty() {
                         continue;
                     }
-                    let doc_ids: Vec<u32> = doc_ids_u64
-                        .into_iter()
-                        .map(|d| d as u32)
-                        .collect();
+                    let doc_ids: Vec<u32> = doc_ids_u64.into_iter().map(|d| d as u32).collect();
                     let reader = &readers[*reader_idx];
                     let docs = reader.get_docs_bulk(&doc_ids);
+                    if docs.iter().any(Option::is_none) {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push("word index refers to a missing document".to_string());
+                        continue;
+                    }
                     for doc in docs.into_iter().flatten() {
                         let root_idx = doc.root_id as usize;
                         if root_idx < indexed_roots.len() {
                             let root = PathBuf::from(&indexed_roots[root_idx]);
-                            let rel = String::from_utf8_lossy(&doc.path);
-                            let full_path = root.join(rel.as_ref());
+                            use std::os::unix::ffi::OsStringExt;
+                            let full_path =
+                                root.join(std::ffi::OsString::from_vec(doc.path.to_vec()));
                             local.push((full_path, doc.byte_length));
-                        } else {
-                            let path =
-                                PathBuf::from(String::from_utf8_lossy(&doc.path).to_string());
-                            local.push((path, doc.byte_length));
                         }
                     }
                 }
@@ -1216,11 +1316,17 @@ fn qihse_word_index_candidates(
         }
     });
 
-    for e in errors.into_inner().unwrap() {
+    let errors = errors.into_inner().unwrap();
+    let complete = errors.is_empty();
+    for e in errors {
         eprintln!("tgrep: warning: qihse word index load failed: {}", e);
     }
 
-    results.into_inner().unwrap()
+    if complete {
+        Some(results.into_inner().unwrap())
+    } else {
+        None
+    }
 }
 
 /// Intersect multiple sorted vectors, returning the intersection.
@@ -1292,6 +1398,19 @@ fn intersect_two(a: &[u32], b: &[u32]) -> Vec<u32> {
     result
 }
 
+// Expand indexed identities to every visible spelling requested by the walk.
+fn expand_visible_aliases(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    visible: &std::collections::HashMap<PathBuf, Vec<PathBuf>>,
+) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    candidates
+        .into_iter()
+        .flat_map(|path| visible.get(&path).into_iter().flatten().cloned())
+        .filter(|path| seen.insert(path.as_os_str().to_os_string()))
+        .collect()
+}
+
 // ── File collection ─────────────────────────────────────────────────
 
 /// Collect all files under the given paths.
@@ -1302,8 +1421,9 @@ fn collect_all_files(
     hidden: bool,
     globs: &[String],
     threads: usize,
-) -> Vec<PathBuf> {
+) -> Result<(Vec<PathBuf>, bool), String> {
     let mut files = Vec::new();
+    let mut errors = false;
 
     for root in paths {
         if root.is_file() {
@@ -1324,11 +1444,9 @@ fn collect_all_files(
         if !globs.is_empty() {
             let mut override_builder = ignore::overrides::OverrideBuilder::new(root);
             for glob in globs {
-                let _ = override_builder.add(glob);
+                override_builder.add(glob).map_err(|e| e.to_string())?;
             }
-            if let Ok(ov) = override_builder.build() {
-                builder.overrides(ov);
-            }
+            builder.overrides(override_builder.build().map_err(|e| e.to_string())?);
         }
 
         let walker = builder.build();
@@ -1336,7 +1454,11 @@ fn collect_all_files(
         for entry in walker {
             let entry = match entry {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(error) => {
+                    eprintln!("tgrep: {}", error);
+                    errors = true;
+                    continue;
+                }
             };
             if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 files.push(entry.path().to_path_buf());
@@ -1344,13 +1466,12 @@ fn collect_all_files(
         }
     }
 
-    files
+    Ok((files, errors))
 }
 
-/// Collect ALL indexed file paths from all segments.
-/// This is used to skip scanning indexed non-candidates (files in the
-/// index that don't match all trigrams — known non-matches).
-fn collect_all_indexed_paths(
+/// Collect files whose complete metadata still matches an indexed record.
+/// Only these files can safely be excluded by a negative index result.
+fn collect_unchanged_indexed_paths(
     readers: &[SegmentReader],
     indexed_roots: &[String],
 ) -> std::collections::HashSet<PathBuf> {
@@ -1360,252 +1481,23 @@ fn collect_all_indexed_paths(
             let root_idx = doc.root_id as usize;
             if root_idx < indexed_roots.len() {
                 let root = PathBuf::from(&indexed_roots[root_idx]);
-                let rel = String::from_utf8_lossy(&doc.path);
-                let full_path = root.join(rel.as_ref());
-                paths.insert(full_path);
+                use std::os::unix::ffi::OsStringExt;
+                let full_path = root.join(std::ffi::OsString::from_vec(doc.path.to_vec()));
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(meta) = fs::metadata(&full_path) {
+                    if meta.len() == doc.byte_length
+                        && meta.dev() == doc.device
+                        && meta.ino() == doc.inode
+                        && meta.mtime() * 1_000_000_000 + meta.mtime_nsec() == doc.mtime_ns
+                        && meta.ctime() * 1_000_000_000 + meta.ctime_nsec() == doc.ctime_ns
+                    {
+                        paths.insert(fs::canonicalize(&full_path).unwrap_or(full_path));
+                    }
+                }
             }
         }
     }
     paths
-}
-
-/// Check if a file's metadata matches the cached metadata.
-fn metadata_matches(path: &Path, cached: &CachedFileMeta) -> bool {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            use std::os::unix::fs::MetadataExt;
-            let mtime_ns = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
-            meta.len() == cached.size && meta.ino() == cached.inode && mtime_ns == cached.mtime_ns
-        }
-        Err(_) => false,
-    }
-}
-
-/// Check if a file's metadata matches the cached metadata AND the file
-/// is not binary (no NUL bytes in the first 8KB). This is the trust
-/// condition for skipping content verification.
-fn can_trust_index(path: &Path, cached: &CachedFileMeta) -> bool {
-    if !metadata_matches(path, cached) {
-        return false;
-    }
-    // Safety net: check for binary files (NUL bytes in first 8KB).
-    // rg skips binary files, so trusting the index for them would
-    // produce false positives. This also covers old indexes built
-    // before the build-time binary skip was added.
-    use std::io::Read;
-    match std::fs::File::open(path) {
-        Ok(mut f) => {
-            let mut buf = [0u8; 8192];
-            match f.read(&mut buf) {
-                Ok(n) => !buf[..n].contains(&0u8),
-                Err(_) => false,
-            }
-        }
-        Err(_) => false,
-    }
-}
-
-/// Check which indexed candidates have unchanged mtime (can trust the index).
-/// Returns the subset of candidates whose file metadata matches the file
-/// list cache, meaning the file hasn't changed since indexing and the
-/// index result is valid without re-reading the file content.
-///
-/// Uses parallel stat() calls (4 threads) to check metadata for large
-/// candidate sets. Each stat() is much cheaper than reading the full
-/// file content, so this is a major win for broad word queries.
-fn trust_indexed_candidates(
-    candidates: &[(PathBuf, u64)],
-    state_dir: &Path,
-    explain: bool,
-) -> Vec<PathBuf> {
-    let cache = match load_file_list_cache(state_dir) {
-        Some(c) => c,
-        None => return Vec::new(),
-    };
-
-    // Build a HashMap for O(1) lookup by path string
-    let meta_map: std::collections::HashMap<&str, &CachedFileMeta> = cache
-        .files
-        .iter()
-        .map(|f| (f.path.as_str(), f))
-        .collect();
-
-    let total = candidates.len();
-
-    // For small candidate sets, check serially (avoids thread overhead)
-    if total <= 256 {
-        let trusted: Vec<PathBuf> = candidates
-            .iter()
-            .filter(|(p, _)| {
-                let path_str = p.to_string_lossy();
-                meta_map
-                    .get(path_str.as_ref())
-                    .map(|cached| can_trust_index(p, cached))
-                    .unwrap_or(false)
-            })
-            .map(|(p, _)| p.clone())
-            .collect();
-        if explain {
-            eprintln!(
-                "tgrep: index-trust: {}/{} candidates trusted (mtime unchanged)",
-                trusted.len(),
-                total
-            );
-        }
-        return trusted;
-    }
-
-    // Parallel stat() for large candidate sets
-    use std::sync::Mutex;
-    use std::thread;
-
-    let num_threads = 4usize.min(total);
-    let chunk_size = (total + num_threads - 1) / num_threads;
-    let meta_map = &meta_map;
-    let results = Mutex::new(Vec::new());
-
-    thread::scope(|s| {
-        for chunk in candidates.chunks(chunk_size) {
-            let results = &results;
-            let meta_map = meta_map;
-            s.spawn(move || {
-                let mut local = Vec::new();
-                for (p, _) in chunk {
-                    let path_str = p.to_string_lossy();
-                    if meta_map
-                        .get(path_str.as_ref())
-                        .map(|cached| can_trust_index(p, cached))
-                        .unwrap_or(false)
-                    {
-                        local.push(p.clone());
-                    }
-                }
-                results.lock().unwrap().extend(local);
-            });
-        }
-    });
-
-    let trusted = results.into_inner().unwrap();
-    if explain {
-        eprintln!(
-            "tgrep: index-trust: {}/{} candidates trusted (mtime unchanged)",
-            trusted.len(),
-            total
-        );
-    }
-    trusted
-}
-
-/// Try to load the file list cache and verify it's still valid.
-/// Returns the list of all files if the cache is valid, or None if
-/// the cache is missing, stale, or invalid (fall back to walking).
-///
-/// Validity check: verify a random sample of files (up to 20) still
-/// exist and match their stored metadata. If any sample fails, the
-/// cache is considered stale.
-fn try_load_file_cache(
-    state_dir: &Path,
-    search_paths: &[PathBuf],
-    _walk_hidden: bool,
-) -> Option<Vec<PathBuf>> {
-    let cache = load_file_list_cache(state_dir)?;
-
-    // Check that the cache roots overlap with the search paths
-    let cache_roots: Vec<PathBuf> = cache.roots.iter().map(PathBuf::from).collect();
-    let search_matches_cache = search_paths.iter().any(|sp| {
-        cache_roots
-            .iter()
-            .any(|cr| sp == cr || sp.starts_with(cr) || cr.starts_with(sp))
-    });
-    if !search_matches_cache {
-        return None;
-    }
-
-    // If search paths are subdirectories of cache roots, filter the cache
-    // to only include files under the search paths.
-    let filtered: Vec<&CachedFileMeta> =
-        if search_paths.len() == 1 && cache_roots.contains(&search_paths[0]) {
-            // Exact root match — use all cached files
-            cache.files.iter().collect()
-        } else {
-            // Filter to files under any search path
-            cache
-                .files
-                .iter()
-                .filter(|f| {
-                    let p = PathBuf::from(&f.path);
-                    search_paths.iter().any(|sp| p.starts_with(sp) || p == *sp)
-                })
-                .collect()
-        };
-
-    if filtered.is_empty() {
-        return None;
-    }
-
-    // Validity check: sample up to 20 files
-    let sample_size = filtered.len().min(20);
-    let step = filtered.len() / sample_size.max(1);
-    let mut checked = 0;
-    let mut failed = 0;
-    for i in (0..filtered.len()).step_by(step.max(1)) {
-        if checked >= sample_size {
-            break;
-        }
-        let f = &filtered[i];
-        let path = PathBuf::from(&f.path);
-        if !metadata_matches(&path, f) {
-            failed += 1;
-        }
-        checked += 1;
-    }
-
-    if failed > 0 {
-        eprintln!(
-            "tgrep: file list cache stale ({} of {} samples changed), falling back to walk",
-            failed, checked
-        );
-        return None;
-    }
-
-    // Cache is valid — return the file list
-    let files: Vec<PathBuf> = filtered.iter().map(|f| PathBuf::from(&f.path)).collect();
-    // Only log cache hits under TGREP_DEBUG; normal operation should be silent.
-    if std::env::var("TGREP_DEBUG").is_ok() {
-        eprintln!(
-            "tgrep: using cached file list ({} files, verified {} samples)",
-            files.len(),
-            checked
-        );
-    }
-    Some(files)
-}
-
-/// Collect unindexed files using the file list cache if available,
-/// falling back to filesystem walk if the cache is missing or stale.
-fn collect_unindexed_files_fast(
-    paths: &[PathBuf],
-    indexed_paths: &std::collections::HashSet<PathBuf>,
-    walk_hidden: bool,
-    globs: &[String],
-    threads: usize,
-    state_dir: &Path,
-) -> Vec<PathBuf> {
-    // Try the file list cache first
-    if let Some(cached_files) = try_load_file_cache(state_dir, paths, walk_hidden) {
-        // Filter out indexed files
-        return cached_files
-            .into_iter()
-            .filter(|p| !indexed_paths.contains(p))
-            .collect();
-    }
-
-    // Fall back to walking the filesystem
-    let all_files = collect_all_files(paths, walk_hidden, globs, threads);
-    all_files
-        .into_iter()
-        .filter(|p| !indexed_paths.contains(p))
-        .collect()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1613,6 +1505,16 @@ fn collect_unindexed_files_fast(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speculative_prefetch_is_opt_in() {
+        assert!(!prefetch_setting_enabled(None));
+        assert!(!prefetch_setting_enabled(Some(std::ffi::OsStr::new("0"))));
+        assert!(!prefetch_setting_enabled(Some(std::ffi::OsStr::new(
+            "true"
+        ))));
+        assert!(prefetch_setting_enabled(Some(std::ffi::OsStr::new("1"))));
+    }
 
     #[test]
     fn test_extract_unique_trigrams() {
@@ -1752,10 +1654,554 @@ mod tests {
     }
 
     #[test]
-    fn test_is_all_lowercase_ascii() {
-        assert!(is_all_lowercase_ascii("hello"));
-        assert!(is_all_lowercase_ascii("hello world 123"));
-        assert!(!is_all_lowercase_ascii("Hello"));
-        assert!(!is_all_lowercase_ascii("helloWorld"));
+    fn test_smart_case_literal_proof() {
+        assert!(smart_case_may_ignore_case("hello", false));
+        assert!(smart_case_may_ignore_case("hello world 123", false));
+        assert!(!smart_case_may_ignore_case("Hello", false));
+        assert!(!smart_case_may_ignore_case("helloWorld", false));
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn alternation_cannot_require_only_one_branch() {
+        assert!(matches!(
+            plan_query("foo|bar", false, false, false),
+            QueryPlan::Streaming
+        ));
+    }
+    #[test]
+    fn inline_case_folding_cannot_require_lowercase_trigram() {
+        assert!(matches!(
+            plan_query("(?i)foo", false, false, false),
+            QueryPlan::Streaming
+        ));
+    }
+    #[test]
+    fn word_regex_is_not_a_whole_token() {
+        assert!(!matches!(
+            plan_query("foo.*bar", false, false, true),
+            QueryPlan::HashIndex { .. }
+        ));
+    }
+    #[test]
+    fn optional_branch_does_not_restrict_matches() {
+        assert!(matches!(
+            plan_query("(?:longliteral)?x", false, false, false),
+            QueryPlan::Streaming
+        ));
+    }
+}
+
+#[cfg(test)]
+mod manifest_root_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Barrier,
+    };
+
+    static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+    struct Fixture {
+        state: PathBuf,
+        old: Vec<String>,
+        new: Vec<String>,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let state = std::env::temp_dir().join(format!(
+                "hax-search-root-map-{}-{}",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&state).unwrap();
+            let old = vec![
+                state.join("old first").to_string_lossy().into_owned(),
+                state.join("old-second").to_string_lossy().into_owned(),
+            ];
+            let new = vec![
+                state.join("new-second").to_string_lossy().into_owned(),
+                state.join("new first").to_string_lossy().into_owned(),
+            ];
+            Self { state, old, new }
+        }
+        fn progress(&self, roots: &[String]) {
+            fs::write(
+                self.state.join("build.json"),
+                serde_json::to_vec(&serde_json::json!({"roots": roots, "status": "completed"}))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        fn manifest(&self, roots: Option<Vec<String>>) {
+            store::write_manifest(
+                &self.state,
+                &store::Manifest {
+                    generation: 7,
+                    segments: vec!["seg_00000007.tgs".to_string()],
+                    profile_hash: 91,
+                    roots,
+                },
+            )
+            .unwrap();
+        }
+        fn migrate(&self) {
+            let current = store::load_manifest(&self.state).unwrap();
+            store::write_manifest(
+                &self.state,
+                &store::Manifest {
+                    generation: current.generation,
+                    segments: current.segments,
+                    profile_hash: current.profile_hash,
+                    roots: Some(self.old.clone()),
+                },
+            )
+            .unwrap();
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.state);
+        }
+    }
+
+    #[test]
+    fn delayed_legacy_reader_uses_roots_captured_before_manifest() {
+        let fixture = Fixture::new();
+        fixture.progress(&fixture.old);
+        fixture.manifest(None);
+        let reader_ready = Barrier::new(2);
+        let writer_done = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                reader_ready.wait();
+                fixture.migrate();
+                fixture.progress(&fixture.new);
+                writer_done.wait();
+            });
+            let (snapshot, roots) = load_index_snapshot(&fixture.state, |state| {
+                let snapshot = store::load_manifest(state);
+                reader_ready.wait();
+                writer_done.wait();
+                snapshot
+            });
+            let snapshot = snapshot.unwrap();
+            assert!(snapshot.roots.is_none());
+            assert_eq!(snapshot.generation, 7);
+            assert_eq!(roots, Some(fixture.old.clone()));
+            assert_eq!(
+                store::load_manifest(&fixture.state).unwrap().roots,
+                Some(fixture.old.clone())
+            );
+        });
+    }
+
+    #[test]
+    fn bound_old_roots_override_new_progress_roots() {
+        let fixture = Fixture::new();
+        fixture.manifest(Some(fixture.old.clone()));
+        fixture.progress(&fixture.new);
+        let (snapshot, roots) = load_index_snapshot(&fixture.state, store::load_manifest);
+        assert_eq!(snapshot.unwrap().profile_hash, 91);
+        assert_eq!(roots, Some(fixture.old.clone()));
+    }
+
+    #[test]
+    fn final_manifest_roots_override_delayed_old_legacy_snapshot() {
+        let fixture = Fixture::new();
+        fixture.progress(&fixture.old);
+        fixture.manifest(None);
+        let (snapshot, roots) = load_index_snapshot(&fixture.state, |state| {
+            fixture.migrate();
+            fixture.progress(&fixture.new);
+            store::publish_manifest_with_roots(
+                state,
+                &["seg_00000008.tgs".to_string()],
+                8,
+                &fixture.new,
+            )
+            .unwrap();
+            let snapshot = store::load_manifest(state);
+            fs::write(state.join("build.json"), serde_json::to_vec(&serde_json::json!({
+                "roots": [fixture.state.join("third-root").to_string_lossy()], "status": "running"
+            })).unwrap()).unwrap();
+            snapshot
+        });
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot.generation, 8);
+        assert_eq!(snapshot.segments, vec!["seg_00000008.tgs".to_string()]);
+        assert_eq!(roots, Some(fixture.new.clone()));
+    }
+
+    #[test]
+    fn empty_bound_roots_are_authoritative_not_legacy_fallback() {
+        let fixture = Fixture::new();
+        fixture.progress(&fixture.old);
+        fixture.manifest(Some(Vec::new()));
+        let (_, roots) = load_index_snapshot(&fixture.state, store::load_manifest);
+        assert!(roots.is_none());
+    }
+
+    #[test]
+    fn bound_roots_work_without_progress_file() {
+        let fixture = Fixture::new();
+        fixture.manifest(Some(fixture.old.clone()));
+        let (_, roots) = load_index_snapshot(&fixture.state, store::load_manifest);
+        assert_eq!(roots, Some(fixture.old.clone()));
+    }
+
+    #[test]
+    fn legacy_manifest_preserves_exact_root_order() {
+        let fixture = Fixture::new();
+        fixture.progress(&fixture.old);
+        fixture.manifest(None);
+        let (snapshot, roots) = load_index_snapshot(&fixture.state, store::load_manifest);
+        assert!(snapshot.unwrap().roots.is_none());
+        assert_eq!(roots, Some(fixture.old.clone()));
+    }
+
+    #[test]
+    fn noncompleted_legacy_progress_is_unavailable() {
+        let fixture = Fixture::new();
+        fixture.manifest(None);
+        for status in [
+            serde_json::json!("running"),
+            serde_json::json!("paused"),
+            serde_json::json!("failed"),
+            serde_json::Value::Null,
+            serde_json::json!(7),
+        ] {
+            fs::write(
+                fixture.state.join("build.json"),
+                serde_json::to_vec(&serde_json::json!({"roots": fixture.old, "status": status}))
+                    .unwrap(),
+            )
+            .unwrap();
+            let (_, roots) = load_index_snapshot(&fixture.state, store::load_manifest);
+            assert!(roots.is_none());
+        }
+    }
+    #[test]
+    fn missing_malformed_or_relative_legacy_roots_are_unavailable() {
+        let fixture = Fixture::new();
+        fixture.manifest(None);
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"roots": null}),
+            serde_json::json!({"roots": [7]}),
+            serde_json::json!({"roots": [""]}),
+            serde_json::json!({"roots": ["relative-root"]}),
+        ] {
+            fs::write(
+                fixture.state.join("build.json"),
+                serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
+            let (_, roots) = load_index_snapshot(&fixture.state, store::load_manifest);
+            assert!(roots.is_none());
+        }
+        fs::write(fixture.state.join("build.json"), b"{").unwrap();
+        assert!(load_index_snapshot(&fixture.state, store::load_manifest)
+            .1
+            .is_none());
+        fs::remove_file(fixture.state.join("build.json")).unwrap();
+        assert!(load_index_snapshot(&fixture.state, store::load_manifest)
+            .1
+            .is_none());
+    }
+    #[test]
+    fn relative_bound_roots_never_fall_back_to_legacy_or_cwd() {
+        let fixture = Fixture::new();
+        fixture.progress(&fixture.old);
+        fixture.manifest(Some(vec!["relative-root".to_string()]));
+        assert!(load_index_snapshot(&fixture.state, store::load_manifest)
+            .1
+            .is_none());
+    }
+    #[test]
+    fn empty_root_map_is_valid_for_an_empty_segment_set() {
+        let fixture = Fixture::new();
+        fixture.progress(&fixture.old);
+        store::write_manifest(
+            &fixture.state,
+            &store::Manifest {
+                generation: 7,
+                segments: Vec::new(),
+                profile_hash: 91,
+                roots: Some(Vec::new()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            load_index_snapshot(&fixture.state, store::load_manifest).1,
+            Some(Vec::new())
+        );
+    }
+    #[test]
+    fn root_only_absolute_legacy_map_remains_compatible() {
+        let fixture = Fixture::new();
+        fixture.manifest(None);
+        fs::write(
+            fixture.state.join("build.json"),
+            serde_json::to_vec(&serde_json::json!({"roots": fixture.old})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_index_snapshot(&fixture.state, store::load_manifest).1,
+            Some(fixture.old.clone())
+        );
+    }
+
+    fn fifo_progress(fixture: &Fixture) {
+        let path = std::ffi::CString::new(
+            fixture
+                .state
+                .join("build.json")
+                .as_os_str()
+                .as_encoded_bytes(),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
+    #[test]
+    fn fifo_snapshot_child() {
+        let Some(state) = std::env::var_os("TGREP_SEARCH_TEST_FIFO_STATE") else {
+            return;
+        };
+        let expected: Option<Vec<String>> =
+            serde_json::from_str(&std::env::var("TGREP_SEARCH_TEST_FIFO_ROOTS").unwrap()).unwrap();
+        let (snapshot, roots) = load_index_snapshot(Path::new(&state), store::load_manifest);
+        assert_eq!(snapshot.unwrap().generation, 7);
+        assert_eq!(roots, expected);
+    }
+
+    fn check_fifo_snapshot(bound: bool) {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let fixture = Fixture::new();
+        let roots = bound.then(|| fixture.old.clone());
+        fixture.manifest(roots.clone());
+        fifo_progress(&fixture);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "search::manifest_root_tests::fifo_snapshot_child",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &fixture.state)
+            .env("XDG_STATE_HOME", &fixture.state)
+            .env("XDG_CONFIG_HOME", &fixture.state)
+            .env("XDG_CACHE_HOME", &fixture.state)
+            .env("XDG_DATA_HOME", &fixture.state)
+            .env("XDG_RUNTIME_DIR", &fixture.state)
+            .env("TGREP_STATE_DIR", &fixture.state)
+            .env("TMPDIR", &fixture.state)
+            .env("TGREP_SEARCH_TEST_FIFO_STATE", &fixture.state)
+            .env(
+                "TGREP_SEARCH_TEST_FIFO_ROOTS",
+                serde_json::to_string(&roots).unwrap(),
+            )
+            .current_dir(&fixture.state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("search build metadata FIFO waited for a writer");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn fifo_legacy_progress_cannot_supply_root_metadata() {
+        check_fifo_snapshot(false);
+    }
+
+    #[test]
+    fn bound_manifest_roots_remain_authoritative_with_fifo_progress() {
+        check_fifo_snapshot(true);
+    }
+}
+
+#[cfg(test)]
+mod unicode_fold_planner_tests {
+    use super::*;
+
+    #[test]
+    fn case_insensitive_queries_never_use_raw_byte_indexes() {
+        for pattern in ["kilo", "kilogram", "longsword", "ssssss", r"\x6bilo"] {
+            for fixed in [false, true] {
+                for word in [false, true] {
+                    assert!(matches!(
+                        plan_query(pattern, fixed, true, word),
+                        QueryPlan::Streaming
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_inline_casefold_classes_cannot_require_ascii_bytes() {
+        for pattern in [
+            "(?i)kilo",
+            "(?i)kilogram",
+            "(?i)longsword",
+            "(?i)ssssss",
+            "(?i:kilogram)",
+            r"(?i)\x6bilo",
+        ] {
+            assert!(
+                matches!(
+                    plan_query(pattern, false, false, false),
+                    QueryPlan::Streaming
+                ),
+                "{}",
+                pattern
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_regex_literals_are_decoded_before_indexing() {
+        for (pattern, literal) in [
+            (r"\x6bilo", "kilo"),
+            (r"kilo\.gram", "kilo.gram"),
+            (r"kilo\(gram\)", "kilo(gram)"),
+        ] {
+            match plan_query(pattern, false, false, false) {
+                QueryPlan::Indexed { grams } => {
+                    assert_eq!(grams, extract_unique_trigrams(literal.as_bytes()))
+                }
+                _ => panic!("expected exact decoded literal for {}", pattern),
+            }
+        }
+    }
+
+    #[test]
+    fn dot_alternation_and_optional_literals_never_require_a_branch() {
+        for pattern in [
+            "ki.o",
+            "kilogram|longsword",
+            "(?:kilogram)?x",
+            "(?:kilogram|longsword)",
+        ] {
+            assert!(
+                matches!(
+                    plan_query(pattern, false, false, false),
+                    QueryPlan::Streaming
+                ),
+                "{}",
+                pattern
+            );
+        }
+        assert_eq!(extract_regex_literal("kilo.gram").as_deref(), Some("gram"));
+        assert_eq!(
+            extract_regex_literal("(?i:k)ilo123456").as_deref(),
+            Some("ilo123456")
+        );
+    }
+}
+
+#[cfg(test)]
+mod smart_case_literal_tests {
+    use super::*;
+
+    #[test]
+    fn syntax_uppercase_cannot_disable_smart_case_fold() {
+        for pattern in [r"\x6Bilo", r"\u{006B}ilo", "(?U)kilo", r"kilo\p{Ll}?"] {
+            let may_fold = smart_case_may_ignore_case(pattern, false);
+            assert!(may_fold, "{}", pattern);
+            assert!(matches!(
+                plan_query(pattern, false, may_fold, false),
+                QueryPlan::Streaming
+            ));
+        }
+    }
+
+    #[test]
+    fn decoded_uppercase_literals_prove_exact_smart_case() {
+        for pattern in [
+            r"\x4Bilo",
+            r"\u{004B}ilo",
+            "Kilo",
+            "Éllo",
+            "(?:Kilo)?x",
+            "Kilo|word",
+        ] {
+            assert!(!smart_case_may_ignore_case(pattern, false), "{}", pattern);
+        }
+        assert!(smart_case_may_ignore_case("[A-Z]kilo", false));
+    }
+
+    #[test]
+    fn fixed_smart_case_uses_actual_unicode_characters() {
+        assert!(!smart_case_may_ignore_case(r"\x6Bilo", true));
+        assert!(!smart_case_may_ignore_case("Kilo", true));
+        assert!(!smart_case_may_ignore_case("Éllo", true));
+        assert!(smart_case_may_ignore_case("éllo", true));
+    }
+}
+
+#[cfg(test)]
+mod display_alias_tests {
+    use super::*;
+    #[test]
+    fn indexed_identity_expands_every_distinct_display_spelling() {
+        let canonical = PathBuf::from("/synthetic/root/a.txt");
+        let alias = PathBuf::from("/synthetic/root/./a.txt");
+        let visible = std::collections::HashMap::from([(
+            canonical.clone(),
+            vec![canonical.clone(), alias.clone()],
+        )]);
+        let paths = expand_visible_aliases([canonical.clone(), canonical.clone()], &visible);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].as_os_str(), canonical.as_os_str());
+        assert_eq!(paths[1].as_os_str(), alias.as_os_str());
+    }
+}
+
+#[cfg(test)]
+mod configured_case_tests {
+    use super::*;
+    #[test]
+    fn explicit_cli_case_mode_overrides_config_defaults() {
+        let ignore = parse_ripgrep_config_content("--ignore-case\n");
+        assert_eq!(effective_case_mode(true, false, &ignore), (true, false));
+        let smart = parse_ripgrep_config_content("--smart-case\n");
+        assert_eq!(effective_case_mode(false, true, &smart), (false, true));
+        assert_eq!(effective_case_mode(false, false, &smart), (true, false));
+    }
+
+    #[test]
+    fn final_case_flag_in_config_wins() {
+        for (text, expected) in [
+            ("-i\n-S\n", (true, false)),
+            ("-S\n-i\n", (false, true)),
+            ("--ignore-case\n--case-sensitive\n", (false, false)),
+            ("-s\n--ignore-case\n", (false, true)),
+        ] {
+            let config = parse_ripgrep_config_content(text);
+            assert_eq!(effective_case_mode(false, false, &config), expected);
+        }
     }
 }

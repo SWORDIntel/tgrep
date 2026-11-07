@@ -225,27 +225,36 @@ def graph_trial_distribution(data):
     fig, ax = plt.subplots(figsize=(12, 6))
     positions = []
     boxes = []
+    conditions = []
+    tick_positions = []
     pos = 0
     for n in subset:
+        start = pos
         warm = data[n]["warm"]["tgrep"]
         if warm:
             boxes.append(warm)
+            conditions.append("warm")
             positions.append(pos)
             pos += 1.5
         cold = data[n]["cold"]["tgrep"]
         if cold:
             boxes.append(cold)
+            conditions.append("cold")
             positions.append(pos)
             pos += 1.5
+        tick_positions.append((start + pos - 1.5) / 2)
 
     bp = ax.boxplot(boxes, positions=positions, widths=1.0, patch_artist=True)
-    for i, patch in enumerate(bp["boxes"]):
-        # Alternate cold (red) and warm (amber)
-        patch.set_facecolor("#CC0000" if i % 2 == 0 else "#FFAA00")
+    for condition, patch, median_line in zip(conditions, bp["boxes"], bp["medians"]):
+        color = "#CC0000" if condition == "cold" else "#FFAA00"
+        patch.set_facecolor(color)
+        median_line.set_color(color)
         patch.set_alpha(0.7)
 
     ax.set_ylabel("Latency (ms)")
     ax.set_title("tgrep Latency Distribution (cold=red, warm=amber)")
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(subset, rotation=45, ha="right", fontsize=8)
     ax.set_yscale("log")
     ax.set_ylim(bottom=1)
     ax.grid(axis="y", alpha=0.3)
@@ -258,8 +267,8 @@ def graph_trial_distribution(data):
 def generate_summary_table(data):
     """Generate a markdown summary table from the benchmark data."""
     lines = []
-    lines.append("| Pattern | Category | tgrep cold (ms) | tgrep warm (ms) | rg (ms) | Cold speedup | Warm speedup | Files |")
-    lines.append("|---------|----------|-----------------|-----------------|---------|-------------|-------------|-------|")
+    lines.append("| Pattern | Category | tgrep cold (ms) | tgrep warm (ms) | rg cold (ms) | rg warm (ms) | Cold speedup | Warm speedup | Files |")
+    lines.append("|---------|----------|-----------------|-----------------|--------------|--------------|-------------|-------------|-------|")
     for name in sorted(data):
         d = data[name]
         cat = d["category"]
@@ -267,9 +276,12 @@ def generate_summary_table(data):
         t_warm = median(d["warm"]["tgrep"]) if d["warm"]["tgrep"] else 0
         rg = median(d["cold"]["rg"]) if d["cold"]["rg"] else 0
         cold_sp = f"{rg/max(t_cold,1):.1f}x" if t_cold else "-"
-        warm_sp = f"{rg/max(t_warm,1):.1f}x" if t_warm else "-"
+        rg_warm = median(d["warm"]["rg"]) if d["warm"]["rg"] else 0
+        warm_sp = f"{rg_warm/max(t_warm,1):.1f}x" if t_warm and rg_warm else "-"
         files = d["cold"]["files"]
-        lines.append(f"| {name} | {cat} | {t_cold:.0f} | {t_warm:.0f} | {rg:.0f} | {cold_sp} | {warm_sp} | {files} |")
+        lines.append(f"| {name} | {cat} | {t_cold:.0f} | {t_warm:.0f} | {rg:.0f} | {rg_warm:.0f} | {cold_sp} | {warm_sp} | {files} |")
+    lines += ["", "Ratios are rg/tgrep medians within each CSV condition. These are historical timings;",
+              "cold/warm label the first application-cache miss/repeated queries, not controlled filesystem caches."]
     return "\n".join(lines)
 
 

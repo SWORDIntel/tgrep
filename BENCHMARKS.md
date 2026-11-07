@@ -1,5 +1,19 @@
 # tgrep Benchmark Results
 
+## Evidence limits
+
+These are historical recorded timings, not a current performance certification. The original
+comprehensive runner cleared only the tgrep application result cache; filesystem cache and ZFS ARC
+were uncontrolled. It always ran tgrep before rg and did not verify result equality. Its
+empty-output counting bug recorded one file for an absent query. The CSV lacks raw output and
+exit statuses; runner fixes do not retroactively validate these recorded counts or correctness.
+
+The published historical summary used the first rg observation divided by the warm tgrep median.
+The corrected graph generator instead uses condition-matched rg/tgrep medians and displays both rg
+baselines. Regenerating its tables and charts recomputes the existing CSV; it does not run new
+benchmarks or establish current performance. CSV `cold` means an application-cache miss, not a
+controlled filesystem-cache condition.
+
 ## Environment
 
 - **CPU:** 8 cores (4 threads for search)
@@ -8,7 +22,7 @@
 - **Index:** 75 segments, ~200M postings, mmap `.qwi` word index (240 MB)
 - **Index state:** `/tmp/tgrep_qwi_mmap`
 - **ripgrep config:** `~/.ripgreprc` with `--smart-case`, `--hidden`, `--glob=!.git/*`, `--threads=4`
-- **Trials:** 10 per pattern (1 cold + 9 warm, alternating tgrep/rg)
+- **Trials:** 10 per pattern (1 application-cache miss + 9 repeated queries, tgrep before rg)
 - **Date:** September 2026 (Post-Phase 11 — index-trust optimization + comprehensive benchmarks)
 
 ## Graphs
@@ -79,6 +93,8 @@ Run `python3 benchmarks/make_graphs.py` to regenerate from CSV data.
 | `benchmarks/run_benchmarks.sh` | Comprehensive benchmark runner (19 patterns, 10 trials) |
 | `benchmarks/make_graphs.py` | Generate PNG graphs from CSV results |
 | `benchmarks/benchmark_results.csv` | Raw CSV data from latest benchmark run |
+| `benchmarks/bench_prefetch_ab.py` | Paired speculative-prefetch A/B runner; requires sudo page-cache reset |
+| `benchmarks/prefetch_ab.csv` | Exploratory page-cache-cold, ARC-warm A/B samples |
 | `benchmarks/summary_table.md` | Auto-generated markdown summary table |
 
 ```bash
@@ -88,6 +104,40 @@ Run `python3 benchmarks/make_graphs.py` to regenerate from CSV data.
 # Generate graphs
 python3 benchmarks/make_graphs.py
 ```
+
+## Speculative Prefetch A/B (Exploratory)
+
+The paired runner compares `posix_fadvise(WILLNEED)` enabled and disabled while
+clearing the tgrep result cache and Linux page cache before every run. It
+alternates which mode runs first and checks that both modes return identical
+file lists. Example:
+
+```bash
+python3 benchmarks/bench_prefetch_ab.py /path/to/corpus Function \
+  --state /tmp/tgrep-state --tgrep ./target/release/tgrep --trials 5 \
+  --output benchmarks/prefetch_ab.csv
+```
+
+The available host did not have the historical 26K-file corpus. An exploratory
+run used `/home/john/corpus_staging/t320` (199 files, 21 MiB allocated, 101 MB
+logical source) on the `rpool` ZFS root. Pattern `Function` matched 151 files.
+With five paired trials, median latency was 167.744 ms with prefetch and
+151.766 ms without it; both modes returned identical file lists. Raw timings
+are in `benchmarks/prefetch_ab.csv`. The sample is too small and noisy to show
+a prefetch benefit; the enabled median was about 10.5% slower, with one
+287.783 ms enabled outlier.
+
+Based on this result, speculative prefetch is opt-in with `TGREP_PREFETCH=1`;
+it is disabled by default until a representative cold-storage benchmark shows a
+benefit. The A/B runner sets this variable only for enabled trials.
+
+This is not a cold-storage benchmark. The runner drops the Linux page cache but
+does not clear ZFS ARC, and that ZFS root kept lower-level cached data available.
+The run therefore measures page-cache-cold, ARC-warm behavior on a small corpus,
+not cold search performance on the intended full corpus. The earlier 30–50%
+cold-search reduction estimate is unverified. A representative result requires
+the full corpus and a controlled ZFS ARC/device-cache procedure on an isolated
+benchmark host.
 
 ## Correctness Verification
 
@@ -198,11 +248,13 @@ significantly exceed the target — tgrep is 4.9–8.8x faster than rg.
 | -w main | 1583ms | 1499ms | 1.1x slower | FAIL |
 | -w nonexistent_xyz | 2545ms | 2219ms | 1.1x slower | FAIL |
 
-**Regression identified:** The hash index `.thi` files grew to 339MB total
-(was 10MB in Phase 8) because the corpus now has 900K unique tokens per
-segment. Loading 339MB of hash index data per search is slower than rg's
-direct scan. Future fix: mmap-based hash index or per-token bucket lookup
-to avoid loading the entire index into memory.
+**Historical regression:** The hash index `.thi` files grew to 339MB total
+(was 10MB in Phase 8) because the corpus had 900K unique tokens per segment.
+The old fallback loaded the complete sidecar for a query. Current code uses
+mmap-backed QWI result buffers that grow with matches and avoids loading legacy
+`.thi` for ordinary tokens when QWI is unavailable by using trigram candidates.
+The historical corpus is unavailable, so the performance effect of this fix
+has not been measured.
 
 ### Case-insensitive patterns (streaming fallback)
 
@@ -222,9 +274,13 @@ is within 10% of rg as expected.
 | Pattern | tgrep median | rg median | Speedup |
 |---------|-------------|-----------|---------|
 | RareNeedle (absent) | 114ms | 630ms | **5.5x faster** |
-| KeystoneTrigram (absent) | ~118ms | ~640ms | **4.7x faster** |
+| KeystoneTrigram (absent) | ~118ms | ~640ms | **~5.4x (computed)** |
 | Struct (238 matches) | 148ms | 686ms | **4.6x faster** |
 | terminal (2011, streaming) | 1347ms | 782ms | 1.7x slower |
+
+The ~5.4x KeystoneTrigram ratio is 640/118 using the displayed approximate historical timings.
+The original 4.7x report does not reconcile with those numbers; this arithmetic correction is not
+a new measurement.
 
 ### Phase 8 Hash Index Fast Path (5 trials, smaller corpus)
 
@@ -233,10 +289,10 @@ These results were from a smaller corpus with ~10MB total `.thi` files.
 
 | Pattern | tgrep median | rg median | Speedup |
 |---------|-------------|-----------|---------|
-| -w Terminal (679 matches) | 122ms | 4395ms | **374x faster** |
-| -w Struct (77 matches) | 68ms | 4510ms | **499x faster** |
-| -w main (1901 matches) | 11ms | 5926ms | **1069x faster** |
-| -w nonexistent_xyz (absent) | 141ms | 5407ms | **670x faster** |
+| -w Terminal (679 matches) | 122ms | 4395ms | **36.0x faster** |
+| -w Struct (77 matches) | 68ms | 4510ms | **66.3x faster** |
+| -w main (1901 matches) | 11ms | 5926ms | **538.7x faster** |
+| -w nonexistent_xyz (absent) | 141ms | 5407ms | **38.3x faster** |
 
 ## Analysis
 
@@ -255,9 +311,10 @@ These results were from a smaller corpus with ~10MB total `.thi` files.
 1. **Smart-case streaming:** All-lowercase patterns with smart-case become
    case-insensitive, falling back to streaming (trigram index is case-sensitive).
    This affects common search patterns like "terminal".
-2. **Hash index scaling:** The `.thi` hash index files grew to 339MB (900K
-   tokens/segment) on the full corpus, making word-search slower than rg.
-   The hash index load is O(n) in index size, not O(1) per query.
+2. **Historical hash index scaling:** `.thi` files grew to 339MB (900K
+   tokens/segment) on the full corpus and the old fallback made word searches
+   slower than rg. Current code avoids full `.thi` loads for ordinary tokens
+   when QWI is missing; the performance effect needs a representative rerun.
 3. **Segment count:** 75 segments means 75 file opens + mmaps per search.
    Compaction would reduce this overhead.
 
@@ -275,9 +332,9 @@ These results were from a smaller corpus with ~10MB total `.thi` files.
 | Fresh build (clear old segments) | Fixed duplicate trigram data from interrupted builds |
 | File list cache (Phase 7) | Eliminated ~500ms filesystem walk in full mode |
 | Subdirectory path filtering | Fixed subdir search returning all indexed candidates |
-| Hash index fast path (Phase 8) | 374–1069x faster than rg for whole-word queries (small corpus) |
+| Hash index fast path (Phase 8) | 36–539x ratios in historical small-corpus timings |
 | Binary search hash lookup | Fixed signed/unsigned comparison bug in hash index search |
-| Parallel hash index loading (Phase 11) | 4-thread .thi loading (still bounded by 339MB I/O) |
+| Parallel hash index loading (Phase 11) | Historical 4-thread `.thi` load; current fallback avoids full loads for ordinary tokens |
 
 ## Raw Data
 

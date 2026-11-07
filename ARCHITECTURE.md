@@ -6,10 +6,17 @@ is to beat ripgrep by avoiding most source-file reads.
 
 ## Design
 
+This document combines design targets with historical implementation snapshots. BM25 ranking,
+QIHSE backup and segment-compaction integration, context/JSON output, and `--one-file-system` are
+not implemented. The `index compact` command currently reindexes its source roots and removes
+obsolete segment files; it does not merge segments. Consult `src/main.rs`, `build.rs`, and
+`src/lib.rs` for current commands and linked components. Live-file correctness and search-cache
+validity require independent regression checks.
+
 - One Rust executable with a small C interface to KEYSTONE and QIHSE helpers.
 - File-level byte trigrams stored in compressed, immutable segments.
 - One live-filesystem search mode, with a streaming path for uncovered files.
-- An incremental builder with bounded memory, adjustable speed, and resume.
+- A source reindexer with cooperative pause requests and atomic manifest replacement.
 - Everything stored in `/rpool/data/db/tgrep` on one ZFS dataset.
 
 ```mermaid
@@ -30,7 +37,7 @@ flowchart LR
 | CPU | Eight Xeon E5-2407 cores; SSE4.2 and AVX1 |
 | Memory | 86 GiB |
 | Search baseline | ripgrep 15.2.0, with PCRE2 available |
-| Primary corpus | `/home/john` on `rpool/ROOT/pve-1`; `--one-file-system`, no symlink following |
+| Primary corpus | `/home/john` on `rpool/ROOT/pve-1`; no symlink following |
 | Worker ceiling | Four across tgrep's active work |
 | Database parent | `rpool/data/db`, mounted at `/rpool/data/db` |
 | Parent quota | 45 GiB shared with QIHSE and KEYSTONE |
@@ -46,18 +53,15 @@ checkpoints survive reboot. [OpenZFS sync property](https://openzfs.github.io/op
 /rpool/data/db/tgrep/
   manifest.json       roots, index profile, generation, published segment names
   build.json          build options, running/paused status, progress
-  rebuild/manifest.json  completed batches of an in-progress full rebuild
   segments/           immutable .tgs files
   tmp/                unfinished segment and replacement-manifest files
-  writer.lock         one builder or compactor
-  manifest.lock       brief coordination for opening/publishing segments
-  PAUSE               pause request
+  writer.lock         one builder or recovery/compaction command
+  pause.request       cooperative pause request for an active build
 ```
 
-Keep at least 2 GiB free inside tgrep's allowance. Before each segment or merge,
-check both the child quota and the parent dataset's available space. Stop the
-build when output will not fit. Completed segments remain usable.
-Source files stay where they are. Build checkpoints stay out of `/scratch`.
+Builds stage segments in the state directory and publish the manifest after the
+full source reindex finishes. Source files stay in place. Resource settings are
+cooperative and do not provide a disk quota check.
 
 ## Reuse And Code Layout
 
@@ -70,41 +74,14 @@ indexing with collision verification, tar.zst streaming search with persistent
 offset indices, anchor seeding for warm-start interpolation, and NST
 cache-line/prefetch/DRAM-locality/branch-prediction tuning infrastructure.
 
-QIHSE contributes positioned file I/O, locking, sync, integer encoding, and
-checksum helpers. It also provides a full pre-indexing infrastructure that tgrep
-leverages instead of reinventing:
-
-- **Index manager** (`qihse_index_manager`): BTREE, HASH, VECTOR_HNSW, and
-  FTS_INVERTED index types with bulk load (`qihse_index_bulk_load`).
-  BTREE indexes file metadata (inode, mtime, size) for fast refresh lookups.
-  HASH indexes full path strings for exact-file queries.
-- **Index scan executor** (`qihse_index_scan`): EQ, RANGE, and PREFIX predicates
-  over pre-built indexes, returning row IDs in batches.
-- **FTS persistence** (`qihse_fts_save` / `qihse_fts_load`): authorization-aware
-  save/load of full-text search indexes. Used for persistent BM25 ranking of
-  indexed documents, not as the primary substring filter.
-- **WAL and crash recovery** (`qihse_vfs_wal`, `qihse_recovery`): write-ahead
-  logging with analysis/redo/undo replay and checkpoint. tgrep's build
-  checkpoints use QIHSE's WAL instead of a custom journal, so interrupted builds
-  survive crashes with transactional semantics.
-- **Compaction** (`qihse_compaction`): background compaction for merging
-  segments, reclaiming space from superseded path records, and TTL sweep of
-  stale file metadata. tgrep's segment compaction delegates to QIHSE's
-  compaction framework.
-- **Backup and restore** (`qihse_backup`): full, incremental, and WAL backups
-  with checksum verification. tgrep index backups use QIHSE's backup API.
-- **Self-optimization DB** (`qihse_search`): persistent learned search
-  configurations keyed by data signature. tgrep records posting-list
-  selectivity, anchor hit rates, and backend calibration results so repeated
-  queries benefit from prior measurements.
-- **KEYSTONE bridge** (`qihse_keystone`): dirty-log ingestion, anchor search,
-  and lower/upper-bound queries bridging QIHSE storage with KEYSTONE
-  acceleration.
-
-tgrep owns its trigram segment format and file metadata schema. QIHSE manages
-persistence, recovery, compaction, and backup. KEYSTONE manages search
-acceleration. The boundary is: tgrep defines what to index and how to query;
-KEYSTONE and QIHSE provide the indexed storage and crash-safe infrastructure.
+QIHSE contributes native helpers used by the current implementation: WAL records
+for segment transactions, atomic file operations, the word-index sidecar,
+search-result cache, and optimization database. WAL recovery identifies
+committed segment records and cleans up unreferenced segment files; it does not
+replay a build or publish a manifest. QIHSE's index manager, FTS, backup, and
+generic compaction APIs are not integrated into tgrep's index lifecycle.
+KEYSTONE supplies search acceleration; tgrep owns its segment format and
+manifest.
 
 Use ripgrep's `ignore`, `grep-regex`, `grep-searcher`, and `grep-printer` libraries
 for traversal, matching, and output. Use `regex-syntax` for query analysis.
@@ -121,7 +98,7 @@ native/               C wrappers and selected native sources
 benches/              ripgrep comparison runner (legacy stub)
 ```
 
-## Current Implementation Status
+## Historical Implementation Snapshot
 
 Phases 0–5 complete. The search tool is functional and verified against rg.
 
@@ -166,11 +143,16 @@ faster than rg (was 1.5–1.7x).
 
 Phase 8 added a hash index fast path for whole-word queries (`-w` flag). When
 the pattern is a single word token, the hash index provides O(log n) candidate
-lookup instead of trigram intersection, achieving 374–1069x speedup over
+lookup instead of trigram intersection, with historical timing ratios of 36–539x over
 `rg -w`. The hash index is persisted as `.thi` sidecar files alongside each
 `.tgs` segment (~10MB total for 75 segments).
 
-## KEYSTONE/QIHSE Pre-Indexing
+## Historical KEYSTONE/QIHSE Pre-Indexing Proposal
+
+The following snapshot describes planned integrations, not the current build or
+query path. In particular, tgrep does not maintain QIHSE BTREE/HASH metadata
+indexes or FTS indexes, nor does it index tar.zst archives or build segments
+incrementally.
 
 tgrep pre-indexes the corpus using a combination of KEYSTONE and QIHSE index
 types, built ahead of time and maintained incrementally. The trigram index is
@@ -199,10 +181,8 @@ maintenance paths.
 4. Insert file metadata (path, inode, size, mtime, ctime) into QIHSE's index
    manager: BTREE on (mtime, inode) for range-based refresh, HASH on path for
    exact lookup.
-5. Flush trigram segments to disk at the configured boundaries. Use QIHSE's WAL
-   to record each segment publication so crash recovery can replay or undo
-   partial builds. Save the hash index as a `.thi` sidecar alongside each
-   `.tgs` segment.
+5. Flush trigram segments to disk at the configured boundaries. Save the hash
+   index as a `.thi` sidecar alongside each `.tgs` segment.
 6. Seed KEYSTONE anchor tables with `keystone_anchor_seed_batch` for warm-start
    interpolation on the sorted posting arrays.
 7. Record data signatures and initial calibration in QIHSE's optimization DB.
@@ -243,9 +223,11 @@ Every search walks the requested scope, including files absent from the index.
 That metadata cost is included in the ripgrep comparison. Refresh is a separate
 command; search does not start a full background rebuild.
 
-Support literals, standard regex, multiple `-e` patterns, case flags, globs,
-ignore files, `--one-file-system`, `-l`, `-n`, `-c`, `-q`, context, and JSON.
-Preserve filename bytes.
+The target search interface supports literals, standard regex, multiple `-e`
+patterns, case flags, globs, ignore files, `-l`, `-n`, `-c`, `-q`, context, and
+JSON. The current CLI supports only a subset directly; unsupported rg flags are
+delegated when invoked through the installed `rg` wrapper. Preserve filename
+bytes.
 Exit codes follow rg: 0 for matches, 1 for no matches, 2 for errors, including
 its quiet-mode behavior. Unsupported options produce an explicit usage error.
 
@@ -341,118 +323,95 @@ search. Compile scalar and SSE4.2 paths for this host.
 
 ## QIHSE Integration
 
-tgrep uses QIHSE's persistence layer for crash-safe index management. The
-integration is through `src/preindex.rs` and the native bindings in `native/`.
-
-- **WAL**: each segment publication appends to QIHSE's WAL. On restart,
-  `qihse_recovery_replay` performs analysis/redo/undo. Completed segments
-  survive; partial writes are rolled back. This replaces the custom
-  `build.json` checkpoint approach with transactional durability.
-- **Checkpoint**: `qihse_recovery_checkpoint` flushes all index state and
-  truncates old WAL segments. Called at segment publication boundaries.
-- **Compaction**: `qihse_compaction_run` merges tgrep segments through QIHSE's
-  compaction framework. The background compaction thread runs at the configured
-  interval, merging the smallest segment groups that fit memory and disk
-  budgets.
-- **Backup**: `qihse_backup_full` and `qihse_backup_incremental` provide index
-  snapshots with checksum verification. `qihse_restore` recovers from backup.
-- **Index manager**: `qihse_index_manager_create` creates a per-root index
-  manager. `qihse_index_manager_add_btree` registers file metadata indexes.
-  `qihse_index_manager_add_hash` registers path lookup indexes.
-  `qihse_index_bulk_load` populates from sorted arrays during initial build.
-- **FTS**: `qihse_fts_create` builds a BM25 inverted index over indexed
-  documents for relevance-sorted output. `qihse_fts_save` and `qihse_fts_load`
-  persist it alongside the trigram segments.
-- **Optimization DB**: `qihse_optimization_init` with a `storage_path` under
-  tgrep's data directory. `qihse_record_performance` logs per-query backend
-  timings. `qihse_get_optimized_config` returns the best-known configuration
-  for a data signature. `qihse_save_optimization_db` persists across restarts.
+tgrep's QIHSE integration uses native bindings for WAL transaction records,
+atomic file helpers, the word-index sidecar, search cache, and optimization
+database.
+Recovery lists committed WAL segments and removes unreferenced segment files; it
+does not infer roots or publish a manifest. Generic QIHSE backup, index-manager,
+FTS, and compaction APIs are not wired into tgrep's segment lifecycle.
 
 ## Building Without Taking Over The Machine
 
-`tgrep index build ROOT...` runs as a low-priority process. Default to one worker,
-a 512 MiB total builder allocation budget, and a combined logical read/write rate
-of 32 MiB/s. Expose `--threads`, `--max-memory`, and `--io-limit` to change them.
-The memory budget includes postings, input buffers, queues, and native allocations.
+`tgrep index build ROOT...` defaults to one discovery worker. `--max-memory=auto`
+records the lesser of one eighth of Linux `MemTotal`, one quarter of current
+`MemAvailable`, and one quarter of cgroup v2 memory headroom. Both RAM values
+are sampled at every build launch. `--io-limit=auto` measures a short write/sync
+and read probe of at most 4 MiB in the state filesystem at launch, bounded by
+one sixteenth of the memory budget. It uses one quarter of the slower
+rate, and respects a lower matching cgroup v2 device byte-rate cap. Explicit
+quantities override these defaults. Builder I/O is paced from Linux process read/write
+byte counters at file and publication boundaries; a single operation can burst above
+the average rate. A resident-memory guard checks before each source file, after
+ingestion, and before serialization, flushing early or failing when there is no
+headroom. It is a sampled soft guard, not exact native allocation accounting.
+The intended builder allocation budget and aggregate logical I/O throttle include
+postings, input buffers, queues, and native allocations.
 Discovery uses a bounded queue; when full, traversal waits for indexing.
 
-Implement the I/O limit with byte accounting and timed waits between batches of
-reads/writes. Check pause requests between input buffers. All workers share the
-same memory and I/O budgets. Compaction uses those budgets too. Search gets
-priority over background build workers through a shared four-slot worker limit.
+I/O pacing uses process read/write counters at file and publication boundaries;
+individual operations can burst. A sampled resident-memory guard checks before
+source files and serialization, and can trigger an earlier flush or fail the
+build. These are cooperative checks, not exact allocation or OS limits.
 
 Flush a segment at 64 MiB of source input, 128 MiB of posting allocations, or
 30 seconds, at the next completed-file boundary. Reserve memory for serialization
 before accepting more input. If a file cannot fit, record it as scan-only.
 Initially cap indexed files at 64 MiB; larger files remain searchable by scanning.
 
-Completed batches become searchable immediately. During the first build, search
-uses the available segments and scans the rest. Progress reports files and bytes
-indexed, scan-only files, throughput, elapsed time, estimated remaining time,
-and the most recent completed checkpoint. ETA stabilizes as discovery completes.
+Segments from a build are not visible to search until the replacement manifest is
+published. If a build fails before publication, the previous manifest remains
+active. Progress is recorded in `build.json`; it is not a resumable segment journal.
 
 ### Pause and resume
 
-Completed segments are the checkpoints. `build.json` stores roots, options,
-profile, status, and progress; no separate work journal is needed.
+`tgrep index pause` creates `pause.request` when a writer is active. The builder
+checks at file boundaries, writes `build.json` with `paused` status, and waits
+while retaining the writer lock. `tgrep index resume` removes the request and
+lets that builder continue. A pause can therefore wait for the current file to
+finish. If the builder process exits while paused, no in-memory batch is saved;
+`resume` starts a new full source reindex from the roots recorded in `build.json`.
 
-On Ctrl-C or `tgrep index pause`, stop taking files, finish the current file when
-practical, publish completed work, and exit. A forced stop discards the unfinished
-batch. `tgrep index resume` rewalks the roots and skips unchanged files already
-recorded in published segments. This repeats metadata traversal, not their
-content indexing, and works after a reboot.
+## Publication And Index Commands
 
-The active batch is the unit of lost work. An interrupted file starts again
-from its beginning. Changed files are rebuilt; missing files are ignored by live
-search and removed during compaction. Profile changes require a fresh build.
-A paused build stays paused until explicitly resumed.
+Each build walks its supplied roots and stages a fresh set of immutable segments.
+After all segments are written, it atomically publishes a replacement manifest;
+the prior manifest remains usable until that point. WAL recovery reports committed
+segments and removes unreferenced segment files, but does not infer roots or publish
+a manifest.
 
-## Publication And Refresh
-
-Use one writer lock for build, refresh, and compaction. Write each segment to a
-temporary file, finish its checksums, sync it, and rename it into `segments/`.
-Sync that directory, then atomically replace and sync `manifest.json` and its
-directory. The manifest lists the completed segments and is the publication point.
-All these files are on the same dataset.
-
-Queries briefly hold a shared manifest lock while opening their segments.
-Publication and removal take that lock exclusively. Existing open mappings
-remain readable after old files are unlinked. Building happens outside this lock.
-
-After interruption, keep segments listed by the search or rebuild manifest and
-discard unfinished or unreferenced output. Corrupt segments are missing coverage,
-rebuilt by refresh. Other completed segments survive. Progress metadata can be
-reconstructed from the segment file tables.
-
-`index refresh` walks the registered roots and writes changed/new files into
-additional segments. Compare metadata before and after reading a file; retry a
-file modified during indexing. Deleted paths cannot appear in live query results.
-When more than 16 segments accumulate, merge the smallest groups that fit the
-memory and disk budgets, retaining only the newest live path records. Publish
-each completed merge separately so interruption restarts only the current group.
+`index refresh` and `index rebuild` both reindex all roots currently bound to the
+manifest. They are not incremental refreshes or resumable batch builds. `index
+compact` currently does the same full source reindex, then runs orphan cleanup to
+remove obsolete segment and sidecar files. It does not merge existing segments.
+All three commands require resolvable roots from the manifest or guarded legacy
+build metadata. If roots cannot be established, the command fails without replacing
+the current index.
 
 ## Commands
 
 ```text
-tgrep index build /home/john --one-file-system
-tgrep index build /home/john --one-file-system --threads=1 --max-memory=512MiB --io-limit=32MiB/s
+tgrep index build /path/to/corpus
+tgrep index build /path/to/corpus --threads=1 --max-memory=512MiB --io-limit=32MiB/s
 tgrep index status
+tgrep index recover
 tgrep index pause
 tgrep index resume
 tgrep index refresh
 tgrep index compact
 tgrep index rebuild
 
-tgrep -F -s 'qihse_file_fsync' ~/Documents/QIHSE
+tgrep -F 'qihse_file_fsync' /path/to/corpus
 tgrep -n 'alpha.*omega' ~/Documents/KEYSTONE
 tgrep -l 'alpha|omega' ~/Documents
 tgrep --explain 'pattern' ~/Documents/QIHSE
 ```
 
 `--explain` reports indexed/scanned file counts, candidate estimates, and the
-selected matcher without emitting matches. Rebuild checkpoints new segments in
-`rebuild/manifest.json` and resumes from that file after interruption. It replaces
-the search manifest when complete and stops if both generations will not fit.
+selected matcher without emitting matches. A stopped refresh, rebuild, or compact
+does not continue from a separate rebuild manifest; rerunning the command starts a
+new full source reindex. `index recover` scans committed WAL segment records and
+removes unreferenced segment files while holding the writer lock; it does not
+replay a build or publish a manifest.
 
 ## Beat ripgrep
 
@@ -490,9 +449,10 @@ indexes — is what closes that gap.
 
 Target 10x faster repeated selective searches, with 100x as the stretch target
 for rare/absent patterns. Keep broad-query scanning within 10% of rg. Start with
-1 GiB and 10 GiB subsets of `/home/john`, then the full home corpus. Both tools
-use `--one-file-system`, ordinary ignore rules, and the configured hidden-file
-behavior. Source-byte totals come from the build's discovery pass.
+1 GiB and 10 GiB subsets of `/home/john`, then the full home corpus. The planned
+comparison uses ordinary ignore rules and configured hidden-file behavior.
+`--one-file-system` is not implemented in the current tgrep CLI. Source-byte
+totals come from the build's discovery pass.
 
 The saved Bash history contains 19 parsed grep invocations and no rg invocations;
 12 filter pipelines. Use these history-derived patterns for the initial suite:
@@ -540,8 +500,8 @@ against rg. Save commands, tool versions, query sets, and raw timings with resul
 6. Wire KEYSTONE hash index for whole-token exact-match fast path.
 7. Add anchor seeding after segment flush; wire batch search for multi-pattern
    queries.
-8. Add live refresh, regex/case planning, rg output modes, and compaction via
-   QIHSE's compaction framework.
+8. Add live refresh, regex/case planning, rg output modes, and a tgrep-native
+   segment merge if compaction is needed.
 9. Wire QIHSE optimization DB for persistent backend calibration.
 10. Run the comparison suite and optimize the largest remaining costs.
 

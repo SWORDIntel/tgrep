@@ -1,7 +1,7 @@
 # tgrep — persistent-index search, released
 
-**v1.0.0 — first public release** (AGPL-3.0). Security-reviewed: see
-[SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the pre-release audit and hardening.
+**Historical v1.0.0 release** (AGPL-3.0). Its pre-release security review and
+hardening record is in [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
 
 Persistent trigram-indexed search that drops in as a ripgrep accelerator.
 
@@ -10,6 +10,21 @@ skip files that can't match your search pattern. When installed as an `rg`
 wrapper, it transparently routes searches to the index when beneficial and
 delegates to real ripgrep for everything else — all `rg` flags work
 identically.
+
+## Install
+
+**Debian/Ubuntu (amd64)** — grab the `.deb` from
+[Releases](https://github.com/SWORDIntel/tgrep/releases):
+
+```bash
+sudo apt install ./tgrep_1.0.0_amd64.deb
+tgrep index build ~          # index your home directory
+```
+
+**From source** (Linux): run `./install.sh` — it builds, installs the
+`rg` wrapper, offers a compressed ZFS dataset for the index on ZFS systems,
+and offers to build a systemwide index. Scripted installs: `--index`,
+`--no-index`, `--zfs`, `--no-zfs`.
 
 ## Performance
 
@@ -116,9 +131,29 @@ tgrep index build /path/to/code
 # Check index status
 tgrep index status
 
-# Recover from WAL after a crash
+# Scan committed WAL records and clean up unreferenced segment files
 tgrep index recover
+
+# Pause an active build at a file boundary, then let it continue
+tgrep index pause
+tgrep index resume
+
+# Reindex the roots currently bound to the index
+tgrep index refresh
+tgrep index rebuild
+
+# Reindex those roots and remove obsolete segment files
+tgrep index compact
 ```
+
+`refresh` and `rebuild` currently both perform a full source reindex; neither is
+incremental. `compact` also performs a full source reindex, then removes obsolete
+segments and sidecars. It does not merge existing segments. `recover` retains
+committed WAL segment files and removes unreferenced segment files, but leaves
+the manifest unchanged; it does not resume a build or publish an index. A pause
+request is cooperative: the active builder finishes its current file, records
+paused status, and waits. If the builder exits or is interrupted, `resume`
+restarts a full reindex from saved roots and build options.
 
 ### Searching
 
@@ -194,7 +229,7 @@ tgrep combines three components:
 | `file_list_cache.json` | File metadata for mtime-based index-trust |
 | `optimization.qdb` | Per-query performance optimization database |
 | `search_cache.qsc` | Cached `-l` search results |
-| `wal/` | Write-ahead log for crash-safe segment publication |
+| `wal/` | Segment transaction records; recovery does not publish a manifest |
 
 See `ARCHITECTURE.md` for the full design and `KEYSTONE_CHANGES.md` for
 KEYSTONE API extension details.
@@ -252,4 +287,4 @@ tgrep/
 
 ## License
 
-See LICENSE file for details.
+tgrep is licensed under the **SWORD Restricted Source Licence v1.1 (SRSL-1.1)**. Personal and non-commercial use is permitted under its terms; commercial exploitation requires a separate written agreement. See [LICENSE](LICENSE).

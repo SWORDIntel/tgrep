@@ -1,7 +1,7 @@
 // tgrep Phase 11: Full benchmark suite runner
 //
 // Runs tgrep vs rg across a comprehensive pattern set, with configurable
-// trials per pattern, warm/cold cache separation, and summary reporting.
+// trials per pattern, verified outputs, and summary reporting.
 //
 // Usage:
 //   ./target/release/bench_suite <path> [trials] [--indexed-only] [--cold-cache]
@@ -169,8 +169,8 @@ fn default_patterns() -> Vec<BenchPattern> {
         BenchPattern {
             pattern: "terminal",
             category: PatternCategory::CaseInsensitive,
-            tgrep_args: &[],
-            rg_args: &[],
+            tgrep_args: &["-i"],
+            rg_args: &["-i"],
         },
         BenchPattern {
             pattern: "struct",
@@ -181,21 +181,71 @@ fn default_patterns() -> Vec<BenchPattern> {
     ]
 }
 
-fn run_cmd(cmd: &mut Command) -> (u64, String, i32) {
+fn run_cmd(cmd: &mut Command) -> Result<(u64, Vec<u8>), String> {
     let start = Instant::now();
-    let output = cmd.output();
+    let output = cmd.output().map_err(|e| format!("{cmd:?}: {e}"))?;
     let elapsed = start.elapsed().as_millis() as u64;
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            (elapsed, stdout, out.status.code().unwrap_or(-1))
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err(format!(
+            "{cmd:?}: {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok((elapsed, output.stdout))
+}
+
+fn run_measured(cmd: &mut Command, cold_cache: bool) -> Result<(u64, Vec<u8>), String> {
+    if cold_cache {
+        let reset = Command::new("sudo")
+            .args([
+                "-n",
+                "sh",
+                "-c",
+                "sync && echo 3 > /proc/sys/vm/drop_caches",
+            ])
+            .output()
+            .map_err(|e| format!("OS page-cache reset: {e}"))?;
+        if !reset.status.success() {
+            return Err(format!(
+                "OS page-cache reset failed: {}: {}",
+                reset.status,
+                String::from_utf8_lossy(&reset.stderr)
+            ));
         }
-        Err(_) => (elapsed, String::new(), -1),
+    }
+    run_cmd(cmd)
+}
+
+fn files(output: &[u8]) -> Vec<&[u8]> {
+    let mut names: Vec<_> = output
+        .split(|&b| b == b'\n')
+        .filter(|s| !s.is_empty())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+// Both lists are sorted by files().
+fn results_match(tgrep: &[&[u8]], rg: &[&[u8]], indexed_only: bool) -> bool {
+    tgrep == rg || (indexed_only && tgrep.iter().all(|name| rg.binary_search(name).is_ok()))
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
     }
 }
 
-fn count_lines(s: &str) -> usize {
-    s.lines().filter(|l| !l.is_empty()).count()
+fn median(sorted: &[u64]) -> u64 {
+    let middle = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        sorted[middle - 1] + (sorted[middle] - sorted[middle - 1]) / 2
+    } else {
+        sorted[middle]
+    }
 }
 
 struct PatternResult {
@@ -221,109 +271,84 @@ fn run_pattern(
     tgrep_bin: &str,
     state_dir: &str,
     indexed_only: bool,
+    rg_bin: &str,
     cold_cache: bool,
-) -> PatternResult {
-    // First trial: verify correctness
-    let mut tgrep_cmd = Command::new(tgrep_bin);
-    tgrep_cmd.env("TGREP_STATE_DIR", state_dir).arg("-l");
-    if indexed_only {
-        tgrep_cmd.arg("--indexed-only");
-    }
-    tgrep_cmd.args(pat.tgrep_args).arg(pat.pattern).arg(path);
-    let (t_time, t_out, _) = run_cmd(&mut tgrep_cmd);
-    let t_count = count_lines(&t_out);
-
-    let mut rg_cmd = Command::new("rg");
-    rg_cmd
-        .arg("--threads=4")
-        .arg("-l")
-        .args(pat.rg_args)
-        .arg(pat.pattern)
-        .arg(path);
-    let (r_time, r_out, _) = run_cmd(&mut rg_cmd);
-    let r_count = count_lines(&r_out);
-
-    // Verify correctness (sorted comparison)
-    let mut t_lines: Vec<&str> = t_out.lines().filter(|l| !l.is_empty()).collect();
-    let mut r_lines: Vec<&str> = r_out.lines().filter(|l| !l.is_empty()).collect();
-    t_lines.sort();
-    r_lines.sort();
-    let correct = if indexed_only {
-        // indexed-only skips unindexed files, so counts may differ
-        t_count <= r_count
-    } else {
-        t_lines == r_lines
-    };
-
-    if !correct && !indexed_only {
-        eprintln!(
-            "  WARNING: mismatch for '{}' — tgrep={} rg={}",
-            pat.pattern, t_count, r_count
-        );
-    }
-
-    let mut tgrep_times = vec![t_time];
-    let mut rg_times = vec![r_time];
-
-    // Remaining trials
-    for _trial in 2..=trials {
+) -> Result<PatternResult, String> {
+    let mut tgrep_times = Vec::new();
+    let mut rg_times = Vec::new();
+    let mut t_count = 0;
+    let mut r_count = 0;
+    for trial in 1..=trials {
         let mut tgrep_cmd = Command::new(tgrep_bin);
         tgrep_cmd.env("TGREP_STATE_DIR", state_dir).arg("-l");
         if indexed_only {
             tgrep_cmd.arg("--indexed-only");
         }
-        tgrep_cmd.args(pat.tgrep_args).arg(pat.pattern).arg(path);
-        let (t_time, _, _) = run_cmd(&mut tgrep_cmd);
-        tgrep_times.push(t_time);
-
-        let mut rg_cmd = Command::new("rg");
+        tgrep_cmd
+            .args(pat.tgrep_args)
+            .arg("--")
+            .arg(pat.pattern)
+            .arg(path);
+        let mut rg_cmd = Command::new(rg_bin);
         rg_cmd
             .arg("--threads=4")
             .arg("-l")
             .args(pat.rg_args)
+            .arg("--")
             .arg(pat.pattern)
             .arg(path);
-        let (r_time, _, _) = run_cmd(&mut rg_cmd);
-        rg_times.push(r_time);
-
-        // Cold cache: drop caches between trials (requires root)
-        if cold_cache {
-            let _ = Command::new("sudo")
-                .args(["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"])
-                .output();
+        let (t, r) = if trial % 2 == 1 {
+            (
+                run_measured(&mut tgrep_cmd, cold_cache)?,
+                run_measured(&mut rg_cmd, cold_cache)?,
+            )
+        } else {
+            let r = run_measured(&mut rg_cmd, cold_cache)?;
+            (run_measured(&mut tgrep_cmd, cold_cache)?, r)
+        };
+        let t_files = files(&t.1);
+        let r_files = files(&r.1);
+        if !results_match(&t_files, &r_files, indexed_only) {
+            return Err(format!(
+                "pattern {:?} trial {trial}: result mismatch: tgrep={} rg={}",
+                pat.pattern,
+                t_files.len(),
+                r_files.len()
+            ));
         }
+        t_count = t_files.len();
+        r_count = r_files.len();
+        tgrep_times.push(t.0);
+        rg_times.push(r.0);
     }
+    let correct = true;
 
     tgrep_times.sort();
     rg_times.sort();
-    let t_med = tgrep_times[tgrep_times.len() / 2];
-    let r_med = rg_times[rg_times.len() / 2];
+    let t_med = median(&tgrep_times);
+    let r_med = median(&rg_times);
     let t_p95_idx = ((tgrep_times.len() as f64) * 0.95).ceil() as usize;
     let r_p95_idx = ((rg_times.len() as f64) * 0.95).ceil() as usize;
 
-    let speedup = if r_med > 0 {
+    let speedup = if !indexed_only && r_med > 0 && t_med > 0 {
         t_med as f64 / r_med as f64
     } else {
-        1.0
+        f64::NAN
     };
     let meets_target = speedup <= pat.category.target();
 
+    let ratio = if speedup.is_finite() {
+        format!("{speedup:.3}")
+    } else {
+        "unmeasured".into()
+    };
     eprintln!(
-        "  {:<30} {:<18} tgrep={:>5}ms rg={:>5}ms speedup={:>6.1}x {} {}",
+        "  {:<30} {:<18} tgrep={t_med}ms rg={r_med}ms ratio(tgrep/rg)={ratio} OK",
         pat.pattern,
-        pat.category.label(),
-        t_med,
-        r_med,
-        if speedup < 1.0 {
-            1.0 / speedup
-        } else {
-            1.0 / speedup
-        },
-        if correct { "OK" } else { "MISMATCH" },
-        if meets_target { "PASS" } else { "FAIL" },
+        pat.category.label()
     );
 
-    PatternResult {
+    Ok(PatternResult {
         pattern: pat.pattern.to_string(),
         category: pat.category,
         tgrep_median: t_med,
@@ -337,10 +362,10 @@ fn run_pattern(
         correct,
         speedup,
         meets_target,
-    }
+    })
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
@@ -353,15 +378,31 @@ fn main() {
     }
 
     let path = &args[1];
-    let trials: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-    let indexed_only = args.iter().any(|a| a == "--indexed-only");
-    let cold_cache = args.iter().any(|a| a == "--cold-cache");
-
-    // Filter patterns if --patterns= is specified
-    let filter_patterns: Option<Vec<String>> = args.iter().find_map(|a| {
-        a.strip_prefix("--patterns=")
-            .map(|s| s.split(',').map(String::from).collect())
-    });
+    let mut next = 2;
+    let trials = match args.get(next).filter(|s| !s.starts_with("--")) {
+        Some(value) => {
+            next += 1;
+            value.parse::<usize>()?
+        }
+        None => 10,
+    };
+    if trials == 0 {
+        return Err("trials must be positive".into());
+    }
+    let mut indexed_only = false;
+    let mut cold_cache = false;
+    let mut filter_patterns: Option<Vec<String>> = None;
+    for arg in &args[next..] {
+        if arg == "--indexed-only" {
+            indexed_only = true;
+        } else if arg == "--cold-cache" {
+            cold_cache = true;
+        } else if let Some(value) = arg.strip_prefix("--patterns=") {
+            filter_patterns = Some(value.split(',').map(String::from).collect());
+        } else {
+            return Err(format!("unknown argument: {arg}").into());
+        }
+    }
 
     let tgrep_bin = env::var("TGREP_BIN").unwrap_or_else(|_| "./target/release/tgrep".to_string());
     let state_dir = env::var("TGREP_STATE_DIR").unwrap_or_else(|_| {
@@ -371,10 +412,11 @@ fn main() {
 
     let mode_label = if indexed_only { "indexed-only" } else { "full" };
     let cache_label = if cold_cache {
-        "cold-cache"
+        "OS page-cache cold; app/query/device caches uncontrolled"
     } else {
-        "warm-cache"
+        "uncontrolled filesystem cache; repeated process runs"
     };
+    let rg_bin = env::var("RG_BIN").unwrap_or_else(|_| "/usr/bin/rg".into());
 
     eprintln!("=== tgrep Phase 11 Benchmark Suite ===");
     eprintln!("  path:       {}", path);
@@ -397,6 +439,9 @@ fn main() {
         })
         .collect();
 
+    if patterns.is_empty() {
+        return Err("pattern filter selected no patterns".into());
+    }
     eprintln!("Running {} patterns...", patterns.len());
     eprintln!();
 
@@ -410,8 +455,9 @@ fn main() {
             &tgrep_bin,
             &state_dir,
             indexed_only,
+            &rg_bin,
             cold_cache,
-        );
+        )?;
         results.push(result);
     }
 
@@ -431,7 +477,9 @@ fn main() {
     let mut total_pass = 0;
     let mut total_patterns = 0;
     for r in &results {
-        let speedup_str = if r.speedup < 1.0 {
+        let speedup_str = if !r.speedup.is_finite() {
+            "unmeasured".into()
+        } else if r.speedup < 1.0 {
             format!("{:.1}x faster", 1.0 / r.speedup)
         } else {
             format!("{:.1}x slower", r.speedup)
@@ -446,7 +494,13 @@ fn main() {
             r.rg_p95,
             speedup_str,
             if r.correct { "OK" } else { "FAIL" },
-            if r.meets_target { "PASS" } else { "FAIL" },
+            if !r.speedup.is_finite() {
+                "N/A"
+            } else if r.meets_target {
+                "PASS"
+            } else {
+                "FAIL"
+            },
         );
         if r.correct {
             total_correct += 1;
@@ -474,8 +528,10 @@ fn main() {
         PatternCategory::Word,
         PatternCategory::CaseInsensitive,
     ] {
-        let cat_results: Vec<&PatternResult> =
-            results.iter().filter(|r| r.category == *cat).collect();
+        let cat_results: Vec<&PatternResult> = results
+            .iter()
+            .filter(|r| r.category == *cat && r.speedup.is_finite())
+            .collect();
         if cat_results.is_empty() {
             continue;
         }
@@ -507,15 +563,15 @@ fn main() {
         mode_label,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
     let mut csv = String::new();
     csv.push_str("pattern,category,tgrep_median_ms,tgrep_min_ms,tgrep_p95_ms,rg_median_ms,rg_min_ms,rg_p95_ms,tgrep_count,rg_count,correct,speedup,meets_target\n");
     for r in &results {
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{:.4},{}\n",
-            r.pattern,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            csv_field(&r.pattern),
             r.category.label(),
             r.tgrep_median,
             r.tgrep_min,
@@ -526,18 +582,89 @@ fn main() {
             r.tgrep_count,
             r.rg_count,
             r.correct,
-            r.speedup,
-            r.meets_target,
+            if r.speedup.is_finite() {
+                format!("{:.4}", r.speedup)
+            } else {
+                String::new()
+            },
+            if r.speedup.is_finite() {
+                r.meets_target.to_string()
+            } else {
+                String::new()
+            },
         ));
     }
-    let _ = std::fs::write(&csv_path, &csv);
+    std::fs::write(&csv_path, &csv)?;
     eprintln!();
     eprintln!("Raw CSV: {}", csv_path);
 
     // Exit code: 0 if all pass, 1 if any fail
     if total_pass == total_patterns && total_correct == total_patterns {
-        std::process::exit(0);
+        Ok(())
     } else {
-        std::process::exit(1);
+        Err("one or more performance targets failed or could not be measured".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[test]
+    fn child_failure_with_output_is_an_error() {
+        let error = run_cmd(&mut fixture(
+            "printf 'same\n'; printf fixture-error >&2; exit 2",
+        ))
+        .unwrap_err();
+        assert!(error.contains("exit status: 2"), "{error}");
+        assert!(error.contains("fixture-error"), "{error}");
+    }
+
+    #[test]
+    fn signalled_child_is_an_error() {
+        let error = run_cmd(&mut fixture("kill -TERM $$")).unwrap_err();
+        assert!(error.contains("signal"), "{error}");
+    }
+
+    #[test]
+    fn no_match_status_is_a_valid_empty_result() {
+        let (_, output) = run_cmd(&mut fixture("exit 1")).unwrap();
+        assert!(output.is_empty());
+        assert_eq!(files(&output).len(), 0);
+    }
+
+    #[test]
+    fn comparison_uses_filenames_and_requires_real_indexed_subset() {
+        let left = files(b"second\nfirst\n");
+        let same = files(b"first\nsecond\n");
+        let different = files(b"first\nother\n");
+        assert!(results_match(&left, &same, false));
+        assert!(!results_match(&left, &different, false));
+        assert!(!results_match(&left, &different, true));
+        assert!(results_match(&files(b"first\n"), &same, true));
+        assert!(!results_match(&files(b"absent\n"), &same, true));
+    }
+
+    #[test]
+    fn csv_quotes_delimiters_quotes_and_line_breaks() {
+        assert_eq!(
+            csv_field("one,\"two\"\nthree"),
+            "\"one,\"\"two\"\"\nthree\""
+        );
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("one\rtwo"), "\"one\rtwo\"");
+    }
+
+    #[test]
+    fn even_median_does_not_overflow() {
+        assert_eq!(median(&[2, 4]), 3);
+        assert_eq!(median(&[u64::MAX - 2, u64::MAX]), u64::MAX - 1);
+        assert_eq!(median(&[0, u64::MAX]), u64::MAX / 2);
     }
 }

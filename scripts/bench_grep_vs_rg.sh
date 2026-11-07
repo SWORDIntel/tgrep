@@ -3,25 +3,35 @@
 # Corpus: KEYSTONE + QIHSE + Native-AI-Terminal source trees
 # Design doc: ARCHITECTURE.md (lines 278-298)
 
-set -u
+set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(dirname "$SCRIPT_DIR")"
+if ! IFS= read -r -d '' SCRIPT_PATH < <(readlink -fz -- "${BASH_SOURCE[0]}"); then
+  echo 'Error: could not resolve baseline script path.' >&2
+  exit 2
+fi
+SCRIPT_DIR="${SCRIPT_PATH%/*}"
+REPO_DIR="${SCRIPT_DIR%/*}"
+[[ -n "$REPO_DIR" ]] || REPO_DIR=/
 
-CORPUS="${TGREP_CORPUS:-$HOME/Documents/KEYSTONE $HOME/Documents/QIHSE $HOME/Documents/Native-AI-Terminal}"
+if [[ "$#" -gt 0 ]]; then
+  CORPUS=("$@")
+elif [[ -n "${TGREP_CORPUS:-}" ]]; then
+  CORPUS=("$TGREP_CORPUS")
+else
+  CORPUS=("$HOME/Documents/KEYSTONE" "$HOME/Documents/QIHSE" "$HOME/Documents/Native-AI-Terminal")
+fi
 TRIALS=5
-OUTDIR="/tmp/tgrep_bench_$$"
-mkdir -p "$OUTDIR"
+OUTDIR=$(mktemp -d "${TMPDIR:-/tmp}/tgrep_bench.XXXXXXXX")
 
 echo "=== tgrep benchmark: grep vs rg ==="
 echo "Design: $REPO_DIR/ARCHITECTURE.md"
-echo "Corpus: $CORPUS"
+echo "Corpus: ${CORPUS[*]}"
 echo "Trials: $TRIALS per pattern"
 echo ""
 
 # Source bytes in corpus
-SRC_BYTES=$(find $CORPUS -type f -readable 2>/dev/null | xargs cat 2>/dev/null | wc -c)
-FILE_COUNT=$(find $CORPUS -type f -readable 2>/dev/null | wc -l)
+SRC_BYTES=$(find "${CORPUS[@]}" -type f -readable -printf '%s\n' | awk '{s+=$1} END {printf "%.0f",s}')
+FILE_COUNT=$(find "${CORPUS[@]}" -type f -readable -printf 'x\n' | wc -l)
 echo "Source files: $FILE_COUNT"
 echo "Source bytes: $SRC_BYTES"
 echo ""
@@ -57,17 +67,28 @@ for i in $(seq 0 $((NUM - 1))); do
   for t in $(seq 1 $TRIALS); do
     # grep: BRE by default, \| is BRE alternation, case-sensitive
     start=$(date +%s%N)
-    grep -r --binary-files=without-match $gopt -e "$gpat" $CORPUS > "$OUTDIR/${id}_grep_${t}.txt" 2>/dev/null
+    if grep -r -H --binary-files=without-match $gopt -e "$gpat" -- "${CORPUS[@]}" > "$OUTDIR/${id}_grep_${t}.txt"; then :
+    else status=$?; [[ "$status" -eq 1 ]] || exit "$status"; fi
     end=$(date +%s%N)
     elapsed=$(( (end - start) / 1000000 ))
     grep_times+=($elapsed)
 
-    # rg: translate \| to |, use -s for case sensitivity
+    # rg: translate BRE alternation and explicitly override smart-case.
     start=$(date +%s%N)
-    rg -s --no-heading $ropt -e "$rpat" $CORPUS > "$OUTDIR/${id}_rg_${t}.txt" 2>/dev/null
+    if rg --case-sensitive --threads 4 --with-filename --no-heading --color never $ropt -e "$rpat" -- "${CORPUS[@]}" > "$OUTDIR/${id}_rg_${t}.txt"; then :
+    else status=$?; [[ "$status" -eq 1 ]] || exit "$status"; fi
     end=$(date +%s%N)
     elapsed=$(( (end - start) / 1000000 ))
     rg_times+=($elapsed)
+    # GNU grep -c includes zero-count files; rg omits those records.
+    if [[ "$gopt" == '-c' ]]; then
+      awk -F: '$NF != 0' "$OUTDIR/${id}_grep_${t}.txt" > "$OUTDIR/count-normalized"
+      mv "$OUTDIR/count-normalized" "$OUTDIR/${id}_grep_${t}.txt"
+    fi
+    if ! diff -u <(LC_ALL=C sort "$OUTDIR/${id}_grep_${t}.txt") <(LC_ALL=C sort "$OUTDIR/${id}_rg_${t}.txt"); then
+      echo "Error: output mismatch for $id trial $t; timings are not comparable." >&2
+      exit 2
+    fi
   done
 
   # Count matches from first trial

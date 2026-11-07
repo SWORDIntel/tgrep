@@ -42,7 +42,7 @@ size_t tgrep_keystone_doc_count(void* handle) {
 
 /* Get approximate memory usage in bytes. */
 size_t tgrep_keystone_memory_usage(void* handle) {
-    return keystone_trigram_index_memory_usage((const keystone_trigram_index_t*)handle);
+    return keystone_trigram_index_memory_usage((const keystone_trigram_index_t *)handle);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -50,16 +50,18 @@ size_t tgrep_keystone_memory_usage(void* handle) {
  * ══════════════════════════════════════════════════════════════════ */
 
 /* Begin a streaming document. Returns stream handle or NULL on failure.
+ * The index must remain alive and unfinalized until the stream is ended or cancelled.
  * name: optional document name (may be NULL, copied internally). */
-void* tgrep_keystone_begin_document(void* handle, const char* name) {
-    return (void*)keystone_trigram_begin_document(
-        (keystone_trigram_index_t*)handle, name);
+void *tgrep_keystone_begin_document(void *handle, const char *name)
+{
+    return (void *)keystone_trigram_begin_document((keystone_trigram_index_t *)handle, name);
 }
 
 /* Feed bytes to the current streaming document. Returns 0 on success. */
-int tgrep_keystone_feed_bytes(void* stream, const uint8_t* data, size_t len) {
-    return keystone_trigram_feed_bytes(
-        (keystone_trigram_stream_t*)stream, (const char*)data, len);
+int tgrep_keystone_feed_bytes(void *stream, const uint8_t *data, size_t len)
+{
+    return keystone_trigram_feed_bytes((keystone_trigram_stream_t *)stream, (const char *)data,
+                                       len);
 }
 
 /* Finish the streaming document and add to index.
@@ -120,15 +122,12 @@ size_t tgrep_keystone_get_candidates(
  * Candidate query (paginated iterator)
  * ══════════════════════════════════════════════════════════════════ */
 
-/* Create a candidate iterator. Returns iterator handle or NULL on failure. */
-void* tgrep_keystone_candidates_begin(
-    void* handle,
-    const char* pattern,
-    size_t pattern_len
-) {
-    return (void*)keystone_trigram_candidates_begin(
-        (const keystone_trigram_index_t*)handle,
-        pattern, pattern_len);
+/* Create a candidate iterator. Returns iterator handle or NULL on failure.
+ * The finalized index must remain alive and unchanged until the iterator is freed. */
+void *tgrep_keystone_candidates_begin(void *handle, const char *pattern, size_t pattern_len)
+{
+    return (void *)keystone_trigram_candidates_begin((const keystone_trigram_index_t *)handle,
+                                                     pattern, pattern_len);
 }
 
 /* Fetch next batch of candidates.
@@ -194,18 +193,15 @@ typedef struct {
     int      truncated;         /* set if capacity exceeded */
 } posting_collector_t;
 
-static int collector_visitor(
-    uint32_t gram,
-    const uint32_t *doc_ids,
-    size_t count,
-    void *ctx
-) {
-    posting_collector_t *c = (posting_collector_t*)ctx;
+static int collector_visitor(uint32_t gram, const uint32_t *doc_ids, size_t count, void *ctx)
+{
+    posting_collector_t *c = (posting_collector_t *)ctx;
     if (c->num_grams >= c->max_grams) {
         c->truncated = 1;
         return 1; /* stop */
     }
-    if (c->num_doc_ids + count > c->max_doc_ids || c->num_doc_ids > UINT32_MAX) {
+    if (c->num_doc_ids > c->max_doc_ids || count > c->max_doc_ids - c->num_doc_ids ||
+        c->num_doc_ids > UINT32_MAX) {
         c->truncated = 1;
         return 1; /* stop */
     }

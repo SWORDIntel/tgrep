@@ -22,7 +22,7 @@ tgrep is a persistent trigram-indexed search tool. See:
 ```bash
 cargo build          # compile
 cargo build --release # optimized build (required for benchmarks)
-cargo test           # run all tests (60 tests)
+cargo test           # run the current test suite
 cargo test -- --nocapture  # run tests with output
 ```
 
@@ -52,15 +52,17 @@ See `BENCHMARKS.md` for full results and `benchmarks/graphs/` for visualizations
 
 ## Key dependencies
 
-- KEYSTONE: `/home/john/Documents/KEYSTONE` (trigram index engine)
-- QIHSE: `/home/john/Documents/QIHSE` (persistence, WAL)
+- KEYSTONE: `vendor/KEYSTONE` (trigram index engine compiled by `build.rs`)
+- QIHSE: `vendor/QIHSE` (selected persistence sources compiled by `build.rs`)
 - Corpus: `/rpool/scratch/tgrep_corpus` (strong test corpus, 26K files, 1.15 GB, includes hidden files)
 - Index state: `/tmp/tgrep_qwi_mmap` (mmap .qwi word index, 75 segments, file list cache)
 
 ## Implementation status
 
-Phases 0–11 complete (100% of 11 phases). Search is functional and verified against rg.
+The roadmap records completion of implementation phases 0–11. Its historical test and benchmark
+results are snapshots; they do not establish current regression coverage or live-file correctness.
 Post-Phase 11: mmap word index, index-trust optimization, comprehensive benchmark suite.
+The following are historical reported timings; see the methodology limits in `BENCHMARKS.md`.
 - Rare patterns: 5.5–12.8x faster than rg (cold), 12–54x (warm)
 - Broad patterns: 2.4–8.4x faster than rg (cold), 24–42x (warm)
 - Word patterns: 1.3–10.7x faster than rg (cold), 20–46x (warm)

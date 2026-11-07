@@ -59,26 +59,28 @@ fn progress_path() -> PathBuf {
     default_state_dir().join("precache_progress.json")
 }
 
-/// Write precache progress as JSON for the dashboard to read.
-fn write_progress(done: usize, total: usize, elapsed_secs: f64, current_pattern: &str) {
-    let path = progress_path();
+fn progress_json(done: usize, total: usize, elapsed_secs: f64, current_pattern: &str) -> String {
     let remaining = if done > 0 && done < total {
-        let per_item = elapsed_secs / done as f64;
-        Some(per_item * (total - done) as f64)
+        Some(elapsed_secs / done as f64 * (total - done) as f64)
     } else {
         None
     };
-    let json = format!(
-        r#"{{"done":{}, "total":{}, "elapsed_secs":{:.3}, "current_pattern":{:?}, "eta_secs":{}}}"#,
-        done,
-        total,
-        elapsed_secs,
-        current_pattern,
-        remaining
-            .map(|r| format!("{:.3}", r))
-            .unwrap_or_else(|| "null".to_string())
+    serde_json::json!({
+        "done": done,
+        "total": total,
+        "elapsed_secs": elapsed_secs,
+        "current_pattern": current_pattern,
+        "eta_secs": remaining,
+    })
+    .to_string()
+}
+
+/// Write precache progress as JSON for the dashboard to read.
+fn write_progress(done: usize, total: usize, elapsed_secs: f64, current_pattern: &str) {
+    let _ = std::fs::write(
+        progress_path(),
+        progress_json(done, total, elapsed_secs, current_pattern),
     );
-    let _ = std::fs::write(&path, json);
 }
 
 fn clear_progress() {
@@ -162,7 +164,10 @@ fn show_status() {
     let state_dir = crate::build::default_state_dir();
     let manifest = crate::store::load_manifest(&state_dir);
     let current_gen = manifest.as_ref().map(|m| m.generation as i64).unwrap_or(0);
-    let stale_count = entries.iter().filter(|e| e.generation != current_gen).count();
+    let stale_count = entries
+        .iter()
+        .filter(|e| e.generation != current_gen)
+        .count();
 
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║              tgrep Cache Status (v2)                     ║");
@@ -181,14 +186,21 @@ fn show_status() {
         println!("║  Stale entries:{:<40}║", stale_count);
     }
     let file_count = cache.file_list().map(|f| f.files.len()).unwrap_or(0);
-    println!("║  File list:    {:<40}║", format!("{} files indexed", file_count));
+    println!(
+        "║  File list:    {:<40}║",
+        format!("{} files indexed", file_count)
+    );
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  Pattern                              Flags  Gen  Files  ║");
     println!("╠══════════════════════════════════════════════════════════╣");
 
     for e in entries.iter().take(50) {
         let pat_display = truncate_pattern(&e.pattern);
-        let gen_marker = if e.generation != current_gen { "*" } else { " " };
+        let gen_marker = if e.generation != current_gen {
+            "*"
+        } else {
+            " "
+        };
         println!(
             "║  {:<36} {:<6} {:>3}{} {:<6}║",
             pat_display,
@@ -200,7 +212,10 @@ fn show_status() {
     }
 
     if entries.len() > 50 {
-        println!("║  ... and {} more entries                               ║", entries.len() - 50);
+        println!(
+            "║  ... and {} more entries                               ║",
+            entries.len() - 50
+        );
     }
 
     println!("╚══════════════════════════════════════════════════════════╝");
@@ -210,6 +225,33 @@ fn show_status() {
 }
 
 // ── Precache ────────────────────────────────────────────────────────
+
+fn precache_command(
+    executable: &std::path::Path,
+    pattern: &str,
+    root: &str,
+    flags: i32,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(executable);
+    cmd.arg("-l");
+    if flags & CACHE_FLAG_CASE_INSENSITIVE != 0 {
+        cmd.arg("-i");
+    }
+    if flags & CACHE_FLAG_WORD_REGEXP != 0 {
+        cmd.arg("-w");
+    }
+    if flags & CACHE_FLAG_FIXED_STRINGS != 0 {
+        cmd.arg("-F");
+    }
+    cmd.arg("--").arg(pattern).arg(root);
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::inherit());
+    cmd
+}
+
+fn search_succeeded(status: std::process::ExitStatus) -> bool {
+    matches!(status.code(), Some(0) | Some(1))
+}
 
 fn run_precache(
     patterns: Vec<String>,
@@ -258,12 +300,16 @@ fn run_precache(
     }
 
     let total = variants.len();
-    println!("tgrep: precaching {} pattern variants over '{}'", total, root);
+    println!(
+        "tgrep: precaching {} pattern variants over '{}'",
+        total, root
+    );
     let bar_len = 40;
     print!("tgrep: ");
 
     let start = std::time::Instant::now();
     let mut done = 0;
+    let mut failed = 0;
 
     for (pattern, flags) in &variants {
         // Write progress for dashboard
@@ -271,24 +317,18 @@ fn run_precache(
 
         // Run tgrep -l for this pattern (populates cache)
         let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("tgrep"));
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("-l").arg(pattern).arg(&root);
-        if *flags & CACHE_FLAG_CASE_INSENSITIVE != 0 {
-            cmd.arg("-i");
+        let mut cmd = precache_command(&exe, pattern, &root, *flags);
+        match cmd.status() {
+            Ok(status) if search_succeeded(status) => {}
+            Ok(status) => {
+                failed += 1;
+                eprintln!("tgrep: precache failed for {:?}: {}", pattern, status);
+            }
+            Err(error) => {
+                failed += 1;
+                eprintln!("tgrep: could not run precache for {:?}: {}", pattern, error);
+            }
         }
-        if *flags & CACHE_FLAG_WORD_REGEXP != 0 {
-            cmd.arg("-w");
-        }
-        if *flags & CACHE_FLAG_FIXED_STRINGS != 0 {
-            cmd.arg("-F");
-        }
-        // Inherit TGREP_STATE_DIR
-        if let Ok(dir) = std::env::var("TGREP_STATE_DIR") {
-            cmd.env("TGREP_STATE_DIR", dir);
-        }
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        let _ = cmd.status();
 
         done += 1;
         let pct = (done * 100) / total;
@@ -310,13 +350,17 @@ fn run_precache(
     println!();
     println!(
         "tgrep: precached {} variants in {:.2}s ({:.0}ms/variant)",
-        total,
+        total - failed,
         elapsed.as_secs_f64(),
         elapsed.as_secs_f64() * 1000.0 / total as f64
     );
 
     // Show cache stats
     show_status();
+    if failed != 0 {
+        eprintln!("tgrep: {} of {} precache variants failed", failed, total);
+        std::process::exit(1);
+    }
 }
 
 // ── Clear ───────────────────────────────────────────────────────────
@@ -409,31 +453,79 @@ fn show_keystone_stats() {
     if let Some(stats) = native::get_keystone_performance_stats() {
         println!("╠══════════════════════════════════════════════════════════╣");
         println!("║  Search Statistics:                                     ║");
-        println!("║    Total searches:    {:>10}                        ║", stats.total_searches);
-        println!("║    Successful:        {:>10}                        ║", stats.successful_searches);
-        println!("║    Success rate:       {:>9.2}%                       ║", stats.search_success_rate * 100.0);
-        println!("║    Avg search time:    {:>9.2} ns                      ║", stats.avg_search_time_ns);
-        println!("║    Speedup vs binary:  {:>9.2}x                       ║", stats.speedup_vs_binary);
+        println!(
+            "║    Total searches:    {:>10}                        ║",
+            stats.total_searches
+        );
+        println!(
+            "║    Successful:        {:>10}                        ║",
+            stats.successful_searches
+        );
+        println!(
+            "║    Success rate:       {:>9.2}%                       ║",
+            stats.search_success_rate * 100.0
+        );
+        println!(
+            "║    Avg search time:    {:>9.2} ns                      ║",
+            stats.avg_search_time_ns
+        );
+        println!(
+            "║    Speedup vs binary:  {:>9.2}x                       ║",
+            stats.speedup_vs_binary
+        );
         println!("╠══════════════════════════════════════════════════════════╣");
         println!("║  Memory:                                                ║");
-        println!("║    Peak memory:       {:>10}                        ║", format_size(stats.peak_memory_usage as u64));
-        println!("║    Avg memory:        {:>10}                        ║", format_size(stats.avg_memory_usage as u64));
+        println!(
+            "║    Peak memory:       {:>10}                        ║",
+            format_size(stats.peak_memory_usage as u64)
+        );
+        println!(
+            "║    Avg memory:        {:>10}                        ║",
+            format_size(stats.avg_memory_usage as u64)
+        );
         println!("╠══════════════════════════════════════════════════════════╣");
         println!("║  Anchors:                                               ║");
-        println!("║    Learned:           {:>10}                        ║", stats.anchors_learned);
-        println!("║    Pruned:            {:>10}                        ║", stats.anchors_pruned);
-        println!("║    Vec efficiency:    {:>9.2}%                       ║", stats.vectorization_efficiency * 100.0);
+        println!(
+            "║    Learned:           {:>10}                        ║",
+            stats.anchors_learned
+        );
+        println!(
+            "║    Pruned:            {:>10}                        ║",
+            stats.anchors_pruned
+        );
+        println!(
+            "║    Vec efficiency:    {:>9.2}%                       ║",
+            stats.vectorization_efficiency * 100.0
+        );
         println!("╠══════════════════════════════════════════════════════════╣");
         println!("║  Timing:                                                ║");
-        println!("║    Total time:        {:>10.3} ms                    ║", stats.total_time_ns as f64 / 1_000_000.0);
-        println!("║    Search time:       {:>10.3} ms                    ║", stats.search_time_ns as f64 / 1_000_000.0);
+        println!(
+            "║    Total time:        {:>10.3} ms                    ║",
+            stats.total_time_ns as f64 / 1_000_000.0
+        );
+        println!(
+            "║    Search time:       {:>10.3} ms                    ║",
+            stats.search_time_ns as f64 / 1_000_000.0
+        );
         if stats.archive_bytes_read > 0 {
             println!("╠══════════════════════════════════════════════════════════╣");
             println!("║  Archive I/O:                                           ║");
-            println!("║    Bytes read:        {:>10}                        ║", format_size(stats.archive_bytes_read));
-            println!("║    Decompress time:   {:>10.3} ms                    ║", stats.archive_decompress_time_ns as f64 / 1_000_000.0);
-            println!("║    Parse time:        {:>10.3} ms                    ║", stats.archive_parse_time_ns as f64 / 1_000_000.0);
-            println!("║    Members searched:  {:>10}                        ║", stats.archive_members_searched);
+            println!(
+                "║    Bytes read:        {:>10}                        ║",
+                format_size(stats.archive_bytes_read)
+            );
+            println!(
+                "║    Decompress time:   {:>10.3} ms                    ║",
+                stats.archive_decompress_time_ns as f64 / 1_000_000.0
+            );
+            println!(
+                "║    Parse time:        {:>10.3} ms                    ║",
+                stats.archive_parse_time_ns as f64 / 1_000_000.0
+            );
+            println!(
+                "║    Members searched:  {:>10}                        ║",
+                stats.archive_members_searched
+            );
         }
     } else {
         println!("║  (performance tracking not available)                   ║");
@@ -471,15 +563,28 @@ fn run_dashboard(interval: f64) {
         let state_dir = crate::build::default_state_dir();
         let manifest = crate::store::load_manifest(&state_dir);
         let current_gen = manifest.as_ref().map(|m| m.generation as i64).unwrap_or(0);
-        let stale_count = entries.iter().filter(|e| e.generation != current_gen).count();
+        let stale_count = entries
+            .iter()
+            .filter(|e| e.generation != current_gen)
+            .count();
 
         // KEYSTONE stats
         let features = native::detect_cpu_features();
         let mut feature_parts = Vec::new();
-        if features & 0x01 != 0 { feature_parts.push("SSE4.2"); }
-        if features & 0x02 != 0 { feature_parts.push("AVX2"); }
-        if features & 0x04 != 0 { feature_parts.push("AVX512"); }
-        let feature_str = if feature_parts.is_empty() { "scalar".to_string() } else { feature_parts.join(" + ") };
+        if features & 0x01 != 0 {
+            feature_parts.push("SSE4.2");
+        }
+        if features & 0x02 != 0 {
+            feature_parts.push("AVX2");
+        }
+        if features & 0x04 != 0 {
+            feature_parts.push("AVX512");
+        }
+        let feature_str = if feature_parts.is_empty() {
+            "scalar".to_string()
+        } else {
+            feature_parts.join(" + ")
+        };
 
         let keystone_stats = native::get_keystone_performance_stats();
 
@@ -497,10 +602,20 @@ fn run_dashboard(interval: f64) {
         println!("║           tgrep Cache Dashboard                         ║");
         println!("╠══════════════════════════════════════════════════════════╣");
         println!("║  Cache file:     {:<38}║", path.display());
-        println!("║  File size:      {:<38}║", if file_size > 0 { format_size(file_size) } else { "(not persisted)".to_string() });
+        println!(
+            "║  File size:      {:<38}║",
+            if file_size > 0 {
+                format_size(file_size)
+            } else {
+                "(not persisted)".to_string()
+            }
+        );
         println!("║  Entries:        {:<38}║", entries.len());
         println!("║  File refs:      {:<38}║", total_file_refs);
-        println!("║  File list:      {:<38}║", format!("{} files", file_count));
+        println!(
+            "║  File list:      {:<38}║",
+            format!("{} files", file_count)
+        );
         println!("║  Current gen:    {:<38}║", current_gen);
         if stale_count > 0 {
             println!("║  Stale entries:  {:<38}║", stale_count);
@@ -510,9 +625,18 @@ fn run_dashboard(interval: f64) {
         println!("║    CPU features:  {:<36}║", feature_str);
         if let Some(ref s) = keystone_stats {
             println!("║    Searches:      {:<36}║", s.total_searches);
-            println!("║    Success rate:  {:<36}║", format!("{:.1}%", s.search_success_rate * 100.0));
-            println!("║    Avg time:      {:<36}║", format!("{:.0} ns", s.avg_search_time_ns));
-            println!("║    Peak memory:   {:<36}║", format_size(s.peak_memory_usage as u64));
+            println!(
+                "║    Success rate:  {:<36}║",
+                format!("{:.1}%", s.search_success_rate * 100.0)
+            );
+            println!(
+                "║    Avg time:      {:<36}║",
+                format!("{:.0} ns", s.avg_search_time_ns)
+            );
+            println!(
+                "║    Peak memory:   {:<36}║",
+                format_size(s.peak_memory_usage as u64)
+            );
         } else {
             println!("║    (stats not available)                                 ║");
         }
@@ -531,8 +655,19 @@ fn run_dashboard(interval: f64) {
         println!("║  Top entries:                                           ║");
         for e in entries.iter().take(10) {
             let pat_display = truncate_pattern(&e.pattern);
-            let gen_marker = if e.generation != current_gen { "*" } else { " " };
-            println!("║    {:<34} {:<5} {:>3}{} {:>5}║", pat_display, flags_string(e.flags), e.generation, gen_marker, e.file_count());
+            let gen_marker = if e.generation != current_gen {
+                "*"
+            } else {
+                " "
+            };
+            println!(
+                "║    {:<34} {:<5} {:>3}{} {:>5}║",
+                pat_display,
+                flags_string(e.flags),
+                e.generation,
+                gen_marker,
+                e.file_count()
+            );
         }
         if entries.is_empty() {
             println!("║    (empty)                                              ║");
@@ -555,4 +690,52 @@ fn truncate_pattern(p: &str) -> String {
         end -= 1;
     }
     format!("{}...", &p[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_escapes_json_control_characters() {
+        let pattern = "quote\" slash\\ zero\0 control\u{1} newline\n unicode €";
+        let progress: serde_json::Value =
+            serde_json::from_str(&progress_json(1, 3, 0.25, pattern)).unwrap();
+        assert_eq!(progress["current_pattern"], pattern);
+        assert_eq!(progress["done"], 1);
+        assert_eq!(progress["eta_secs"], 0.5);
+        let complete: serde_json::Value =
+            serde_json::from_str(&progress_json(3, 3, 1.0, pattern)).unwrap();
+        assert!(complete["eta_secs"].is_null());
+    }
+
+    #[test]
+    fn precache_protects_option_like_pattern_and_root() {
+        let command = precache_command(
+            std::path::Path::new("tgrep"),
+            "-needle",
+            "-root",
+            CACHE_FLAG_CASE_INSENSITIVE | CACHE_FLAG_WORD_REGEXP | CACHE_FLAG_FIXED_STRINGS,
+        );
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            arguments,
+            ["-l", "-i", "-w", "-F", "--", "-needle", "-root"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn precache_distinguishes_no_matches_from_search_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        assert!(search_succeeded(std::process::ExitStatus::from_raw(0)));
+        assert!(search_succeeded(std::process::ExitStatus::from_raw(1 << 8)));
+        assert!(!search_succeeded(std::process::ExitStatus::from_raw(
+            2 << 8
+        )));
+        assert!(!search_succeeded(std::process::ExitStatus::from_raw(9)));
+    }
 }

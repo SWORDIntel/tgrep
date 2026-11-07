@@ -1,5 +1,13 @@
 # tgrep Security Review — Pre-Public-Release
 
+Historical assessment of the 2026-09-25 source tree, which declared AGPL-3.0-only.
+Its license findings describe that snapshot. This review is not a security or
+release assessment of the current SRSL-1.1 source tree.
+
+This is a dated assessment and remediation record. The findings table and fix-order section
+describe the original state; they are not a current vulnerability inventory. Volatile reproduction
+artifacts may no longer exist. Remediation claims need current tests before a release decision.
+
 Date: 2026-09-25. Two tracks: static review (all of src/, native/*.c, build/install
 scripts, git history) + dynamic harness (25 state-file corruption mutations, hostile
 search corpus, hostile-tree index build, cache subcommands, kill -9 recovery, env-hijack PoC).
@@ -53,7 +61,8 @@ AGPL-3.0-only.
 
 ## Trust model
 
-State dir defaults to `~/.local/state/tgrep` (0755/0644). Findings marked
+State dir defaults to `~/.local/state/tgrep`. The original assessment observed 0755 directories
+and 0644 files; the remediation record above reports directory hardening to 0700. Findings marked
 [state-dir] require a writable/shared state dir (`TGREP_STATE_DIR`/`XDG_STATE_HOME`
 or account compromise). Everything else requires only files in a searched directory.
 

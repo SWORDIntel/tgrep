@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LicenseRef-SRSL-1.1 */
 /**
  * qihse_wrapper.c — tgrep narrow FFI wrapper around QIHSE file helpers.
  *
@@ -5,26 +6,30 @@
  * Will grow as QIHSE WAL, index manager, and FTS are wired in later phases.
  */
 
-#include <stdint.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <sys/stat.h>
-#include <stdio.h>
-#include <errno.h>
 
 /* fsync a file descriptor. Returns 0 on success, -1 on error. */
-int tgrep_qihse_file_sync(int fd) {
+int tgrep_qihse_file_sync(int fd)
+{
     return fsync(fd);
 }
 
 /* Open a directory and fsync it (ensures directory entries are durable).
  * Returns 0 on success, -1 on error. */
-int tgrep_qihse_dir_sync(const char* path) {
-    if (!path) return -1;
+int tgrep_qihse_dir_sync(const char *path)
+{
+    if (!path)
+        return -1;
     int fd = open(path, O_RDONLY | O_DIRECTORY);
-    if (fd < 0) return -1;
+    if (fd < 0)
+        return -1;
     int rc = fsync(fd);
     close(fd);
     return rc;
@@ -33,18 +38,17 @@ int tgrep_qihse_dir_sync(const char* path) {
 /* Atomic file write: write data to tmp file, fsync, rename to target, fsync dir.
  * Returns 0 on success, -1 on error.
  * This is the crash-safe segment publication primitive. */
-int tgrep_qihse_atomic_write(
-    const char* target_path,
-    const uint8_t* data,
-    size_t len
-) {
-    if (!target_path || (!data && len > 0)) return -1;
+int tgrep_qihse_atomic_write(const char *target_path, const uint8_t *data, size_t len)
+{
+    if (!target_path || (!data && len > 0))
+        return -1;
 
     /* Build tmp path: target_path + ".<pid>.tmp" — unique per process so two
      * writers never race on the same name. */
     size_t path_len = strlen(target_path);
     char tmp_path[4096];
-    if (path_len + 24 >= sizeof(tmp_path)) return -1;
+    if (path_len + 24 >= sizeof(tmp_path))
+        return -1;
     snprintf(tmp_path, sizeof(tmp_path), "%s.%ld.tmp", target_path, (long)getpid());
 
     /* Write to tmp file: exclusive (never clobber an existing file or follow a
@@ -53,19 +57,25 @@ int tgrep_qihse_atomic_write(
     int fd = -1;
     for (int attempt = 0; attempt < 4 && fd < 0; attempt++) {
         if (attempt > 0)
-            snprintf(tmp_path, sizeof(tmp_path), "%s.%ld.%d.tmp",
-                     target_path, (long)getpid(), attempt);
+            snprintf(tmp_path, sizeof(tmp_path), "%s.%ld.%d.tmp", target_path, (long)getpid(),
+                     attempt);
         fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
-        if (fd < 0 && errno != EEXIST) return -1;
+        if (fd < 0 && errno != EEXIST)
+            return -1;
     }
-    if (fd < 0) return -1;
+    if (fd < 0)
+        return -1;
 
     size_t written = 0;
     while (written < len) {
         ssize_t n = write(fd, data + written, len - written);
-        if (n < 0) {
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) {
+            int saved_errno = n == 0 ? EIO : errno;
             close(fd);
             unlink(tmp_path);
+            errno = saved_errno;
             return -1;
         }
         written += (size_t)n;
@@ -89,7 +99,8 @@ int tgrep_qihse_atomic_write(
     /* Extract directory from target_path */
     char dir_path[4096];
     size_t dir_len = path_len;
-    while (dir_len > 0 && target_path[dir_len - 1] != '/') dir_len--;
+    while (dir_len > 0 && target_path[dir_len - 1] != '/')
+        dir_len--;
     if (dir_len == 0) {
         memcpy(dir_path, ".", 2);
     } else {

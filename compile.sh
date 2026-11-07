@@ -14,7 +14,13 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if ! IFS= read -r -d '' SCRIPT_PATH < <(readlink -fz -- "${BASH_SOURCE[0]}"); then
+    echo 'Error: could not resolve compile script path.' >&2
+    exit 2
+fi
+SCRIPT_DIR="${SCRIPT_PATH%/*}"
+[[ -n "$SCRIPT_DIR" ]] || SCRIPT_DIR=/
+cd "$SCRIPT_DIR"
 
 # ── Help ─────────────────────────────────────────────────────────────
 
@@ -118,6 +124,8 @@ case "$SIMD_LEVEL" in
         exit 1
         ;;
 esac
+
+SIMD_FLAGS="${TGREP_SIMD_FLAGS-$SIMD_FLAGS}"
 
 # ── Clean ────────────────────────────────────────────────────────────
 

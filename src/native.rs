@@ -4,7 +4,12 @@
 // are in the `keystone` and `qihse` modules below.
 
 use std::ffi::c_void;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+
+fn path_c(path: &Path) -> Result<std::ffi::CString, String> {
+    std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())
+}
 
 // ── Raw FFI ──────────────────────────────────────────────────────────
 
@@ -185,12 +190,11 @@ pub mod ffi {
         pub fn tgrep_keystone_detect_cpu_features() -> u32;
 
         // Phase 10: QIHSE optimization DB
-        pub fn tgrep_optimization_init(
-            db: *mut crate::native::OptimizationDb,
+        pub fn tgrep_optimization_create(
             max_entries: usize,
             storage_path: *const std::ffi::c_char,
-        ) -> i32;
-        pub fn tgrep_optimization_destroy(db: *mut crate::native::OptimizationDb);
+        ) -> *mut crate::native::OptimizationDb;
+        pub fn tgrep_optimization_free(db: *mut crate::native::OptimizationDb);
         pub fn tgrep_optimization_record(
             db: *mut crate::native::OptimizationDb,
             sig: *const crate::native::DataSignature,
@@ -355,12 +359,10 @@ impl DataSignature {
     }
 }
 
-/// Opaque optimization DB handle. The C side defines the actual layout
-/// (80 bytes on x86-64). We reserve enough space so the C code can write
-/// into it without overwriting adjacent Rust memory.
-#[repr(C, align(8))]
+/// Opaque C-owned optimization DB; its mutex must never move after initialization.
+#[repr(C)]
 pub struct OptimizationDb {
-    _opaque: [u8; 80],
+    _private: [u8; 0],
 }
 
 /// Result of an optimized config lookup.
@@ -467,7 +469,7 @@ impl KeystoneIndex {
     }
 
     /// Begin a streaming document for chunked ingestion.
-    pub fn begin_document(&mut self, name: Option<&str>) -> Result<DocumentStream, String> {
+    pub fn begin_document(&mut self, name: Option<&str>) -> Result<DocumentStream<'_>, String> {
         let name_c = match name.map(std::ffi::CString::new).transpose() {
             Ok(c) => c,
             Err(_) => return Err("document name contains NUL byte".into()),
@@ -482,14 +484,15 @@ impl KeystoneIndex {
         } else {
             Ok(DocumentStream {
                 stream,
-                _name: name_c,
+                _index: std::marker::PhantomData,
             })
         }
     }
 
     /// Extract unique trigrams from a pattern.
     pub fn extract_trigrams(pattern: &[u8]) -> Vec<u32> {
-        let mut buf = vec![0u32; 64];
+        let max_trigrams = pattern.len().saturating_sub(2);
+        let mut buf = vec![0u32; max_trigrams];
         let n = unsafe {
             ffi::tgrep_keystone_extract_trigrams(
                 pattern.as_ptr() as *const std::ffi::c_char,
@@ -528,7 +531,7 @@ impl KeystoneIndex {
     }
 
     /// Create a paginated candidate iterator.
-    pub fn candidates(&self, pattern: &[u8]) -> Result<CandidateIter, String> {
+    pub fn candidates(&self, pattern: &[u8]) -> Result<CandidateIter<'_>, String> {
         let iter = unsafe {
             ffi::tgrep_keystone_candidates_begin(
                 self.handle,
@@ -537,9 +540,12 @@ impl KeystoneIndex {
             )
         };
         if iter.is_null() {
-            Err("no candidates (pattern too short or trigrams not found)".into())
+            Err("candidate iterator unavailable (index not finalized or allocation failed)".into())
         } else {
-            Ok(CandidateIter { iter })
+            Ok(CandidateIter {
+                iter,
+                _index: std::marker::PhantomData,
+            })
         }
     }
 
@@ -564,8 +570,14 @@ impl KeystoneIndex {
     /// Requires a finalized index.
     pub fn collect_postings(&self) -> Result<std::collections::BTreeMap<u32, Vec<u32>>, String> {
         let stats = self.stats();
-        let max_grams = stats.unique_trigrams as usize + 1;
-        let max_doc_ids = stats.total_postings as usize + 1;
+        let max_grams = usize::try_from(stats.unique_trigrams)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or("gram count exceeds addressable memory")?;
+        let max_doc_ids = usize::try_from(stats.total_postings)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or("posting count exceeds addressable memory")?;
 
         let mut grams = vec![0u32; max_grams];
         let mut offsets = vec![0u32; max_grams];
@@ -618,13 +630,22 @@ impl Drop for KeystoneIndex {
 }
 
 /// RAII handle to a streaming document being ingested.
-pub struct DocumentStream {
+///
+/// The index remains exclusively borrowed until the stream is consumed.
+///
+/// ```compile_fail
+/// use tgrep::native::KeystoneIndex;
+/// let mut index = KeystoneIndex::new(1).unwrap();
+/// let stream = index.begin_document(None).unwrap();
+/// index.finalize().unwrap();
+/// stream.cancel();
+/// ```
+pub struct DocumentStream<'a> {
     stream: *mut c_void,
-    // Keep the CString alive so the name persists
-    _name: Option<std::ffi::CString>,
+    _index: std::marker::PhantomData<&'a mut KeystoneIndex>,
 }
 
-impl DocumentStream {
+impl DocumentStream<'_> {
     /// Feed bytes to the current document.
     pub fn feed(&mut self, data: &[u8]) -> Result<(), String> {
         let rc = unsafe { ffi::tgrep_keystone_feed_bytes(self.stream, data.as_ptr(), data.len()) };
@@ -636,15 +657,14 @@ impl DocumentStream {
     }
 
     /// Finish the document and add to index. Returns assigned doc_id.
-    pub fn finish(self, out_doc_id: Option<&mut u32>) -> Result<(), String> {
+    pub fn finish(mut self, out_doc_id: Option<&mut u32>) -> Result<(), String> {
         let mut id: u32 = 0;
         let id_ptr = match out_doc_id {
             Some(p) => p as *mut u32,
             None => &mut id as *mut u32,
         };
         let rc = unsafe { ffi::tgrep_keystone_end_document(self.stream, id_ptr) };
-        // Stream is consumed regardless of result
-        std::mem::forget(self); // prevent Drop from running (stream already freed in C)
+        self.stream = std::ptr::null_mut(); // C consumes the stream on every return path.
         if rc != KS_OK {
             Err(ks_err_str(rc).into())
         } else {
@@ -653,13 +673,13 @@ impl DocumentStream {
     }
 
     /// Abort the document without indexing.
-    pub fn cancel(self) {
+    pub fn cancel(mut self) {
         unsafe { ffi::tgrep_keystone_cancel_document(self.stream) };
-        std::mem::forget(self);
+        self.stream = std::ptr::null_mut();
     }
 }
 
-impl Drop for DocumentStream {
+impl Drop for DocumentStream<'_> {
     fn drop(&mut self) {
         // If not explicitly finished or cancelled, cancel to avoid leak
         if !self.stream.is_null() {
@@ -669,11 +689,21 @@ impl Drop for DocumentStream {
 }
 
 /// RAII handle to a paginated candidate iterator.
-pub struct CandidateIter {
+///
+/// ```compile_fail
+/// use tgrep::native::KeystoneIndex;
+/// let mut index = KeystoneIndex::new(1).unwrap();
+/// index.finalize().unwrap();
+/// let mut iter = index.candidates(b"abc").unwrap();
+/// drop(index);
+/// iter.next_batch(1).unwrap();
+/// ```
+pub struct CandidateIter<'a> {
     iter: *mut c_void,
+    _index: std::marker::PhantomData<&'a KeystoneIndex>,
 }
 
-impl CandidateIter {
+impl CandidateIter<'_> {
     /// Fetch the next batch of candidates. Returns (doc_ids, exhausted).
     pub fn next_batch(&mut self, capacity: usize) -> Result<(Vec<u32>, bool), String> {
         let mut buf = vec![0u32; capacity];
@@ -709,7 +739,7 @@ impl CandidateIter {
     }
 }
 
-impl Drop for CandidateIter {
+impl Drop for CandidateIter<'_> {
     fn drop(&mut self) {
         if !self.iter.is_null() {
             unsafe { ffi::tgrep_keystone_candidates_free(self.iter) };
@@ -721,8 +751,7 @@ impl Drop for CandidateIter {
 
 /// Atomically write data to a file (tmp + fsync + rename + dir fsync).
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
-    let c_path =
-        std::ffi::CString::new(path.to_str().ok_or("invalid path")?).map_err(|e| e.to_string())?;
+    let c_path = path_c(path)?;
     let rc = unsafe { ffi::tgrep_qihse_atomic_write(c_path.as_ptr(), data.as_ptr(), data.len()) };
     if rc != 0 {
         Err(format!("atomic_write failed (rc={})", rc))
@@ -743,8 +772,7 @@ pub fn file_sync(fd: i32) -> Result<(), String> {
 
 /// Open a directory and fsync it.
 pub fn dir_sync(path: &Path) -> Result<(), String> {
-    let c_path =
-        std::ffi::CString::new(path.to_str().ok_or("invalid path")?).map_err(|e| e.to_string())?;
+    let c_path = path_c(path)?;
     let rc = unsafe { ffi::tgrep_qihse_dir_sync(c_path.as_ptr()) };
     if rc != 0 {
         Err(format!("dir_sync failed (rc={})", rc))
@@ -764,6 +792,12 @@ pub struct WalReplayRecord {
     pub txn_id: u64,
 }
 
+#[derive(Default)]
+struct ReplayCollector {
+    records: Vec<WalReplayRecord>,
+    invalid_record: bool,
+}
+
 /// RAII handle to a QIHSE write-ahead log.
 pub struct Wal {
     handle: *mut c_void,
@@ -780,18 +814,18 @@ extern "C" fn replay_trampoline(
 ) -> bool {
     // The C WAL parser consumes attacker-writable files: never trust a
     // (ptr, len) pair — a null key with nonzero len is UB via from_raw_parts.
-    let records = unsafe { &mut *(user_data as *mut Vec<WalReplayRecord>) };
-    if key.is_null() || key_len == 0 {
-        return false; // drop the record; do not build a slice from a bad pair
+    let collector = unsafe { &mut *(user_data as *mut ReplayCollector) };
+    if key.is_null() || key_len == 0 || (value.is_null() && value_len != 0) {
+        collector.invalid_record = true;
+        return false;
     }
-    let key_slice =
-        unsafe { std::slice::from_raw_parts(key as *const u8, key_len as usize) };
+    let key_slice = unsafe { std::slice::from_raw_parts(key as *const u8, key_len as usize) };
     let value_slice = if value.is_null() || value_len == 0 {
         Vec::new()
     } else {
         unsafe { std::slice::from_raw_parts(value, value_len as usize) }.to_vec()
     };
-    records.push(WalReplayRecord {
+    collector.records.push(WalReplayRecord {
         key: key_slice.to_vec(),
         value: value_slice,
         op_type,
@@ -803,8 +837,7 @@ extern "C" fn replay_trampoline(
 impl Wal {
     /// Create or open a WAL in the given directory.
     pub fn create(directory: &Path) -> Result<Self, String> {
-        let c_path = std::ffi::CString::new(directory.to_str().ok_or("invalid path")?)
-            .map_err(|e| e.to_string())?;
+        let c_path = path_c(directory)?;
         let handle = unsafe { ffi::tgrep_wal_create(c_path.as_ptr()) };
         if handle.is_null() {
             Err("qihse_wal_create returned null".to_string())
@@ -820,6 +853,9 @@ impl Wal {
 
     /// Log a segment publication within a transaction.
     pub fn log_segment(&self, txn_id: u64, segment_name: &str, metadata: &[u8]) -> u64 {
+        let Ok(metadata_len) = u32::try_from(metadata.len()) else {
+            return 0;
+        };
         let c_name = match std::ffi::CString::new(segment_name) {
             Ok(s) => s,
             Err(_) => return 0,
@@ -830,7 +866,7 @@ impl Wal {
                 txn_id,
                 c_name.as_ptr(),
                 metadata.as_ptr(),
-                metadata.len() as u32,
+                metadata_len,
             )
         }
     }
@@ -883,14 +919,14 @@ impl Wal {
     /// Replay all committed WAL records. Returns records from committed
     /// transactions only (uncommitted/partial writes are skipped).
     pub fn replay(&self) -> Result<Vec<WalReplayRecord>, String> {
-        let mut records: Vec<WalReplayRecord> = Vec::new();
+        let mut collector = ReplayCollector::default();
         let cb_ptr = replay_trampoline as *const c_void;
-        let user_data = &mut records as *mut Vec<WalReplayRecord> as *mut c_void;
+        let user_data = &mut collector as *mut ReplayCollector as *mut c_void;
         let n = unsafe { ffi::tgrep_wal_replay(self.handle, cb_ptr, user_data) };
-        if n < 0 {
+        if n < 0 || collector.invalid_record {
             Err(format!("wal_replay failed (rc={})", n))
         } else {
-            Ok(records)
+            Ok(collector.records)
         }
     }
 }
@@ -955,27 +991,39 @@ impl HashIndex {
     }
 
     /// Search for all doc IDs matching a token.
-    /// Returns a Vec of doc IDs. Empty if not found.
-    pub fn search_all(&self, token: &[u8]) -> Vec<u32> {
-        let max_results = 4096;
-        let mut buf = vec![0u64; max_results];
-        let count = unsafe {
-            ffi::tgrep_hash_index_search_all(
-                self.handle,
-                token.as_ptr() as *const std::ffi::c_char,
-                token.len(),
-                buf.as_mut_ptr(),
-                max_results,
-            )
-        };
-        buf.truncate(count);
-        buf.into_iter().map(|v| v as u32).collect()
+    /// An empty Vec means no match; allocation failures and invalid IDs are errors.
+    pub fn search_all(&self, token: &[u8]) -> Result<Vec<u32>, String> {
+        let mut buf = vec![0u64; 4096];
+        loop {
+            let count = unsafe {
+                ffi::tgrep_hash_index_search_all(
+                    self.handle,
+                    token.as_ptr() as *const std::ffi::c_char,
+                    token.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            if count == usize::MAX {
+                return Err("hash_index_search_all failed".into());
+            }
+            if count > buf.len() {
+                buf.resize(count, 0);
+                continue;
+            }
+            buf.truncate(count);
+            return buf
+                .into_iter()
+                .map(|id| {
+                    u32::try_from(id).map_err(|_| "hash index document ID exceeds u32".into())
+                })
+                .collect();
+        }
     }
 
     /// Save the hash index to a file.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let path_c = std::ffi::CString::new(path.to_str().ok_or("invalid path")?)
-            .map_err(|e| format!("CString error: {}", e))?;
+        let path_c = path_c(path)?;
         let rc = unsafe { ffi::tgrep_hash_index_save(self.handle, path_c.as_ptr()) };
         if rc != 0 {
             Err(format!("hash_index_save failed (rc={})", rc))
@@ -986,8 +1034,7 @@ impl HashIndex {
 
     /// Load a hash index from a file.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let path_c = std::ffi::CString::new(path.to_str().ok_or("invalid path")?)
-            .map_err(|e| format!("CString error: {}", e))?;
+        let path_c = path_c(path)?;
         let handle = unsafe { ffi::tgrep_hash_index_load(path_c.as_ptr()) };
         if handle.is_null() {
             Err("hash_index_load returned null".into())
@@ -1040,8 +1087,7 @@ impl WordIndexBuilder {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let path_c = std::ffi::CString::new(path.to_str().ok_or("invalid path")?)
-            .map_err(|e| format!("CString error: {}", e))?;
+        let path_c = path_c(path)?;
         let rc = unsafe { ffi::tgrep_word_index_save(self.handle, path_c.as_ptr()) };
         if rc != 0 {
             Err(format!("word_index_save failed (rc={})", rc))
@@ -1068,8 +1114,7 @@ pub struct MmapWordIndex {
 
 impl MmapWordIndex {
     pub fn load(path: &Path) -> Result<Self, String> {
-        let path_c = std::ffi::CString::new(path.to_str().ok_or("invalid path")?)
-            .map_err(|e| format!("CString error: {}", e))?;
+        let path_c = path_c(path)?;
         let handle = unsafe { ffi::tgrep_word_index_load(path_c.as_ptr()) };
         if handle.is_null() {
             Err("word_index_load returned null".into())
@@ -1078,22 +1123,39 @@ impl MmapWordIndex {
         }
     }
 
-    pub fn search(&self, token: &[u8], max_results: usize) -> Vec<u64> {
+    pub fn search(&self, token: &[u8], max_results: usize) -> Result<Vec<u64>, String> {
         if token.is_empty() || max_results == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let mut out = vec![0u64; max_results];
-        let count = unsafe {
-            ffi::tgrep_word_index_search(
-                self.handle,
-                token.as_ptr() as *const std::ffi::c_char,
-                token.len(),
-                out.as_mut_ptr(),
-                max_results,
-            )
-        };
-        out.truncate(count);
-        out
+        // Most tokens have few matching files. Avoid allocating from the total
+        // sidecar entry count (which can be hundreds of thousands per segment)
+        // for every query. Grow only when the result buffer fills; a full buffer
+        // may mean either an exact fit or that more matches remain, so probe at
+        // a larger capacity until a call returns fewer results than it can hold.
+        let mut capacity = max_results.min(4096).max(1);
+        loop {
+            let mut out = Vec::new();
+            out.try_reserve_exact(capacity)
+                .map_err(|error| format!("word-index result allocation failed: {error}"))?;
+            out.resize(capacity, 0u64);
+            let count = unsafe {
+                ffi::tgrep_word_index_search(
+                    self.handle,
+                    token.as_ptr() as *const std::ffi::c_char,
+                    token.len(),
+                    out.as_mut_ptr(),
+                    capacity,
+                )
+            };
+            if count > capacity {
+                return Err("word-index search returned more results than requested".into());
+            }
+            out.truncate(count);
+            if count < capacity || capacity == max_results {
+                return Ok(out);
+            }
+            capacity = capacity.saturating_mul(2).min(max_results);
+        }
     }
 
     pub fn size(&self) -> usize {
@@ -1184,15 +1246,14 @@ pub fn batch_search_auto(
 
     let table_ptr = table.map(|t| t.handle()).unwrap_or(std::ptr::null_mut());
 
-    let pcfg = if threads > 0 {
-        Some(ParallelConfigRaw {
-            num_threads: threads as i32,
+    let pcfg = i32::try_from(threads)
+        .ok()
+        .filter(|count| *count > 0)
+        .map(|num_threads| ParallelConfigRaw {
+            num_threads,
             use_thread_pool: 1,
             batch_chunk: 256,
-        })
-    } else {
-        None
-    };
+        });
 
     unsafe {
         ffi::tgrep_keystone_search_batch_auto(
@@ -1227,9 +1288,9 @@ pub fn batch_search_auto(
 /// for future searches with similar data signatures.
 ///
 /// Persisted as a binary file at the given storage path.
-/// Thread-safe (single mutex on the C side).
+/// The C object uses a mutex; this wrapper requires mutable access for writes.
 pub struct OptimizationDatabase {
-    db: OptimizationDb,
+    db: *mut OptimizationDb,
 }
 
 impl OptimizationDatabase {
@@ -1237,7 +1298,6 @@ impl OptimizationDatabase {
     /// storage path. If a storage path is given and the file exists, entries
     /// are loaded automatically.
     pub fn create(max_entries: usize, storage_path: Option<&str>) -> Result<Self, String> {
-        let mut db = OptimizationDb { _opaque: [0; 80] };
         let c_path = match storage_path.map(std::ffi::CString::new).transpose() {
             Ok(p) => p,
             Err(_) => return Err("storage_path contains NUL byte".into()),
@@ -1246,9 +1306,9 @@ impl OptimizationDatabase {
             .as_ref()
             .map(|s| s.as_ptr())
             .unwrap_or(std::ptr::null());
-        let rc = unsafe { ffi::tgrep_optimization_init(&mut db, max_entries, path_ptr) };
-        if rc != 0 {
-            return Err(format!("optimization_init failed with code {}", rc));
+        let db = unsafe { ffi::tgrep_optimization_create(max_entries, path_ptr) };
+        if db.is_null() {
+            return Err("optimization_create failed".into());
         }
         Ok(OptimizationDatabase { db })
     }
@@ -1266,14 +1326,7 @@ impl OptimizationDatabase {
     ) {
         unsafe {
             ffi::tgrep_optimization_record(
-                &mut self.db,
-                sig,
-                pipeline,
-                dimensions,
-                speedup,
-                confidence,
-                threads,
-                backend,
+                self.db, sig, pipeline, dimensions, speedup, confidence, threads, backend,
             );
         }
     }
@@ -1289,7 +1342,7 @@ impl OptimizationDatabase {
     ) {
         unsafe {
             ffi::tgrep_optimization_record_anchor(
-                &mut self.db,
+                self.db,
                 sig,
                 anchor_count,
                 hit_rate,
@@ -1308,7 +1361,7 @@ impl OptimizationDatabase {
     ) -> Option<OptimizedConfig> {
         let mut out = OptimizedConfig::default();
         let found =
-            unsafe { ffi::tgrep_optimization_get_config(&mut self.db, sig, min_samples, &mut out) };
+            unsafe { ffi::tgrep_optimization_get_config(self.db, sig, min_samples, &mut out) };
         if found != 0 {
             Some(out)
         } else {
@@ -1318,7 +1371,7 @@ impl OptimizationDatabase {
 
     /// Save the DB to disk.
     pub fn save(&mut self) -> Result<(), String> {
-        let rc = unsafe { ffi::tgrep_optimization_save(&mut self.db) };
+        let rc = unsafe { ffi::tgrep_optimization_save(self.db) };
         if rc != 0 {
             Err(format!("optimization_save failed with code {}", rc))
         } else {
@@ -1328,7 +1381,7 @@ impl OptimizationDatabase {
 
     /// Load the DB from disk.
     pub fn load(&mut self) -> Result<(), String> {
-        let rc = unsafe { ffi::tgrep_optimization_load(&mut self.db) };
+        let rc = unsafe { ffi::tgrep_optimization_load(self.db) };
         if rc != 0 {
             Err(format!("optimization_load failed with code {}", rc))
         } else {
@@ -1338,18 +1391,18 @@ impl OptimizationDatabase {
 
     /// Number of entries in the DB.
     pub fn count(&self) -> usize {
-        unsafe { ffi::tgrep_optimization_count(&self.db) }
+        unsafe { ffi::tgrep_optimization_count(self.db) }
     }
 
     /// Enable or disable learning.
     pub fn set_learning(&mut self, enable: bool) {
-        unsafe { ffi::tgrep_optimization_set_learning(&mut self.db, if enable { 1 } else { 0 }) };
+        unsafe { ffi::tgrep_optimization_set_learning(self.db, if enable { 1 } else { 0 }) };
     }
 }
 
 impl Drop for OptimizationDatabase {
     fn drop(&mut self) {
-        unsafe { ffi::tgrep_optimization_destroy(&mut self.db) };
+        unsafe { ffi::tgrep_optimization_free(self.db) };
     }
 }
 
@@ -1492,12 +1545,15 @@ impl SearchCache {
         }
         let mut entries: Vec<CacheEntryInfo> = Vec::with_capacity(max_entries);
         // Safety: CacheEntryInfo is repr(C) and we allocate zeroed entries
-        entries.resize(max_entries, CacheEntryInfo {
-            pattern: std::ptr::null_mut(),
-            flags: 0,
-            generation: 0,
-            file_count: 0,
-        });
+        entries.resize(
+            max_entries,
+            CacheEntryInfo {
+                pattern: std::ptr::null_mut(),
+                flags: 0,
+                generation: 0,
+                file_count: 0,
+            },
+        );
         let mut out_count: usize = 0;
         let rc = unsafe {
             ffi::tgrep_cache_get_entries(
@@ -1711,6 +1767,27 @@ mod tests {
         for &id in &all {
             assert_eq!(id % 2, 1);
         }
+
+        assert_eq!(
+            idx.candidates(b"a").unwrap().collect_all().unwrap().len(),
+            100
+        );
+    }
+
+    #[test]
+    fn test_collect_postings_after_finalize() {
+        let mut idx = KeystoneIndex::new(2).unwrap();
+        for content in [b"abc".as_slice(), b"abd".as_slice()] {
+            let mut stream = idx.begin_document(None).unwrap();
+            stream.feed(content).unwrap();
+            stream.finish(None).unwrap();
+        }
+        idx.finalize().unwrap();
+        let postings = idx.collect_postings().unwrap();
+        let abc = ((b'a' as u32) << 16) | ((b'b' as u32) << 8) | b'c' as u32;
+        let abd = ((b'a' as u32) << 16) | ((b'b' as u32) << 8) | b'd' as u32;
+        assert_eq!(postings.get(&abc), Some(&vec![0]));
+        assert_eq!(postings.get(&abd), Some(&vec![1]));
     }
 
     #[test]
@@ -1725,6 +1802,14 @@ mod tests {
         let trigrams = KeystoneIndex::extract_trigrams(b"hello");
         // "hello" has trigrams: hel, ell, llo = 3
         assert_eq!(trigrams.len(), 3);
+    }
+
+    #[test]
+    fn trigram_extraction_handles_patterns_with_more_than_64_unique_windows() {
+        let pattern: Vec<u8> = (0..=120).collect();
+        let trigrams = KeystoneIndex::extract_trigrams(&pattern);
+        assert_eq!(trigrams.len(), pattern.len() - 2);
+        assert_eq!(trigrams, crate::search::extract_unique_trigrams(&pattern));
     }
 
     #[test]
@@ -1749,6 +1834,25 @@ mod tests {
         let read = std::fs::read(&path).unwrap();
         assert_eq!(read, data);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_native_paths_preserve_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut name = format!("tgrep-native-{}-", std::process::id()).into_bytes();
+        name.push(0xff);
+        let path = std::env::temp_dir().join(std::ffi::OsString::from_vec(name));
+        atomic_write(&path, b"content").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"content");
+        let mut index = HashIndex::create(2).unwrap();
+        index.add(b"word", 7).unwrap();
+        index.finalize().unwrap();
+        index.save(&path).unwrap();
+        assert_eq!(
+            HashIndex::load(&path).unwrap().search_all(b"word").unwrap(),
+            vec![7]
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1810,6 +1914,34 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_replay_rejects_invalid_pointer_pairs() {
+        let mut collector = ReplayCollector::default();
+        let context = &mut collector as *mut ReplayCollector as *mut c_void;
+        assert!(!replay_trampoline(
+            std::ptr::null(),
+            1,
+            std::ptr::null(),
+            0,
+            1,
+            1,
+            context,
+        ));
+        assert!(collector.invalid_record);
+        collector.invalid_record = false;
+        assert!(!replay_trampoline(
+            c"segment".as_ptr(),
+            7,
+            std::ptr::null(),
+            1,
+            1,
+            1,
+            context,
+        ));
+        assert!(collector.invalid_record);
+        assert!(collector.records.is_empty());
+    }
+
+    #[test]
     fn test_wal_multiple_transactions() {
         let wal_dir = std::env::temp_dir().join("tgrep_wal_test_multi");
         let _ = std::fs::remove_dir_all(&wal_dir);
@@ -1860,11 +1992,11 @@ mod tests {
         idx.add(b"world", 3).unwrap();
         idx.finalize().unwrap();
         assert_eq!(idx.count(), 3);
-        let results = idx.search_all(b"hello");
+        let results = idx.search_all(b"hello").unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.contains(&1));
         assert!(results.contains(&2));
-        let results = idx.search_all(b"world");
+        let results = idx.search_all(b"world").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], 3);
     }
@@ -1874,8 +2006,89 @@ mod tests {
         let mut idx = HashIndex::create(16).expect("create");
         idx.add(b"hello", 1).unwrap();
         idx.finalize().unwrap();
-        let results = idx.search_all(b"missing");
+        let results = idx.search_all(b"missing").unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_hash_index_rejects_out_of_range_document_ids() {
+        let mut index = HashIndex::create(2).unwrap();
+        let token = b"oversized";
+        assert_eq!(
+            unsafe {
+                ffi::tgrep_hash_index_add(
+                    index.handle,
+                    token.as_ptr() as *const std::ffi::c_char,
+                    token.len(),
+                    u32::MAX as u64 + 1,
+                )
+            },
+            0
+        );
+        index.finalize().unwrap();
+        assert!(index.search_all(token).is_err());
+        assert_eq!(
+            unsafe {
+                ffi::tgrep_hash_index_search_all(
+                    std::ptr::null_mut(),
+                    token.as_ptr() as *const std::ffi::c_char,
+                    token.len(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn test_hash_index_all_matches_across_buffer_boundary() {
+        for count in [4095u32, 4096, 4097, 5000] {
+            let mut idx = HashIndex::create(8).unwrap();
+            for doc in 0..count {
+                idx.add(b"common", doc).unwrap();
+            }
+            idx.finalize().unwrap();
+            let mut matches = idx.search_all(b"common").unwrap();
+            matches.sort_unstable();
+            assert_eq!(matches, (0..count).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn test_hash_index_matches_counted_binary_tokens() {
+        let mut idx = HashIndex::create(8).unwrap();
+        for (token, doc) in [
+            (&b"ab"[..], 1),
+            (&b"ab\0cd"[..], 2),
+            (&b"ab\0de"[..], 3),
+            (&b"ab\0cd"[..], 4),
+            (&b"\0ab"[..], 5),
+            (&b""[..], 6),
+            (&b"\xff\0\xfe"[..], 7),
+        ] {
+            idx.add(token, doc).unwrap();
+        }
+        idx.finalize().unwrap();
+        assert_eq!(idx.search_all(b"ab").unwrap(), vec![1]);
+        let mut matches = idx.search_all(b"ab\0cd").unwrap();
+        matches.sort_unstable();
+        assert_eq!(matches, vec![2, 4]);
+        assert!(idx.search_all(b"ab\0missing").unwrap().is_empty());
+        assert_eq!(idx.search_all(b"\0ab").unwrap(), vec![5]);
+        assert_eq!(idx.search_all(b"").unwrap(), vec![6]);
+        assert_eq!(idx.search_all(b"\xff\0\xfe").unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn test_hash_index_query_across_stack_buffer_boundary() {
+        for len in [4095, 4096, 4097] {
+            let token = vec![b'a'; len];
+            let mut idx = HashIndex::create(8).unwrap();
+            idx.add(&token, 42).unwrap();
+            idx.finalize().unwrap();
+            assert_eq!(idx.search_all(&token).unwrap(), vec![42]);
+        }
     }
 
     #[test]
@@ -1892,11 +2105,11 @@ mod tests {
         }
         let loaded = HashIndex::load(&path).unwrap();
         assert_eq!(loaded.count(), 3);
-        let results = loaded.search_all(b"alpha");
+        let results = loaded.search_all(b"alpha").unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.contains(&10));
         assert!(results.contains(&30));
-        let results = loaded.search_all(b"beta");
+        let results = loaded.search_all(b"beta").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], 20);
         std::fs::remove_file(&path).unwrap();
@@ -1913,15 +2126,41 @@ mod tests {
         idx.save(&path).unwrap();
         let loaded = MmapWordIndex::load(&path).unwrap();
         assert!(loaded.size() >= 4);
-        let results = loaded.search(b"alpha", 64);
+        let results = loaded.search(b"alpha", 64).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.contains(&10));
         assert!(results.contains(&30));
-        let results = loaded.search(b"beta", 64);
+        let results = loaded.search(b"beta", 64).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], 20);
-        assert!(loaded.search(b"missing", 64).is_empty());
+        assert!(loaded.search(b"missing", 64).unwrap().is_empty());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_qihse_word_index_grows_results_only_for_common_tokens() {
+        let path = std::env::temp_dir().join(format!(
+            "tgrep_qwi_growth_{}_{}.qwi",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut index = WordIndexBuilder::create().unwrap();
+        for doc_id in 0..5000u32 {
+            index.add(b"common", doc_id).unwrap();
+        }
+        index.add(b"rare", 6000).unwrap();
+        index.save(&path).unwrap();
+
+        let loaded = MmapWordIndex::load(&path).unwrap();
+        assert!(loaded.search(b"absent", loaded.size()).unwrap().is_empty());
+        let mut common = loaded.search(b"common", loaded.size()).unwrap();
+        common.sort_unstable();
+        assert_eq!(common, (0..5000u64).collect::<Vec<_>>());
+        assert_eq!(loaded.search(b"rare", loaded.size()).unwrap(), vec![6000]);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1938,14 +2177,14 @@ mod tests {
         }
         let loaded = MmapWordIndex::load(&path).unwrap();
         assert!(loaded.size() >= 4);
-        let results = loaded.search(b"hello", 64);
+        let results = loaded.search(b"hello", 64).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.contains(&1));
         assert!(results.contains(&3));
-        let results = loaded.search(b"world", 64);
+        let results = loaded.search(b"world", 64).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], 2);
-        assert!(loaded.search(b"missing", 64).is_empty());
+        assert!(loaded.search(b"missing", 64).unwrap().is_empty());
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -1961,11 +2200,11 @@ mod tests {
         assert_eq!(idx.count(), 100);
         for i in 0..100 {
             let token = format!("token_{}", i);
-            let results = idx.search_all(token.as_bytes());
+            let results = idx.search_all(token.as_bytes()).unwrap();
             assert_eq!(results.len(), 1, "token {} should have 1 result", i);
             assert_eq!(results[0], i);
         }
-        assert!(idx.search_all(b"missing_token").is_empty());
+        assert!(idx.search_all(b"missing_token").unwrap().is_empty());
     }
 
     #[test]
@@ -1988,6 +2227,7 @@ mod tests {
         assert_eq!(results[2], 6, "key 30 at index 6");
         assert_eq!(results[3], 9, "key 45 at index 9");
         assert_eq!(results[4], KEYSTONE_NOT_FOUND, "key 99 not found");
+        assert_eq!(batch_search_auto(&arr, &keys, None, usize::MAX), results);
     }
 
     #[test]
@@ -2022,6 +2262,19 @@ mod tests {
         assert_eq!(db.count(), 1);
         // Not enough samples yet (min_samples=5)
         assert!(db.get_config(&sig, 5).is_none());
+    }
+
+    #[test]
+    fn test_optimization_db_survives_rust_move() {
+        let mut first = OptimizationDatabase::create(4, None).unwrap();
+        let mut second = OptimizationDatabase::create(4, None).unwrap();
+        let sig = DataSignature::new(42, 100, 0, 0.5, 0.1);
+        first.record(&sig, 1, 8, 2.0, 0.9, 2, 0);
+        std::mem::swap(&mut first, &mut second);
+        assert_eq!(first.count(), 0);
+        assert_eq!(second.count(), 1);
+        second.record(&sig, 1, 8, 2.0, 0.9, 2, 0);
+        assert_eq!(second.get_config(&sig, 2).unwrap().samples, 2);
     }
 
     #[test]

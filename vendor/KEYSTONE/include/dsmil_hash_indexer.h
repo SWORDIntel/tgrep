@@ -42,12 +42,13 @@ void dsmil_hash_index_destroy(dsmil_hash_index_t* idx);
 /**
  * @brief Hash a string (e.g. email, IP, username) and record its byte offset.
  */
-int dsmil_hash_index_add(dsmil_hash_index_t* idx, const char* str, size_t len, uint64_t byte_offset);
+int dsmil_hash_index_add(dsmil_hash_index_t *idx, const char *str, size_t len,
+                         uint64_t byte_offset);
 
 /**
- * @brief Lock and sort the index to prepare for KEYSTONE acceleration.
+ * @brief Sort the index to prepare for searches; adding another entry requires finalizing again.
  */
-int dsmil_hash_index_finalize(dsmil_hash_index_t* idx);
+int dsmil_hash_index_finalize(dsmil_hash_index_t *idx);
 
 /**
  * @brief Execute a sub-logarithmic search for the target string.
@@ -58,7 +59,8 @@ int dsmil_hash_index_finalize(dsmil_hash_index_t* idx);
  *
  * @return KEYSTONE_NOT_FOUND if absent, or the index ordinal on success.
  */
-keystone_result_t dsmil_hash_index_search(dsmil_hash_index_t* idx, const char* query_str, uint64_t* out_offset);
+keystone_result_t dsmil_hash_index_search(dsmil_hash_index_t *idx, const char *query_str,
+                                          uint64_t *out_offset);
 
 /**
  * @brief Search for all entries matching the target string.
@@ -71,15 +73,15 @@ keystone_result_t dsmil_hash_index_search(dsmil_hash_index_t* idx, const char* q
  * @param query_str String to search for.
  * @param out_offsets Caller-provided buffer for results.
  * @param max_offsets Size of out_offsets buffer.
- * @param out_count Number of matches written to out_offsets.
- * @return KEYSTONE_OK on success (including zero matches), KEYSTONE_NOT_FOUND on error.
+ * @param out_count Optional total number of matches, which may exceed max_offsets.
+ * Only min(*out_count, max_offsets) offsets are written; out_offsets may be NULL when max_offsets
+ * is zero. query_str is NUL-terminated, while add accepts counted bytes and retains its own copy.
+ * @return 0 if at least one match exists, KEYSTONE_NOT_FOUND if absent or invalid.
+ * out_count is set to zero on absence or invalid arguments when supplied.
  */
-keystone_result_t dsmil_hash_index_search_all(
-    dsmil_hash_index_t* idx,
-    const char* query_str,
-    uint64_t* out_offsets,
-    size_t max_offsets,
-    size_t* out_count);
+keystone_result_t dsmil_hash_index_search_all(dsmil_hash_index_t *idx, const char *query_str,
+                                              uint64_t *out_offsets, size_t max_offsets,
+                                              size_t *out_count);
 
 /**
  * @brief Serialize a finalized hash index to a file.

@@ -9,7 +9,11 @@ ignore behavior, and exit codes.
 
 ---
 
-## Current Performance Profile
+All performance figures and root-cause hypotheses below are historical research inputs. Expected
+impacts are targets, not measured improvements. In particular, a missing word-index sidecar does not
+by itself explain regressions for searches that do not use the word-index path.
+
+## Historical Performance Profile
 
 ### Measured A/B benchmark (26K files, 1.15 GB, ZFS, SSE4.2)
 
@@ -141,10 +145,10 @@ additional 20–30% over current uniform prefetch. io_uring adds another 10–15
 from index without reading file content.
 
 **Investigate:**
-- Extend index-trust to `-l` (non-word) mode: if file unchanged since index
-  build, and the trigram index says it contains the pattern, trust it
-- Risk: false positives if trigram index has stale data — but mtime+size
-  check should catch modifications
+- Keep content verification for non-word `-l` queries. Trigram intersection only proves that
+  required trigrams occur somewhere in the file; unchanged metadata cannot rule out false positives.
+  For example, `abcXbcdYcdeZdef` contains every trigram of `abcdef`, but not the literal.
+- Exact-token trust still requires compatible token boundaries, flags, and file-version checks.
 - Extend to `-i -l` (case-insensitive): normalize trigrams at index time
 - Extend to `-c` (count): store per-file match counts in index for unchanged
   files — return count without reading
@@ -275,9 +279,9 @@ count (up to I/O bandwidth limit).
 - Rank candidates by trigram frequency score (rarest trigram match = highest
   rank)
 - Verify highest-ranked first
-- For `-l` mode: once enough matches found, skip remaining candidates
-  (if user only needs to know "does it exist")
-- For `-c` mode: verify in rank order, stop when count is determined
+- For quiet existence mode (`-q`), stop after a match subject to required error semantics.
+- `-l` must list every matching file; `-c` must compute complete counts. Candidate ranking must
+  preserve those outputs and cannot omit remaining candidates merely because a match was found.
 - Evaluate: how often do users need ALL matches vs just "any match"?
 - Risk: changes output ordering — may break ripgrep compatibility
 
@@ -410,7 +414,7 @@ For each research area:
 
 ### Benchmark protocol
 
-- **Cold cache:** Clear tgrep search cache before each trial. Note: cannot
+- **Application-cache miss:** Clear tgrep search cache before each trial. Note: cannot
   drop Linux page cache without root — document this limitation.
 - **Warm cache:** Run search twice, measure second run.
 - **Trials:** Minimum 3 per pattern, report median.
