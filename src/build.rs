@@ -813,7 +813,7 @@ struct MemoryGuard {
 }
 
 // Reserve room for the per-file peak before reading the file. Besides the
-// source buffer, tokenization copies unique tokens into a temporary Rust set,
+// source buffer, tokenization deduplicates borrowed token slices in a Rust set,
 // and the native indexes may grow while the content is being fed. Native
 // allocations are observed in resident RSS on later checks; this multiplier
 // protects the transient work that occurs before that RSS check.
@@ -976,6 +976,61 @@ mod resource_tests {
     use super::tests::Scratch;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn roots_inside_state_are_rejected_without_replacing_published_state() {
+        fn snapshot(directory: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            let mut files = std::collections::BTreeMap::new();
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    files.extend(snapshot(&path));
+                } else {
+                    files.insert(path.clone(), fs::read(path).unwrap());
+                }
+            }
+            files
+        }
+
+        let scratch = Scratch::new();
+        let source = scratch.corpus("source", "one.txt");
+        let state = scratch.state();
+        run_build(
+            &[source.to_str().unwrap().into()],
+            1,
+            "512MiB",
+            "1GiB/s",
+            &state,
+        )
+        .unwrap();
+        let nested = state.join("nested-source");
+        fs::create_dir(&nested).unwrap();
+        let nested_file = nested.join("two.txt");
+        fs::write(&nested_file, b"needle\n").unwrap();
+        let root_alias = scratch.0.join("source-alias");
+        let state_alias = scratch.0.join("state-alias");
+        std::os::unix::fs::symlink(&nested, &root_alias).unwrap();
+        std::os::unix::fs::symlink(&state, &state_alias).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        let before = snapshot(&state);
+        for configured_state in [&state, &state_alias] {
+            for invalid_root in [&state, &nested, &nested_file, &root_alias] {
+                // Reject the whole request even when a valid root precedes it.
+                let roots = [
+                    source.to_str().unwrap().into(),
+                    invalid_root.to_str().unwrap().into(),
+                ];
+                let error = run_build(&roots, 1, "512MiB", "1GiB/s", configured_state).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(error.to_string().contains("state directory"));
+                assert_eq!(snapshot(&state), before);
+                assert_eq!(
+                    fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+                    0o755
+                );
+            }
+        }
+    }
 
     #[test]
     fn nested_state_is_excluded_on_initial_and_replacement_builds() {
@@ -1447,8 +1502,29 @@ fn run_build_checked(
                 .ok_or_else(|| std::io::Error::other("root path is not UTF-8"))
         })
         .collect::<std::io::Result<_>>()?;
+    let reject_state_roots = |canonical_state: &Path| {
+        if roots
+            .iter()
+            .any(|root| Path::new(root).starts_with(canonical_state))
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "build roots must be outside the tgrep state directory",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    // Reject existing state roots before even changing permissions, progress or
+    // WAL. Canonical paths cover aliases of both the state and source roots.
+    match fs::canonicalize(state_dir) {
+        Ok(canonical_state) => reject_state_roots(&canonical_state)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     ensure_state_dirs(state_dir)?;
     let canonical_state = fs::canonicalize(state_dir)?;
+    reject_state_roots(&canonical_state)?;
     let _lock = WriterLock::acquire(state_dir)?;
     if let Some(expected_roots) = expected_current_roots {
         let current_roots = current_index_roots(state_dir)?;

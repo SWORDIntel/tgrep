@@ -191,6 +191,7 @@ def main():
     parser.add_argument("--audit-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--trials", type=int, default=9)
+    parser.add_argument("--build-memory", default="2GiB", help="Cooperative budget used equally for both builds")
     args = parser.parse_args()
     if args.trials < 1:
         parser.error("--trials must be positive")
@@ -217,6 +218,7 @@ def main():
     output.mkdir(parents=True)
     report = {"status": "running", "binaries": identities, "trials_per_query": args.trials,
               "method": "One warmup, rotating three-tool order, fresh processes, warm filesystem cache; four search workers, no OS/ARC cache reset.",
+              "build_memory": args.build_memory,
               "corpora": []}
     try:
         for label, rare in [("tgrep", "TGREP_QWI_ENTRY_SIZE"),
@@ -231,7 +233,7 @@ def main():
             for name in ("baseline", "candidate"):
                 state = output / "states" / name / label
                 command = [str(binaries[name]), "index", "build", info["root"],
-                           "--threads", "2", "--max-memory", "2GiB", "--io-limit", "1GiB/s"]
+                           "--threads", "2", "--max-memory", args.build_memory, "--io-limit", "1GiB/s"]
                 print(f"Building {name}/{label}: {info['files']} files, {info['source_bytes']} bytes", flush=True)
                 result, wall_ms = invoke(command, environment(state), timeout=900)
                 (output / f"{name}-{label}-build.log").write_bytes(result.stderr + result.stdout)

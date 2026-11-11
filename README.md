@@ -102,8 +102,10 @@ Unbound legacy THI is neither produced nor used for query pruning.
 **WAL v2** protects segment identity and record headers as well as payloads.
 Complete legacy records remain readable; appends create a new v2 segment.
 Incomplete legacy tails are rejected unchanged. Only an incomplete final v2
-record in the last segment can be repaired after validation. Older binaries
-reject v2 WAL; retain a separate pre-migration state when downgrade is required.
+record in the last segment can be repaired after validation. WAL v2 is not
+downgrade-compatible. Do not open migrated state with older binaries; retain a
+separate pre-migration state when downgrade is required. The repaired 1.1 reader
+rejects v2, but pre-repair readers cannot be assumed to fail safely.
 
 Compaction checks every input posting and present word sidecar. Missing QWI
 omits the merged sidecar; a corrupt present QWI fails. Empty state is a no-op;

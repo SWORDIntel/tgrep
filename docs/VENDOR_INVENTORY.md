@@ -45,8 +45,8 @@ The recorded profile is GCC 14.2.0 on `x86_64-linux-gnu`, with `-std=c11`,
 
 | Inventory category | Files | Logical bytes |
 |---|---:|---:|
-| All retained vendor files | 187 | 9,563,410 |
-| Vendor translation units and reachable headers in this profile | 28 | 413,292 |
+| All retained vendor files | 187 | 9,563,491 |
+| Vendor translation units and reachable headers in this profile | 28 | 413,373 |
 | Vendor files outside this profile's translation-unit/header closure | 159 | 9,150,118 |
 
 The build compiles **15 native translation units**: seven local wrappers and eight

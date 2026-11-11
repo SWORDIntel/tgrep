@@ -991,10 +991,10 @@
       "sha256": "a44cf9aa5aca09ff618caab4530406869eb7be75a24d6e12a1ac5d7cb2a86f46"
     },
     "vendor/QIHSE/include/qihse_wal.h": {
-      "bytes": 6820,
+      "bytes": 6901,
       "reviewed_baseline": "modified",
       "reviewed_baseline_sha256": "8d52c110b0fee9ed77d805b314cbf7c97bead1c3d222e5c29309510162571996",
-      "sha256": "763028aa7ae1dc9d0d070a4e502a58544201a1ecad29ec558ebc547cf81d2cbd"
+      "sha256": "e9169b47192bc3a88f32cc9d8f1a66d702d0869141168b00e1e7a82e57adeedf"
     },
     "vendor/QIHSE/include/qihse_window_executor.h": {
       "bytes": 2658,

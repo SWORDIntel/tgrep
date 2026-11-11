@@ -44,7 +44,8 @@ typedef enum qihse_wal_durability_e {
 
 /* New segments have a 32-byte, little-endian v2 header:
  * zero sentinel[8], "QWALv2\0\0"[8], version[4], segment index[8], CRC32[4].
- * The sentinel is an invalid legacy LSN, so old readers fail closed.
+ * The sentinel is rejected by the repaired legacy reader. Pre-repair readers
+ * may not validate it: v2 state must not be opened with older binaries.
  * Records contain the fields below in little endian, followed by an independent
  * header CRC32, then key/value bytes. The v2 checksum covers concatenated key and
  * value bytes; the header CRC covers all preceding 30 header bytes, including

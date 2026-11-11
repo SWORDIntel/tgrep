@@ -56,7 +56,7 @@ returns corruption errors. Administrative `open` checks every posting.
 `visit_postings` supplies checked compaction traversal; `document_frequency`
 reads checked dictionary counts without decoding postings. V1 remains available
 for administrative inspection but cannot authorize pruning because earlier
-builders indexed decoded UTF-16 as raw bytes.
+builders indexed raw UTF-16 bytes while the verifier decoded the text.
 
 Exact TGS bytes are `90 + 64D + 2L + 16G + 12B + V`, where D is documents,
 L raw path bytes counted once, G dictionary keys, B posting blocks, and V varint
@@ -104,7 +104,9 @@ Complete corruption fails unchanged. Only an incomplete final v2 record in the
 last segment is repairable. Complete legacy records remain readable; incomplete
 legacy tails fail because their lengths lack independent integrity. Appending
 creates a new v2 segment. New headers are staged/synced before no-replacement
-publication, and old readers reject the zero sentinel.
+publication. The repaired 1.1 reader rejects the zero sentinel; pre-repair readers
+may silently stop replay or append to unsupported data. V2 state must not be used
+with older binaries. A downgrade requires a separate pre-migration state.
 
 Validation precedes callbacks and cleanup. Allocation resumes above stored and
 checkpointed LSNs. Short writes/EINTR are handled; write or required sync failures
