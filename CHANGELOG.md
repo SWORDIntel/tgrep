@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Automatically rebuild legacy or unreadable indexes during indexed search from
+  their saved roots; fall back to live scanning if repair fails.
+
 ## 1.2.0 — review repairs
 
 - Version WAL segment/record headers with independent integrity, complete legacy

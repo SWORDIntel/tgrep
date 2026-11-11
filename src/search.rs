@@ -305,6 +305,29 @@ fn load_index_snapshot(
     (manifest, roots)
 }
 
+fn open_search_segments(
+    state_dir: &Path,
+    manifest: Option<&store::Manifest>,
+) -> Result<Vec<SegmentReader>, String> {
+    let mut readers = Vec::new();
+    let Some(manifest) = manifest else {
+        return Ok(readers);
+    };
+    let segments_dir = state_dir.join("segments");
+    for name in &manifest.segments {
+        match SegmentReader::open_for_search(&segments_dir.join(name)) {
+            Ok(reader) if reader.supports_safe_pruning() => readers.push(reader),
+            Ok(_) => {
+                return Err(format!("legacy index segment {name} requires rebuilding"));
+            }
+            Err(error) => {
+                return Err(format!("failed to read index segment {name}: {error}"));
+            }
+        }
+    }
+    Ok(readers)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct IndexCostEstimate {
     documents: u64,
@@ -413,51 +436,69 @@ pub fn run_search(config: SearchConfig) {
 
     // Load the manifest and open segments
     let state_dir = default_state_dir();
-    let (manifest, root_snapshot) = load_index_snapshot(&state_dir, store::load_manifest);
-    let can_use_index = root_snapshot.is_some();
+    let segments_dir = state_dir.join("segments");
+    let (mut manifest, mut root_snapshot) = load_index_snapshot(&state_dir, store::load_manifest);
+    let mut can_use_index = root_snapshot.is_some();
     if config.indexed_only && !can_use_index {
         eprintln!(
             "tgrep: --indexed-only requires an index with a meaningful absolute root mapping"
         );
         exit(2);
     }
-    let indexed_roots = root_snapshot.unwrap_or_default();
+    let mut indexed_roots = root_snapshot.take().unwrap_or_default();
     let mut plan = if can_use_index {
         plan
     } else {
         QueryPlan::Streaming
     };
-    let segments_dir = state_dir.join("segments");
-
-    let mut readers: Vec<SegmentReader> = Vec::new();
-    if let Some(manifest) = manifest
-        .as_ref()
-        .filter(|_| can_use_index && !matches!(plan, QueryPlan::Streaming))
-    {
-        for name in &manifest.segments {
-            match SegmentReader::open_for_search(&segments_dir.join(name)) {
-                Ok(reader) if reader.supports_safe_pruning() => readers.push(reader),
-                Ok(_) => {
-                    eprintln!("tgrep: legacy index requires rebuilding; scanning source files");
-                    if config.indexed_only {
-                        exit(2);
+    let mut readers = if can_use_index && !matches!(plan, QueryPlan::Streaming) {
+        match open_search_segments(&state_dir, manifest.as_ref()) {
+            Ok(readers) => readers,
+            Err(reason) => {
+                eprintln!("tgrep: {reason}; rebuilding the index from its saved roots");
+                match crate::build::rebuild() {
+                    Ok(()) => {
+                        (manifest, root_snapshot) =
+                            load_index_snapshot(&state_dir, store::load_manifest);
+                        can_use_index = root_snapshot.is_some();
+                        indexed_roots = root_snapshot.take().unwrap_or_default();
+                        if can_use_index {
+                            match open_search_segments(&state_dir, manifest.as_ref()) {
+                                Ok(readers) => readers,
+                                Err(reopen_error) => {
+                                    eprintln!(
+                                        "tgrep: rebuilt index could not be opened: {reopen_error}"
+                                    );
+                                    if config.indexed_only {
+                                        exit(2);
+                                    }
+                                    plan = QueryPlan::Streaming;
+                                    Vec::new()
+                                }
+                            }
+                        } else {
+                            eprintln!("tgrep: rebuild completed without a usable root mapping");
+                            if config.indexed_only {
+                                exit(2);
+                            }
+                            plan = QueryPlan::Streaming;
+                            Vec::new()
+                        }
                     }
-                    readers.clear();
-                    plan = QueryPlan::Streaming;
-                    break;
-                }
-                Err(error) => {
-                    eprintln!("tgrep: failed to read index segment {}: {}", name, error);
-                    if config.indexed_only {
-                        exit(2);
+                    Err(error) => {
+                        eprintln!("tgrep: automatic index rebuild failed: {error}");
+                        if config.indexed_only {
+                            exit(2);
+                        }
+                        plan = QueryPlan::Streaming;
+                        Vec::new()
                     }
-                    readers.clear();
-                    plan = QueryPlan::Streaming;
-                    break;
                 }
             }
         }
-    }
+    } else {
+        Vec::new()
+    };
     // This pass is already required for root binding. Reuse it for cost
     // metadata instead of decoding every document table a second time.
     let mut indexed_source_bytes = 0u64;

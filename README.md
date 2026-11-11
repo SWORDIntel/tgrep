@@ -96,8 +96,11 @@ files may contribute index entries; source verification decides output behavior.
 
 New builds write **TGS v2** and **QWI v3**, with checked metadata/postings and word
 blocks bound to the TGS generation and metadata fingerprint. Legacy TGS v1 lacks
-safe encoding provenance: normal search scans, indexed-only requires rebuilding.
-Unbound legacy THI is neither produced nor used for query pruning.
+safe encoding provenance. Search automatically rebuilds legacy or unreadable
+segments from saved roots and publishes the replacement atomically. If rebuilding
+fails, normal search scans source files and `--indexed-only` reports the failure.
+Index repair never removes source files. Unbound legacy THI is neither produced
+nor used for query pruning.
 
 **WAL v2** protects segment identity and record headers as well as payloads.
 Complete legacy records remain readable; appends create a new v2 segment.
