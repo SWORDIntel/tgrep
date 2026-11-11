@@ -1,6 +1,6 @@
 # tgrep roadmap
 
-## Review repair reconstruction — in progress
+## Review repair reconstruction — complete
 
 Audit baseline: `22d146ad3751597711b57116060e84cf169fc87b`. The environment
 reverted before previous repaired source delivery. This branch reconstructs the
@@ -13,8 +13,16 @@ Historical test results are not completion gates here.
 - [x] Reapply WAL v2 framing and conservative legacy migration.
 - [x] Reapply bounded per-file output and cost-based query routing.
 - [x] Reapply checked snapshot compaction and vendor inventory.
-- [ ] Pass release tests, strict Clippy, formatting and native sanitizers.
-- [ ] Remeasure immutable corpora, output memory and compaction; package source/executable.
+- [x] Pass release tests, strict Clippy, formatting and native sanitizers.
+- [x] Remeasure immutable corpora, output memory and compaction; package source/executable.
+
+Fresh application-source validation at `e61f441fc2ab666995d9cd760b4bcc85ee23fb24`:
+253 release harness entries passed, strict Clippy/formatting/vendor inventory passed,
+17 WAL and 12 QWI sanitizer groups passed, 135 paired search trials matched independent
+ripgrep, nine large-output runs agreed, and 12 compaction query comparisons passed.
+The exact executable and source bundle accompany the review. See `BENCHMARKS.md`
+for measured sizes, latency regressions, memory/compaction results and evidence hashes.
+These eight repair gates are separate from the continuing work below.
 
 ## Continuing engineering work
 
