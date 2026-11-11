@@ -1,290 +1,135 @@
-# tgrep — persistent-index search, released
+# tgrep — persistent indexes for live-file search
 
-**Historical v1.0.0 release** (AGPL-3.0). Its pre-release security review and
-hardening record is in [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
+tgrep uses file-level trigram and word-hash indexes to select candidates, then
+checks source content with ripgrep's matching libraries. Ordinary searches walk
+the requested filesystem, respect ignore rules, and scan files outside valid
+index coverage. An index is a filter; cached results are ordering hints.
 
-Persistent trigram-indexed search that drops in as a ripgrep accelerator.
+Current source version: **1.2.0**. The accompanying [SRSL-1.1 licence](LICENSE)
+applies to tgrep; third-party components retain their own licences. See
+[CHANGELOG.md](CHANGELOG.md), [ARCHITECTURE.md](ARCHITECTURE.md), and
+[BENCHMARKS.md](BENCHMARKS.md) for behavior, measurements and limits.
 
-tgrep builds a persistent trigram index over your codebase and uses it to
-skip files that can't match your search pattern. When installed as an `rg`
-wrapper, it transparently routes searches to the index when beneficial and
-delegates to real ripgrep for everything else — all `rg` flags work
-identically.
+## Build and run
 
-## Install
-
-**Debian/Ubuntu (amd64)** — grab the `.deb` from
-[Releases](https://github.com/SWORDIntel/tgrep/releases):
-
-```bash
-sudo apt install ./tgrep_1.0.0_amd64.deb
-tgrep index build ~          # index your home directory
-```
-
-**From source** (Linux): run `./install.sh` — it builds, installs the
-`rg` wrapper, offers a compressed ZFS dataset for the index on ZFS systems,
-and offers to build a systemwide index. Scripted installs: `--index`,
-`--no-index`, `--zfs`, `--no-zfs`.
-
-## Performance
-
-Benchmarked on a 26K-file, 1.15 GB corpus (10 trials, cold cache):
-
-| Category | vs ripgrep (cold) | vs ripgrep (warm) |
-|----------|-------------------|-------------------|
-| Rare patterns | **5.5–12.8x faster** | 12–54x faster |
-| Broad patterns | **2.4–8.4x faster** | 24–42x faster |
-| Word search (`-w`) | **1.3–10.7x faster** | 20–46x faster |
-| Case-insensitive | within 10% | 29–36x faster |
-
-Previously, `-w` word searches were 1.0–1.1x slower than rg. The index-trust
-optimization (mtime-based verification skip) now makes them 4.8–10.7x faster.
-
-See `BENCHMARKS.md` for full results and `benchmarks/graphs/` for visualizations.
-
-## Quick start
+Linux, Rust, a C compiler, and independent ripgrep are required for the full
+validation suite. Default native compilation uses SSE4.2; the executable requires
+a compatible CPU. `compile.sh` may select more host-specific SIMD flags. The
+scripts do not implement cross compilation or runtime CPU multiversioning.
 
 ```bash
-# Install tgrep and create the rg wrapper
-./install.sh
-
-# Build an index for your codebase
-tgrep index build /path/to/code
-
-# Search — uses the index automatically
-rg "pattern" /path/to/code          # faster than real rg
-rg -w "word" /path/to/code          # much faster (hash index + index-trust)
-rg -A 2 "pattern" /path/to/code     # delegates to real rg (unsupported flag)
-rg --help                           # identical to real rg
-rg --version                        # identical to real rg
+cargo build --release --locked --bin tgrep
+./target/release/tgrep --version
+TGREP_STATE_DIR=/path/to/tgrep-state ./target/release/tgrep index build /path/to/source
+TGREP_STATE_DIR=/path/to/tgrep-state ./target/release/tgrep -l -F needle /path/to/source
+TGREP_STATE_DIR=/path/to/tgrep-state ./target/release/tgrep index status
 ```
 
-## How it works
+The Cargo command uses Cargo's configured target directory. `compile.sh` and
+`install.sh` resolve that directory from Cargo metadata, explicitly build the
+native host target, and use `<target_directory>/<host>/<profile>/tgrep`. They
+reject `CARGO_BUILD_TARGET` before cleaning or installing. `--version` reports
+package version, source revision/dirty state, profile and target; an archive
+without Git metadata reports `source-archive`.
 
-tgrep sits between you and ripgrep:
+State resolves through `TGREP_STATE_DIR`, `$XDG_STATE_HOME/tgrep`,
+`$HOME/.local/state/tgrep`, then `.tgrep` if no home is available. Keep it outside
+source roots when possible. The builder also excludes its canonical state
+directory, including configured symlink aliases, and rejects roots inside state.
 
-```
-rg command
-    │
-    ▼
-┌──────────────┐     indexed search?     ┌──────────────┐
-│  tgrep router │───── yes ──────────────▶│  tgrep index │
-└──────────────┘                          └──────────────┘
-    │ no                                         │
-    ▼                                            ▼
-┌──────────────┐                          ┌──────────────┐
-│  real ripgrep │◀──── results merged ────│  grep-printer │
-└──────────────┘                          └──────────────┘
-```
+## Searching
 
-1. **Index exists and pattern benefits?** → tgrep uses the trigram index
-   to find candidate files, then verifies matches with `grep-searcher`
-   (same engine ripgrep uses).
-2. **Unsupported flags or no index?** → delegates to real ripgrep with
-   all original arguments. Output is identical.
-3. **`-w` word search with index-trust?** → skips content verification
-   for files whose mtime matches the file list cache (file unchanged
-   since indexing). Changed files are still verified.
+The direct CLI accepts `-w`, `-l`, `-c`, `-n`, `-q`, `-i`, `-S`, `-F`, repeated
+`-e`, `--explain`, `--list-files` and `--indexed-only`. `--explain` reports a plan
+without executing the query. Direct `-j`, `--hidden`, `-g`, `-H` and `-I` flags
+are not exposed; the implemented config subset covers workers, hidden files,
+globs and case mode. The wrapper delegates unsupported commands/configuration.
 
-## Installation
+Traversal observes `.gitignore`, `.ignore` and `.rgignore`. Freshness comparisons
+include device, inode, size, mtime and ctime. New and changed files are scanned;
+matching metadata or cache hits never authorize an unverified result. This is
+live search, not a filesystem snapshot. Case-insensitive/unindexable queries
+stream. Broad queries over small indexed files can also stream when checked
+dictionary frequencies predict little useful pruning.
 
-### Prerequisites
+`--indexed-only` bypasses cost-based streaming, excludes uncovered files, and
+errors when safe indexed execution is unavailable. It is a diagnostic mode,
+not a complete live-search result.
 
-- Rust (rustup/cargo)
-- ripgrep (`rg`) installed and in PATH
-- C compiler (gcc/clang) for native KEYSTONE/QIHSE extensions
+Completed-file output uses a bounded queue. Per-file output memory is capped at
+1 MiB before spilling to a private anonymous temporary file. Spill/copy buffers
+are bounded; write and flush failures propagate. Broken pipes cancel workers and
+close temporary files. Large output can consume temporary disk space and add I/O.
+This bounds output buffering, not total process RSS or matcher working memory.
 
-### Install
+## Optional rg wrapper
 
 ```bash
-git clone <repo-url> tgrep
-cd tgrep
-./install.sh
+./install.sh --no-index --no-zfs
 ```
 
-This will:
-1. Build tgrep in release mode
-2. Find your real `rg` binary
-3. Install `tgrep` to `~/.local/bin/tgrep`
-4. Create an `rg` wrapper at `~/.local/bin/rg`
-5. Store the real rg path for delegation
+The installer builds tgrep, locates independent rg, and creates the wrapper in
+`~/.local/bin`. Supported nonterminal searches can use tgrep. Unsupported flags,
+non-UTF-8 arguments, terminal output, and wrapper `--help`/`--version` delegate
+with original argument bytes. Use `tgrep --version` to identify tgrep itself.
+`./install.sh --uninstall` removes the installation while preserving state.
 
-Make sure `~/.local/bin` is in your `PATH` (check your shell config).
+## Index lifecycle
 
-### Uninstall
+| Command | Behavior |
+| --- | --- |
+| `index build ROOT...` | Full source build with atomic manifest replacement. |
+| `index status` | Validate active segments; report active, obsolete, temporary, auxiliary, logical and allocated bytes. |
+| `index refresh` / `index rebuild` | Full source rebuild of bound roots. |
+| `index compact` | Merge checked immutable snapshots without source reads; preserve freshness metadata and root bindings. |
+| `index recover` | Validate WAL, retain committed segments and clean unreferenced files; does not publish a new manifest. |
+| `index pause` / `index resume` | Cooperative file-boundary pause; after an interrupted process, resume starts a full rebuild from saved options. |
 
 ```bash
-./install.sh --uninstall
+tgrep index build /path/to/source --threads 2 --max-memory 2GiB --io-limit 1GiB/s
 ```
 
-Restores direct ripgrep access. Index data in `~/.local/state/tgrep` is
-preserved — remove it manually if desired.
+Memory reservations/RSS checks and logical I/O pacing are cooperative, not OS
+limits. Operations can burst between checks. Budget failures preserve the old
+manifest. Files larger than 64 MiB and BOM-marked UTF-16 remain scan-only. Binary
+files may contribute index entries; source verification decides output behavior.
 
-## Usage
+New builds write **TGS v2** and **QWI v3**, with checked metadata/postings and word
+blocks bound to the TGS generation and metadata fingerprint. Legacy TGS v1 lacks
+safe encoding provenance: normal search scans, indexed-only requires rebuilding.
+Unbound legacy THI is neither produced nor used for query pruning.
 
-### Indexing
+**WAL v2** protects segment identity and record headers as well as payloads.
+Complete legacy records remain readable; appends create a new v2 segment.
+Incomplete legacy tails are rejected unchanged. Only an incomplete final v2
+record in the last segment can be repaired after validation. Older binaries
+reject v2 WAL; retain a separate pre-migration state when downgrade is required.
+
+Compaction checks every input posting and present word sidecar. Missing QWI
+omits the merged sidecar; a corrupt present QWI fails. Empty state is a no-op;
+one segment is fully checked without rewriting. Old snapshots stay usable until
+replacement publication. Files with uncertain commit/publication outcomes are
+retained. Compaction does not add files or refresh source changes.
+
+## Validation and remaining scope
 
 ```bash
-# Build a fresh index
-tgrep index build /path/to/code
-
-# Check index status
-tgrep index status
-
-# Scan committed WAL records and clean up unreferenced segment files
-tgrep index recover
-
-# Pause an active build at a file boundary, then let it continue
-tgrep index pause
-tgrep index resume
-
-# Reindex the roots currently bound to the index
-tgrep index refresh
-tgrep index rebuild
-
-# Reindex those roots and remove obsolete segment files
-tgrep index compact
+cargo test --release --locked -j 4
+cargo clippy --all-targets --locked -j 4 -- -D warnings
+cargo fmt --all -- --check
+python3 scripts/vendor_inventory.py --check
 ```
 
-`refresh` and `rebuild` currently both perform a full source reindex; neither is
-incremental. `compact` also performs a full source reindex, then removes obsolete
-segments and sidecars. It does not merge existing segments. `recover` retains
-committed WAL segment files and removes unreferenced segment files, but leaves
-the manifest unchanged; it does not resume a build or publish an index. A pause
-request is cooperative: the active builder finishes its current file, records
-paused status, and waits. If the builder exits or is interrupted, `resume`
-restarts a full reindex from saved roots and build options.
+CLI tests require real rg and do not silently skip the oracle. Review harnesses
+record executable/corpus hashes, independent byte counts, parity and timing
+conditions. Historical performance claims are preserved under `docs/history/`;
+they do not describe current live-file behavior.
 
-### Searching
+Incremental refresh, deployment-filesystem performance tuning and runtime SIMD
+dispatch remain open. [docs/VENDOR_INVENTORY.md](docs/VENDOR_INVENTORY.md) records
+native scope without treating unlinked files as automatically removable.
 
-After installation, use `rg` as normal — tgrep handles routing automatically.
-
-You can also use `tgrep` directly:
-
-```bash
-tgrep "pattern" /path/to/code          # basic search
-tgrep -w "word" /path/to/code          # whole-word (hash index fast path)
-tgrep -l "pattern" /path/to/code       # files with matches
-tgrep -c "pattern" /path/to/code       # count matches
-tgrep -n "pattern" /path/to/code       # line numbers
-tgrep -i "pattern" /path/to/code       # case-insensitive (streaming)
-tgrep --explain "pattern" /path/to/code # show query plan
-```
-
-### Cache
-
-tgrep caches `-l` (files-with-matches) results for instant repeat searches:
-
-```bash
-tgrep cache status       # show cache stats
-tgrep cache clear        # clear all cached results
-tgrep cache compact      # compact the cache
-tgrep cache dashboard    # live cache + KEYSTONE telemetry
-```
-
-## Supported rg flags
-
-tgrep handles these flags directly (using the index):
-
-| Flag | Description |
-|------|-------------|
-| `-w, --word-regexp` | Whole-word search (hash index fast path) |
-| `-l, --files-with-matches` | Print only filenames |
-| `-c, --count` | Count matches per file |
-| `-n, --line-number` | Show line numbers |
-| `-q, --quiet` | Suppress output (exit code only) |
-| `-i, --ignore-case` | Case-insensitive (streaming fallback) |
-| `-S, --smart-case` | Smart case detection |
-| `-F, --fixed-strings` | Literal string search |
-| `-e, --regexp PATTERN` | Multiple patterns |
-| `-j, --threads N` | Thread count |
-| `--hidden` | Search hidden files |
-| `-g, --glob GLOB` | File glob filter |
-| `-H, --with-filename` | Print filename (default) |
-| `-I, --no-filename` | Suppress filename |
-
-All other flags (`-A`, `-B`, `-C`, `--json`, `--color`, `-r`, `-U`, `-P`,
-`-z`, `-o`, `-p`, `--files`, `--type-list`, etc.) are delegated to real
-ripgrep with identical behavior.
-
-## Architecture
-
-tgrep combines three components:
-
-- **KEYSTONE** — trigram extraction, candidate selection, posting traversal,
-  and batch search with SIMD acceleration (SSE4.2/AVX2/AVX512).
-- **QIHSE** — persistence, WAL/recovery, mmap-backed word index (`.qwi`),
-  search-result cache, and optimization database.
-- **grep-printer** / **grep-searcher** / **grep-regex** — ripgrep-compatible
-  output, verification, and regex matching.
-
-### Index format
-
-| Component | Description |
-|-----------|-------------|
-| `.tgs` segments | Trigram postings with delta-varint encoding |
-| `.qwi` sidecars | mmap-backed flat sorted word index (240 MB for 26K files) |
-| `.thi` sidecars | Legacy KEYSTONE hash index (fallback) |
-| `manifest.json` | Segment list and generation tracking |
-| `file_list_cache.json` | File metadata for mtime-based index-trust |
-| `optimization.qdb` | Per-query performance optimization database |
-| `search_cache.qsc` | Cached `-l` search results |
-| `wal/` | Segment transaction records; recovery does not publish a manifest |
-
-See `ARCHITECTURE.md` for the full design and `KEYSTONE_CHANGES.md` for
-KEYSTONE API extension details.
-
-## Benchmarking
-
-```bash
-# Comprehensive benchmark (19 patterns, 10 trials)
-./benchmarks/run_benchmarks.sh 10
-
-# Generate graphs
-python3 benchmarks/make_graphs.py
-
-# Results: benchmarks/benchmark_results.csv, benchmarks/graphs/
-```
-
-## Project structure
-
-```
-tgrep/
-├── install.sh              # Installer (creates rg wrapper)
-├── Cargo.toml
-├── src/
-│   ├── main.rs             # CLI entry point + rg-compat detection
-│   ├── rg_compat.rs        # rg compatibility router
-│   ├── search.rs           # Search pipeline (trigram/hash/streaming)
-│   ├── build.rs            # Index build pipeline
-│   ├── store.rs            # Segment format (.tgs)
-│   ├── native.rs           # FFI bindings to KEYSTONE/QIHSE
-│   ├── cache.rs            # Search-result cache
-│   ├── cache_v2.rs         # v2 cache (grouped entries, file IDs)
-│   └── index.rs            # Index management commands
-├── native/                 # C wrappers for KEYSTONE/QIHSE
-│   ├── keystone_wrapper.c
-│   ├── word_index_mmap.c    # mmap flat word index (.qwi)
-│   ├── qihse_wal_wrapper.c
-│   └── ...
-├── benchmarks/
-│   ├── run_benchmarks.sh   # Benchmark runner
-│   ├── make_graphs.py      # Graph generator
-│   └── graphs/             # PNG visualizations
-└── docs/
-    ├── ARCHITECTURE.md
-    ├── ROADMAP.md
-    ├── BENCHMARKS.md
-    └── KEYSTONE_CHANGES.md
-```
-
-## Dependencies
-
-- [KEYSTONE](https://github.com/SWORDIntel/KEYSTONE) — trigram index engine
-- [QIHSE](https://github.com/SWORDIntel/QIHSE) — persistence, WAL, word index
-- [ripgrep](https://github.com/BurntSushi/ripgrep) — the real `rg` for delegation
-- [grep-printer](https://docs.rs/grep-printer) — ripgrep-compatible output
-
-## License
-
-tgrep is licensed under the **SWORD Restricted Source Licence v1.1 (SRSL-1.1)**. Personal and non-commercial use is permitted under its terms; commercial exploitation requires a separate written agreement. See [LICENSE](LICENSE).
+The tracked historical 1.0.0 Debian executable lacks established source
+provenance. Build current source. `scripts/build_deb.sh` derives dependencies
+from the staged ELF and fails if Debian library metadata is missing; it does
+not guess a libc floor. See [ROADMAP.md](ROADMAP.md).

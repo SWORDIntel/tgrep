@@ -11,60 +11,34 @@ progress bar by reading `ROADMAP.md` and counting completed phases.
 
 ## Project overview
 
-tgrep is a persistent trigram-indexed search tool. See:
-- `ARCHITECTURE.md` — system design
-- `PLAN.md` — implementation plan (11 phases)
-- `ROADMAP.md` — progress tracking
-- `KEYSTONE_CHANGES.md` — KEYSTONE API extension details
+tgrep is a persistent trigram/word-index filter for live-file searches.
+Read `README.md` for commands, `ARCHITECTURE.md` for invariants, `ROADMAP.md`
+for unfinished work and `BENCHMARKS.md` for measurements. `PLAN.md` and
+`docs/history/` preserve historical targets/snapshots. Old test counts,
+workstation assumptions and timing ratios are not current validation.
 
-## Build & test
-
-```bash
-cargo build          # compile
-cargo build --release # optimized build (required for benchmarks)
-cargo test           # run the current test suite
-cargo test -- --nocapture  # run tests with output
-```
-
-## Benchmark
+## Build and validation
 
 ```bash
-# Comprehensive benchmark suite (19 patterns, 10 trials, cold + warm cache)
-./benchmarks/run_benchmarks.sh 10 /tmp/tgrep_qwi_mmap /rpool/scratch/tgrep_corpus
-
-# Generate graphs from benchmark CSV
-python3 benchmarks/make_graphs.py
-
-# Paired tgrep vs rg benchmark (10 trials, verifies result equality)
-TGREP_STATE_DIR=/tmp/tgrep_qwi_mmap ./target/release/bench "Pattern" /rpool/scratch/tgrep_corpus 10
-
-# Indexed-only mode (skips unindexed file scan, for measuring pure index performance)
-TGREP_STATE_DIR=/tmp/tgrep_qwi_mmap ./target/release/bench "Pattern" /rpool/scratch/tgrep_corpus 10 -- --indexed-only
-
-# Debug: list files that would be searched
-TGREP_STATE_DIR=/tmp/tgrep_qwi_mmap ./target/release/tgrep --list-files "Pattern" /rpool/scratch/tgrep_corpus
-
-# Explain query plan without searching
-TGREP_STATE_DIR=/tmp/tgrep_qwi_mmap ./target/release/tgrep --explain "Pattern" /rpool/scratch/tgrep_corpus
+cargo build --release --locked --bin tgrep
+cargo test --release --locked -j 4
+cargo clippy --all-targets --locked -j 4 -- -D warnings
+cargo fmt --all -- --check
+python3 scripts/vendor_inventory.py --check
 ```
 
-See `BENCHMARKS.md` for full results and `benchmarks/graphs/` for visualizations.
+CLI tests require independent ripgrep. Measure release builds with explicit
+state outside immutable corpora; compare outputs and timings. Review harnesses
+record hashes, byte counts and measurement conditions. Do not run heavy builds
+or sanitizer jobs alongside benchmarks.
 
-## Key dependencies
+## Storage and search invariants
 
-- KEYSTONE: `vendor/KEYSTONE` (trigram index engine compiled by `build.rs`)
-- QIHSE: `vendor/QIHSE` (selected persistence sources compiled by `build.rs`)
-- Corpus: `/rpool/scratch/tgrep_corpus` (strong test corpus, 26K files, 1.15 GB, includes hidden files)
-- Index state: `/tmp/tgrep_qwi_mmap` (mmap .qwi word index, 75 segments, file list cache)
+Keep published segments immutable. Corruption broadens ordinary search to
+scanning or produces an indexed-only error, never a false negative. Cache hits
+only order verification. Preserve root bindings and freshness through compaction.
+After attempted COMMIT or manifest publication, retain files on ambiguous failure.
 
-## Implementation status
-
-The roadmap records completion of implementation phases 0–11. Its historical test and benchmark
-results are snapshots; they do not establish current regression coverage or live-file correctness.
-Post-Phase 11: mmap word index, index-trust optimization, comprehensive benchmark suite.
-The following are historical reported timings; see the methodology limits in `BENCHMARKS.md`.
-- Rare patterns: 5.5–12.8x faster than rg (cold), 12–54x (warm)
-- Broad patterns: 2.4–8.4x faster than rg (cold), 24–42x (warm)
-- Word patterns: 1.3–10.7x faster than rg (cold), 20–46x (warm)
-- Case-insensitive: within 10% of rg (cold), 29–36x (warm)
-See `ROADMAP.md` for phase progress and `ARCHITECTURE.md` for design details.
+Root `build.rs` lists linked native sources. Vendor inventory records hashes and
+compiler-discovered headers; it does not establish imported upstream provenance
+or justify removing unlinked files without further review.

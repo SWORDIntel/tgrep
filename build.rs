@@ -1,4 +1,55 @@
+use std::process::Command;
+
+fn git_output(arguments: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(arguments).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn build_version() {
+    let mut revision = git_output(&["rev-parse", "--short=12", "HEAD"])
+        .unwrap_or_else(|| "source-archive".to_owned());
+    if git_output(&["status", "--porcelain"]).is_some_and(|status| !status.is_empty()) {
+        revision.push_str("-dirty");
+    }
+    // Watch Git metadata and tracked inputs so a rebuild records the actual
+    // checkout, including worktrees whose .git entry is a file.
+    for name in ["HEAD", "index"] {
+        if let Some(path) = git_output(&["rev-parse", "--git-path", name]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    if let Some(reference) = git_output(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git_output(&["rev-parse", "--git-path", &reference]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    if let Ok(output) = Command::new("git").args(["ls-files", "-z"]).output() {
+        if output.status.success() {
+            for path in output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+            {
+                if let Ok(path) = std::str::from_utf8(path) {
+                    // Cargo's line protocol cannot represent newline-containing paths.
+                    if !path.contains(['\r', '\n']) {
+                        println!("cargo:rerun-if-changed={path}");
+                    }
+                }
+            }
+        }
+    }
+    let version = std::env::var("CARGO_PKG_VERSION").expect("Cargo supplies package version");
+    let profile = std::env::var("PROFILE").expect("Cargo supplies build profile");
+    let target = std::env::var("TARGET").expect("Cargo supplies target triple");
+    println!("cargo:rustc-env=TGREP_BUILD_VERSION={version} ({revision}; {profile}; {target})");
+}
+
 fn main() {
+    build_version();
     println!("cargo:rerun-if-env-changed=TGREP_SIMD_FLAGS");
     for directory in [
         "native",

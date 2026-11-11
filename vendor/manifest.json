@@ -1,0 +1,1181 @@
+{
+  "baseline_is_upstream_import": false,
+  "keystone_comparison": {
+    "current_comparison": {
+      "include/dsmil_dirty_parser.h": "identical",
+      "include/dsmil_hash_indexer.h": "different",
+      "include/dsmil_keystone_wrapper.h": "identical",
+      "include/dsmil_micro_model.h": "identical",
+      "include/dsmil_model_bridge.h": "identical",
+      "include/dsmil_model_weights.h": "identical",
+      "include/dsmil_telemetry_processor.h": "identical",
+      "include/keystone.h": "identical",
+      "include/keystone_exact_index.h": "different",
+      "include/keystone_fabric.h": "identical",
+      "include/keystone_federated_query.h": "different",
+      "include/keystone_federation.h": "different",
+      "include/keystone_hybrid.h": "different",
+      "include/keystone_incident.h": "different",
+      "include/keystone_rag.h": "different",
+      "include/keystone_safe_alloc.h": "identical",
+      "include/keystone_tar_zst.h": "identical",
+      "include/keystone_telemetry.h": "different",
+      "include/keystone_temporal.h": "different",
+      "include/keystone_topology.h": "different",
+      "include/keystone_trigram.h": "identical",
+      "include/keystoned.h": "different",
+      "include/qihse_keystone_bridge.h": "identical",
+      "include/simdjson.h": "identical",
+      "src/dsmil_hash_indexer.c": "different",
+      "src/keystone.c": "different",
+      "src/keystone_avx512.c": "different",
+      "src/keystone_avx512.h": "different",
+      "src/keystone_avx512_search.c": "different",
+      "src/keystone_trigram.c": "different"
+    },
+    "is_upstream_import_baseline": false,
+    "reference_sha256": {
+      "include/dsmil_dirty_parser.h": "39a60629cd079977e2b19bb1d984a9d5b555de936f6fc8ad6e062c97af577446",
+      "include/dsmil_hash_indexer.h": "147ed7fddfd565d7d4bcc80205de4e611089a63943c38a8a2149718e6897cb6c",
+      "include/dsmil_keystone_wrapper.h": "e5aeac95674fab4b75cb65cd2d05e1c941aaf561d5ad2f199cac9c81b74bb7ed",
+      "include/dsmil_micro_model.h": "c5e55b7743734f86fb201aec32978c4888c485f7f4bd0b3c9b0c09423b781b6a",
+      "include/dsmil_model_bridge.h": "54c93b554a32b26afd3d9fcb3c35476750bfc26f2a23816f410d92270f66d957",
+      "include/dsmil_model_weights.h": "59656cb5848d0e40418181d1b2cf5546805859bfccfcc2c563961564680f1105",
+      "include/dsmil_telemetry_processor.h": "c25616f0b74d911a783cb59ba21756f6f4e34fbb5a00bd7d6e1495677ecfaa64",
+      "include/keystone.h": "0ac4729fc4ce2b628ae1b4e531a42077c0582b8eeebaba38330f9d94c13013a5",
+      "include/keystone_exact_index.h": "c680e50b2a476b61906f302e624525d8cf5ca1448d8883e4e10dd0c16ff23fae",
+      "include/keystone_fabric.h": "732e766694835eb0be6b24876763e769e091197401d76c55123413a96d1fdc1b",
+      "include/keystone_federated_query.h": "a054c1c18fe26c76a5aefc7e7c667479c3ff2b72017b534284a61f08e61036d8",
+      "include/keystone_federation.h": "5cfc94969f661e9af70b4920970d5dbf005fbd1416ff96a8127c397230011a82",
+      "include/keystone_hybrid.h": "2a29cd6b03442d084d8b63196733b30e8e3705d7688ec4308f0a61dbb3338d97",
+      "include/keystone_incident.h": "8484240cc13ad75fea802b99cedf296e30206b0014732ffbac23aac1ebf0fbb5",
+      "include/keystone_rag.h": "0346cf1bd4167a9a0402ab6ffadd550c2fcd37a5ade47105218b1d91323f6142",
+      "include/keystone_safe_alloc.h": "4c5aa846e72408701393201796f5b16d3a7c25e66305d2227e4c0c1ffc73f1dc",
+      "include/keystone_tar_zst.h": "dc4bfeab09b86128848c4098462fba6fb1d57120654f1a6f35d3dbb19978d812",
+      "include/keystone_telemetry.h": "58daa9f3fc31db8ab1ef6f9c393f9ec1f75fc399402c10d783c0b13273c3a211",
+      "include/keystone_temporal.h": "608dee5e920eb6bc55c634f0c3d27a3f57ef8b3aaaaeb6a770eea897a09a9f69",
+      "include/keystone_topology.h": "42cd22a6b1fb0aa638e9a803e70a98065e374b4d91a2f6f783d57aaf268ed30d",
+      "include/keystone_trigram.h": "5c477e56b846066356ff867974fb64ccc0a4c1d1d0652ebe20208f94e03cba1f",
+      "include/keystoned.h": "657ef08137ab268fedb6610049017992361cd51e3af8fad0f586749fca2caed2",
+      "include/qihse_keystone_bridge.h": "83e73c26994dcd8e91ccebfdeaec681443dee7298104102b583e5d663cd7918d",
+      "include/simdjson.h": "53eb123e20c330b6a6dbb0b4792bc7cb1f8e147af8124b29adcf264866ba064b",
+      "src/dsmil_hash_indexer.c": "e47077de69524b946a0d7fbf27bcdec644bd664b2bd2286c6ffb0556c15c970a",
+      "src/keystone.c": "cf7ed1906bfc88eb5b5b150fd3feb937b1a6b48ddec86fc70aeab6fcb29cc2da",
+      "src/keystone_avx512.c": "9a1aa784347e7d5908f4fc8d9b179af0452b3ac80d90cf49ec70cd24549d08b5",
+      "src/keystone_avx512.h": "0295a059eaadb28ab66c3bbe1213109a20ea9a2a41af3d0c32555107770efcb2",
+      "src/keystone_avx512_search.c": "a2a10da264663f727fc6b303b9d7a15a3c67f70516c9e95d9436a239275dd03e",
+      "src/keystone_trigram.c": "e4e68c10c11f51536c4cbad8492ff2c9271a01ab64ec8b258917626c70af2f38"
+    },
+    "revision": "da8e31fc92a4bb35b572b2935aed8d8377cc9e1b"
+  },
+  "native_build": {
+    "compiler_command": [
+      "cc"
+    ],
+    "compiler_target": "x86_64-linux-gnu",
+    "compiler_version": "cc (Debian 14.2.0-19) 14.2.0",
+    "flags": [
+      "-std=c11",
+      "-D_GNU_SOURCE",
+      "-Wall",
+      "-Wextra",
+      "-O2",
+      "-msse4.2"
+    ],
+    "include_directories": [
+      "vendor/KEYSTONE/include",
+      "vendor/QIHSE/include",
+      "vendor/QIHSE/persistence"
+    ],
+    "translation_units": {
+      "native/hash_wrapper.c": {
+        "headers": [
+          "vendor/KEYSTONE/include/dsmil_hash_indexer.h",
+          "vendor/KEYSTONE/include/keystone.h",
+          "vendor/KEYSTONE/include/keystone_exact_index.h",
+          "vendor/KEYSTONE/include/keystone_fabric.h",
+          "vendor/KEYSTONE/include/keystone_federated_query.h",
+          "vendor/KEYSTONE/include/keystone_federation.h",
+          "vendor/KEYSTONE/include/keystone_hybrid.h",
+          "vendor/KEYSTONE/include/keystone_incident.h",
+          "vendor/KEYSTONE/include/keystone_rag.h",
+          "vendor/KEYSTONE/include/keystone_telemetry.h",
+          "vendor/KEYSTONE/include/keystone_temporal.h",
+          "vendor/KEYSTONE/include/keystone_topology.h",
+          "vendor/KEYSTONE/include/keystone_trigram.h",
+          "vendor/KEYSTONE/include/keystoned.h"
+        ],
+        "sha256": "b2f7c2d31437d69a4197ba3249038ce74fc95dbcd82f96cc1b5aa2d1e7efea8b"
+      },
+      "native/keystone_wrapper.c": {
+        "headers": [
+          "vendor/KEYSTONE/include/keystone.h",
+          "vendor/KEYSTONE/include/keystone_exact_index.h",
+          "vendor/KEYSTONE/include/keystone_fabric.h",
+          "vendor/KEYSTONE/include/keystone_federated_query.h",
+          "vendor/KEYSTONE/include/keystone_federation.h",
+          "vendor/KEYSTONE/include/keystone_hybrid.h",
+          "vendor/KEYSTONE/include/keystone_incident.h",
+          "vendor/KEYSTONE/include/keystone_rag.h",
+          "vendor/KEYSTONE/include/keystone_telemetry.h",
+          "vendor/KEYSTONE/include/keystone_temporal.h",
+          "vendor/KEYSTONE/include/keystone_topology.h",
+          "vendor/KEYSTONE/include/keystone_trigram.h",
+          "vendor/KEYSTONE/include/keystoned.h"
+        ],
+        "sha256": "c268b82efcea9c88c8ad8f9271a05bca5085445b4cb77988c755e424c238bcba"
+      },
+      "native/qihse_cache_wrapper.c": {
+        "headers": [
+          "vendor/QIHSE/include/qihse_table_store.h"
+        ],
+        "sha256": "b8eaa2343fb2bb8ef12fe53c1ae72771b339c5b424ca3222d03311b10c7ec326"
+      },
+      "native/qihse_opt_wrapper.c": {
+        "headers": [],
+        "sha256": "cd761286a53bdff9672c9bff3f32660388b15a83eb60da28149e9a1d8c302dd6"
+      },
+      "native/qihse_wal_wrapper.c": {
+        "headers": [
+          "vendor/QIHSE/include/qihse_platform.h",
+          "vendor/QIHSE/include/qihse_wal.h"
+        ],
+        "sha256": "b374dc4335ee9841f3a817493b0dd3d0c62e61760c11d1befa28f0ce3e091e56"
+      },
+      "native/qihse_wrapper.c": {
+        "headers": [],
+        "sha256": "d9be3f470d727193406b7c7b10c2304039c68281b8fc364f771f9144983d7445"
+      },
+      "native/word_index_mmap.c": {
+        "headers": [
+          "vendor/QIHSE/include/qihse_btree.h"
+        ],
+        "sha256": "23f4e2a6ed9951be136ab7a418bab6b7147fe4750ce67b497559fbd14711ee5d"
+      },
+      "vendor/KEYSTONE/src/dsmil_hash_indexer.c": {
+        "headers": [
+          "vendor/KEYSTONE/include/dsmil_hash_indexer.h",
+          "vendor/KEYSTONE/include/keystone.h",
+          "vendor/KEYSTONE/include/keystone_exact_index.h",
+          "vendor/KEYSTONE/include/keystone_fabric.h",
+          "vendor/KEYSTONE/include/keystone_federated_query.h",
+          "vendor/KEYSTONE/include/keystone_federation.h",
+          "vendor/KEYSTONE/include/keystone_hybrid.h",
+          "vendor/KEYSTONE/include/keystone_incident.h",
+          "vendor/KEYSTONE/include/keystone_rag.h",
+          "vendor/KEYSTONE/include/keystone_safe_alloc.h",
+          "vendor/KEYSTONE/include/keystone_telemetry.h",
+          "vendor/KEYSTONE/include/keystone_temporal.h",
+          "vendor/KEYSTONE/include/keystone_topology.h",
+          "vendor/KEYSTONE/include/keystone_trigram.h",
+          "vendor/KEYSTONE/include/keystoned.h"
+        ],
+        "sha256": "97e7b171ec77b45c6a5227bf21897deca8e7183d7d3a7fcd1a03894708c0a65b"
+      },
+      "vendor/KEYSTONE/src/keystone.c": {
+        "headers": [
+          "vendor/KEYSTONE/include/keystone.h",
+          "vendor/KEYSTONE/include/keystone_exact_index.h",
+          "vendor/KEYSTONE/include/keystone_fabric.h",
+          "vendor/KEYSTONE/include/keystone_federated_query.h",
+          "vendor/KEYSTONE/include/keystone_federation.h",
+          "vendor/KEYSTONE/include/keystone_hybrid.h",
+          "vendor/KEYSTONE/include/keystone_incident.h",
+          "vendor/KEYSTONE/include/keystone_rag.h",
+          "vendor/KEYSTONE/include/keystone_safe_alloc.h",
+          "vendor/KEYSTONE/include/keystone_telemetry.h",
+          "vendor/KEYSTONE/include/keystone_temporal.h",
+          "vendor/KEYSTONE/include/keystone_topology.h",
+          "vendor/KEYSTONE/include/keystone_trigram.h",
+          "vendor/KEYSTONE/include/keystoned.h",
+          "vendor/KEYSTONE/src/keystone_avx512.h"
+        ],
+        "sha256": "00c99345f8fb0cb02565a6636f2048faee80f9fc7429208f2c4e3eaa7d81f05a"
+      },
+      "vendor/KEYSTONE/src/keystone_avx512.c": {
+        "headers": [
+          "vendor/KEYSTONE/src/keystone_avx512.h"
+        ],
+        "sha256": "92bd88e1ff3625e0bd76639c18a2e26802d4be08e6066be4a88c3b13192f8f17"
+      },
+      "vendor/KEYSTONE/src/keystone_avx512_search.c": {
+        "headers": [
+          "vendor/KEYSTONE/src/keystone_avx512.h"
+        ],
+        "sha256": "c17d359422a0635eb3340963093c32152d3aac7b4dba3345c4d4a252bce15440"
+      },
+      "vendor/KEYSTONE/src/keystone_trigram.c": {
+        "headers": [
+          "vendor/KEYSTONE/include/keystone_trigram.h"
+        ],
+        "sha256": "ddb8bac18448796666258b47b4c94a2ae4b7ab1ca7dceb5e373533583404fa0b"
+      },
+      "vendor/QIHSE/src/frieze/qihse_btree.c": {
+        "headers": [
+          "vendor/QIHSE/include/qihse_btree.h",
+          "vendor/QIHSE/include/qihse_platform.h"
+        ],
+        "sha256": "e3e35b897fb2e8f36435f44403f33aa87b0c94f483fe579350590afbdeda2617"
+      },
+      "vendor/QIHSE/src/tractable/qihse_table_store.c": {
+        "headers": [
+          "vendor/QIHSE/include/qihse_table_store.h"
+        ],
+        "sha256": "e892a9b9a3d41e65c3daad9ddc9d2bd839bbae76b0cc5bd4abaffaeb35132be3"
+      },
+      "vendor/QIHSE/src/tractable/qihse_wal.c": {
+        "headers": [
+          "vendor/QIHSE/include/qihse_platform.h",
+          "vendor/QIHSE/include/qihse_wal.h"
+        ],
+        "sha256": "f0561d2a56a572c3bd5f1fc5857c87cbad519bad98f883853c5a94be0a77804b"
+      }
+    }
+  },
+  "original_import_revisions": {
+    "KEYSTONE": null,
+    "QIHSE": null
+  },
+  "removed_since_reviewed_baseline": [],
+  "reviewed_repository_baseline": "22d146ad3751597711b57116060e84cf169fc87b",
+  "schema_version": 1,
+  "vendor_files": {
+    "vendor/KEYSTONE/include/dsmil_dirty_parser.h": {
+      "bytes": 1669,
+      "reviewed_baseline": "unchanged",
+      "sha256": "39a60629cd079977e2b19bb1d984a9d5b555de936f6fc8ad6e062c97af577446"
+    },
+    "vendor/KEYSTONE/include/dsmil_hash_indexer.h": {
+      "bytes": 3802,
+      "reviewed_baseline": "unchanged",
+      "sha256": "0bd6c334f0e914f1376e82428873a731405a94e9b7e494b7f4cd1be0fbbbebc4"
+    },
+    "vendor/KEYSTONE/include/dsmil_keystone_wrapper.h": {
+      "bytes": 18344,
+      "reviewed_baseline": "unchanged",
+      "sha256": "e5aeac95674fab4b75cb65cd2d05e1c941aaf561d5ad2f199cac9c81b74bb7ed"
+    },
+    "vendor/KEYSTONE/include/dsmil_micro_model.h": {
+      "bytes": 1857,
+      "reviewed_baseline": "unchanged",
+      "sha256": "c5e55b7743734f86fb201aec32978c4888c485f7f4bd0b3c9b0c09423b781b6a"
+    },
+    "vendor/KEYSTONE/include/dsmil_model_bridge.h": {
+      "bytes": 1682,
+      "reviewed_baseline": "unchanged",
+      "sha256": "54c93b554a32b26afd3d9fcb3c35476750bfc26f2a23816f410d92270f66d957"
+    },
+    "vendor/KEYSTONE/include/dsmil_model_weights.h": {
+      "bytes": 199016,
+      "reviewed_baseline": "unchanged",
+      "sha256": "59656cb5848d0e40418181d1b2cf5546805859bfccfcc2c563961564680f1105"
+    },
+    "vendor/KEYSTONE/include/dsmil_telemetry_processor.h": {
+      "bytes": 6613,
+      "reviewed_baseline": "unchanged",
+      "sha256": "c25616f0b74d911a783cb59ba21756f6f4e34fbb5a00bd7d6e1495677ecfaa64"
+    },
+    "vendor/KEYSTONE/include/keystone.h": {
+      "bytes": 13202,
+      "reviewed_baseline": "unchanged",
+      "sha256": "0ac4729fc4ce2b628ae1b4e531a42077c0582b8eeebaba38330f9d94c13013a5"
+    },
+    "vendor/KEYSTONE/include/keystone_exact_index.h": {
+      "bytes": 2834,
+      "reviewed_baseline": "unchanged",
+      "sha256": "13079add013a3bb147cf9f57975515afc67029c0a707c151a8b1653c63455cf0"
+    },
+    "vendor/KEYSTONE/include/keystone_fabric.h": {
+      "bytes": 4766,
+      "reviewed_baseline": "unchanged",
+      "sha256": "732e766694835eb0be6b24876763e769e091197401d76c55123413a96d1fdc1b"
+    },
+    "vendor/KEYSTONE/include/keystone_federated_query.h": {
+      "bytes": 4496,
+      "reviewed_baseline": "unchanged",
+      "sha256": "225cfa71b90873c7b72dbb2ab2427afcb090427e55f0049647fc6bc1f7d8015f"
+    },
+    "vendor/KEYSTONE/include/keystone_federation.h": {
+      "bytes": 9601,
+      "reviewed_baseline": "unchanged",
+      "sha256": "b11f544bbcd11ea4d9de19f1c71c9e19be0245390fefb21509efbfe65a5b6da9"
+    },
+    "vendor/KEYSTONE/include/keystone_hybrid.h": {
+      "bytes": 2640,
+      "reviewed_baseline": "unchanged",
+      "sha256": "778e749a8427ab5275f0c22364cf67a258d020b7c98b0902849af4625e797e76"
+    },
+    "vendor/KEYSTONE/include/keystone_incident.h": {
+      "bytes": 4371,
+      "reviewed_baseline": "unchanged",
+      "sha256": "ea191bdeb2780101ec7cd7eef6afbff77ef37c6de151ab3139f8acc5ca062509"
+    },
+    "vendor/KEYSTONE/include/keystone_rag.h": {
+      "bytes": 4440,
+      "reviewed_baseline": "unchanged",
+      "sha256": "f3aadda5cf6aa7e0eccec09a9821c56cd3922c490a6f727a35c5bce0773cfd3a"
+    },
+    "vendor/KEYSTONE/include/keystone_safe_alloc.h": {
+      "bytes": 1217,
+      "reviewed_baseline": "unchanged",
+      "sha256": "4c5aa846e72408701393201796f5b16d3a7c25e66305d2227e4c0c1ffc73f1dc"
+    },
+    "vendor/KEYSTONE/include/keystone_tar_zst.h": {
+      "bytes": 9886,
+      "reviewed_baseline": "unchanged",
+      "sha256": "dc4bfeab09b86128848c4098462fba6fb1d57120654f1a6f35d3dbb19978d812"
+    },
+    "vendor/KEYSTONE/include/keystone_telemetry.h": {
+      "bytes": 6486,
+      "reviewed_baseline": "unchanged",
+      "sha256": "d8875d7f277c83a2d93444b76c2f452c65891b1649240977e3e3ce6420847841"
+    },
+    "vendor/KEYSTONE/include/keystone_temporal.h": {
+      "bytes": 3708,
+      "reviewed_baseline": "unchanged",
+      "sha256": "f27c7ed472287f84a2682a52d1bc014f3d3553a87dfebfbacf790819bb09972b"
+    },
+    "vendor/KEYSTONE/include/keystone_topology.h": {
+      "bytes": 3835,
+      "reviewed_baseline": "unchanged",
+      "sha256": "65b5ffcbc4bc2e6f7ee80126d42dec888c7931b21ded3543d040f5873f48333d"
+    },
+    "vendor/KEYSTONE/include/keystone_trigram.h": {
+      "bytes": 12670,
+      "reviewed_baseline": "unchanged",
+      "sha256": "5c477e56b846066356ff867974fb64ccc0a4c1d1d0652ebe20208f94e03cba1f"
+    },
+    "vendor/KEYSTONE/include/keystoned.h": {
+      "bytes": 5726,
+      "reviewed_baseline": "unchanged",
+      "sha256": "8a33b50c9744ad26b4d2a17b5e105a32d5ca31161b697b5425e2b529afb7f5b3"
+    },
+    "vendor/KEYSTONE/include/qihse_keystone_bridge.h": {
+      "bytes": 3046,
+      "reviewed_baseline": "unchanged",
+      "sha256": "83e73c26994dcd8e91ccebfdeaec681443dee7298104102b583e5d663cd7918d"
+    },
+    "vendor/KEYSTONE/include/simdjson.h": {
+      "bytes": 7711281,
+      "reviewed_baseline": "unchanged",
+      "sha256": "53eb123e20c330b6a6dbb0b4792bc7cb1f8e147af8124b29adcf264866ba064b"
+    },
+    "vendor/KEYSTONE/src/dsmil_hash_indexer.c": {
+      "bytes": 17496,
+      "reviewed_baseline": "unchanged",
+      "sha256": "97e7b171ec77b45c6a5227bf21897deca8e7183d7d3a7fcd1a03894708c0a65b"
+    },
+    "vendor/KEYSTONE/src/keystone.c": {
+      "bytes": 98345,
+      "reviewed_baseline": "unchanged",
+      "sha256": "00c99345f8fb0cb02565a6636f2048faee80f9fc7429208f2c4e3eaa7d81f05a"
+    },
+    "vendor/KEYSTONE/src/keystone_avx512.c": {
+      "bytes": 1831,
+      "reviewed_baseline": "unchanged",
+      "sha256": "92bd88e1ff3625e0bd76639c18a2e26802d4be08e6066be4a88c3b13192f8f17"
+    },
+    "vendor/KEYSTONE/src/keystone_avx512.h": {
+      "bytes": 3680,
+      "reviewed_baseline": "unchanged",
+      "sha256": "8ca4e389ddc00ab7c834e549daeb5316946a87a04d7fd2a2fa965bcbb142eb1e"
+    },
+    "vendor/KEYSTONE/src/keystone_avx512_search.c": {
+      "bytes": 14660,
+      "reviewed_baseline": "unchanged",
+      "sha256": "c17d359422a0635eb3340963093c32152d3aac7b4dba3345c4d4a252bce15440"
+    },
+    "vendor/KEYSTONE/src/keystone_trigram.c": {
+      "bytes": 97187,
+      "reviewed_baseline": "unchanged",
+      "sha256": "ddb8bac18448796666258b47b4c94a2ae4b7ab1ca7dceb5e373533583404fa0b"
+    },
+    "vendor/QIHSE/include/qihse.h": {
+      "bytes": 21575,
+      "reviewed_baseline": "unchanged",
+      "sha256": "32b9ca1aae71cee1ec64f5cb9d512e90b31e09ca7bc03c09a5587cce976f608b"
+    },
+    "vendor/QIHSE/include/qihse_af_xdp.h": {
+      "bytes": 5346,
+      "reviewed_baseline": "unchanged",
+      "sha256": "a1a151e41c6d11ffe59db1023a647026bfe6059a246c6f57d9a49f366b87b39d"
+    },
+    "vendor/QIHSE/include/qihse_aggregate_executor.h": {
+      "bytes": 1628,
+      "reviewed_baseline": "unchanged",
+      "sha256": "80c3038b50bd180ab9ea10d72d78cbee7ff34bd2afd2d79cf2c64bfada15ab57"
+    },
+    "vendor/QIHSE/include/qihse_ai_memory.h": {
+      "bytes": 7466,
+      "reviewed_baseline": "unchanged",
+      "sha256": "b6f7efe70d72560024fa870c489fe7f24a383df8bbf041c1d787efdfe1371401"
+    },
+    "vendor/QIHSE/include/qihse_arena.h": {
+      "bytes": 1194,
+      "reviewed_baseline": "unchanged",
+      "sha256": "7b3aa3bfb059a1e437ec172efb14e7b840b738f6bd32bffb81d11784a189e560"
+    },
+    "vendor/QIHSE/include/qihse_auth.h": {
+      "bytes": 7961,
+      "reviewed_baseline": "unchanged",
+      "sha256": "ccd778b39e72457e93bf6106202706be95d95aab435e5d29780ee28b26b33a8b"
+    },
+    "vendor/QIHSE/include/qihse_backup.h": {
+      "bytes": 30565,
+      "reviewed_baseline": "unchanged",
+      "sha256": "e7736a6cdccf10d5fb9cd17100451bae9ac099a3c09bf0cfa73198c291e0c22a"
+    },
+    "vendor/QIHSE/include/qihse_blob.h": {
+      "bytes": 5436,
+      "reviewed_baseline": "unchanged",
+      "sha256": "3d77f281dbe0bd526a33b89f9843ffe5a834eaa7b366ec6dff249cf977514a73"
+    },
+    "vendor/QIHSE/include/qihse_bolt.h": {
+      "bytes": 4750,
+      "reviewed_baseline": "unchanged",
+      "sha256": "44888c8b0d66a229d718106c2a8e561a3cc2a635bee004d30e2c69f7f87392c3"
+    },
+    "vendor/QIHSE/include/qihse_btree.h": {
+      "bytes": 6875,
+      "reviewed_baseline": "unchanged",
+      "sha256": "3b9e9144d6992a5efb5145f88bbb2f876137daf08bce5fe06c75959590a9a0c4"
+    },
+    "vendor/QIHSE/include/qihse_bundle.h": {
+      "bytes": 2704,
+      "reviewed_baseline": "unchanged",
+      "sha256": "ff950ede1ef816343a31238335e27e87783900b9e3e85d5a8b1f7e9626f1e4e9"
+    },
+    "vendor/QIHSE/include/qihse_bytecode.h": {
+      "bytes": 2532,
+      "reviewed_baseline": "unchanged",
+      "sha256": "ebecf0e8ad0e58f934cace9f13d2ded1d5e0eb8cb766b3106b3afec5bcdd4f1b"
+    },
+    "vendor/QIHSE/include/qihse_bytecode_compiler.h": {
+      "bytes": 2587,
+      "reviewed_baseline": "unchanged",
+      "sha256": "6e064c560a32cfb87f643990cf5f086019f6d8845e18d36328722bdde341a6e1"
+    },
+    "vendor/QIHSE/include/qihse_ca_provision.h": {
+      "bytes": 9994,
+      "reviewed_baseline": "unchanged",
+      "sha256": "29aed6e82bb194c6368d23fad3fda7254d5c73242f06f9baa30cb84681d4af0a"
+    },
+    "vendor/QIHSE/include/qihse_cdc.h": {
+      "bytes": 1665,
+      "reviewed_baseline": "unchanged",
+      "sha256": "50e3523b1c2893875a21216779e81c8348c2999849dd71c67d515851b952da98"
+    },
+    "vendor/QIHSE/include/qihse_clickhouse_http.h": {
+      "bytes": 3672,
+      "reviewed_baseline": "unchanged",
+      "sha256": "713a00244dfaa9aab79bc1c80bc6bfcc678e998ecd0b57ad61dd880a34cb5d7d"
+    },
+    "vendor/QIHSE/include/qihse_clickhouse_sql.h": {
+      "bytes": 27291,
+      "reviewed_baseline": "unchanged",
+      "sha256": "a6c3b46dccb95a3e42865d08a5a77f0ca2ee13e4e7d79fd3257f9345dcd8ee36"
+    },
+    "vendor/QIHSE/include/qihse_cluster.h": {
+      "bytes": 2069,
+      "reviewed_baseline": "unchanged",
+      "sha256": "5a613c35eb9eb0460c76c24b313d9b4af60e45c71a8bdb6fc4e147b89f2374ec"
+    },
+    "vendor/QIHSE/include/qihse_cluster_brain.h": {
+      "bytes": 10647,
+      "reviewed_baseline": "unchanged",
+      "sha256": "cbd283315033843b6033c8af5297fb0e8c3730b959b06fa04b5d2e9ab345833d"
+    },
+    "vendor/QIHSE/include/qihse_cluster_bus.h": {
+      "bytes": 19336,
+      "reviewed_baseline": "unchanged",
+      "sha256": "2ce6ff1f6eaa3dea0585736a1b868c1d6ecdacc6dd01cb135021b986af040484"
+    },
+    "vendor/QIHSE/include/qihse_cluster_failover.h": {
+      "bytes": 2907,
+      "reviewed_baseline": "unchanged",
+      "sha256": "5b6609aa9d833c938cfa5b272fea733f0439a6187ae6e54797e9e3ab0d9474b0"
+    },
+    "vendor/QIHSE/include/qihse_cluster_migrate.h": {
+      "bytes": 1350,
+      "reviewed_baseline": "unchanged",
+      "sha256": "46c94b906ccea0e9f4051151cd0bcb1e1ecf0fbec1c7d57b67b9ea5a0f45a041"
+    },
+    "vendor/QIHSE/include/qihse_cluster_numa.h": {
+      "bytes": 1466,
+      "reviewed_baseline": "unchanged",
+      "sha256": "717c3a5ee10fc49d563266f9cd67f7a4448064f1309572d003ab3119140f3b2f"
+    },
+    "vendor/QIHSE/include/qihse_cluster_ops.h": {
+      "bytes": 2490,
+      "reviewed_baseline": "unchanged",
+      "sha256": "e52a5ad409af3a415ea72ca5a230bb000fc6aec661ed8c877e6971f5a53e1e03"
+    },
+    "vendor/QIHSE/include/qihse_cluster_rebalance.h": {
+      "bytes": 2439,
+      "reviewed_baseline": "unchanged",
+      "sha256": "e23f9c0cc85a8f26583dbb7c108f13f7dd5d83cc2dbf22149680bab070c6eb7a"
+    },
+    "vendor/QIHSE/include/qihse_cluster_scatter.h": {
+      "bytes": 5568,
+      "reviewed_baseline": "unchanged",
+      "sha256": "d9cf2a412bbf4d2ade63140095961ce7ea096199ada605037862e71f2ccad469"
+    },
+    "vendor/QIHSE/include/qihse_cluster_slot.h": {
+      "bytes": 6550,
+      "reviewed_baseline": "unchanged",
+      "sha256": "54b730d9e87848624d1b57df077e8c0070ed6443c33950faeaa0dc8d2d71b8df"
+    },
+    "vendor/QIHSE/include/qihse_column.h": {
+      "bytes": 5673,
+      "reviewed_baseline": "unchanged",
+      "sha256": "09aa93e8b3c03115c019ba73321027a3432d34cb7d0bcc0031faf4d9b5efa3ae"
+    },
+    "vendor/QIHSE/include/qihse_compaction.h": {
+      "bytes": 1795,
+      "reviewed_baseline": "unchanged",
+      "sha256": "4951c743c8002cb5f26c4577d39a80a0e9e39a5c17af270b39a57d95a399bfd3"
+    },
+    "vendor/QIHSE/include/qihse_consensus.h": {
+      "bytes": 31012,
+      "reviewed_baseline": "unchanged",
+      "sha256": "14e3e99f6e912e49de5c22bb312bb16dc6c572988f4a3a01fe38bb60f81d9e25"
+    },
+    "vendor/QIHSE/include/qihse_controller.h": {
+      "bytes": 20560,
+      "reviewed_baseline": "unchanged",
+      "sha256": "bec0c3624993ba12922afa8c22fd898a1d262fe75388da8d46c994579c6b577e"
+    },
+    "vendor/QIHSE/include/qihse_crc16.h": {
+      "bytes": 575,
+      "reviewed_baseline": "unchanged",
+      "sha256": "5b067c85a495c25d1fbf8ee24848762b6e2af7c9119dce92f4e3e3228a0129fc"
+    },
+    "vendor/QIHSE/include/qihse_cypher_executor.h": {
+      "bytes": 1635,
+      "reviewed_baseline": "unchanged",
+      "sha256": "053c555311c496719da4abc0c384c5dc3657be0090c0e802461fcf44c62e60b7"
+    },
+    "vendor/QIHSE/include/qihse_cypher_parser.h": {
+      "bytes": 8468,
+      "reviewed_baseline": "unchanged",
+      "sha256": "46a4d2ed6c781e0f18107a332350f5d4aa36d56ec6dd91a5e9a6895a545b2506"
+    },
+    "vendor/QIHSE/include/qihse_dist_planner.h": {
+      "bytes": 4755,
+      "reviewed_baseline": "unchanged",
+      "sha256": "b92ec9641e2002a251c26230c69e5711a0b0214cf6038ff3b2e1c6c7d3a12ed5"
+    },
+    "vendor/QIHSE/include/qihse_document.h": {
+      "bytes": 2612,
+      "reviewed_baseline": "unchanged",
+      "sha256": "67a0858c3f49a22b3f52349346184984e5275c619546c66c7a2313334af28df5"
+    },
+    "vendor/QIHSE/include/qihse_es_api.h": {
+      "bytes": 2709,
+      "reviewed_baseline": "unchanged",
+      "sha256": "2a00d5901e8b6853d200a7a24b3915ab49be9c0e709df2ad1f3314e579566542"
+    },
+    "vendor/QIHSE/include/qihse_event_stream.h": {
+      "bytes": 6126,
+      "reviewed_baseline": "unchanged",
+      "sha256": "a42c4561cac891fec599960d0b8c23394e1b79db30130d3c102bed232f37401f"
+    },
+    "vendor/QIHSE/include/qihse_export.h": {
+      "bytes": 4061,
+      "reviewed_baseline": "unchanged",
+      "sha256": "4e6aa1dab1688b2c2cbc4fa2a9c104d3963763d6e81a5d743a4b0f994f13444a"
+    },
+    "vendor/QIHSE/include/qihse_fabric_dispatch.h": {
+      "bytes": 26951,
+      "reviewed_baseline": "unchanged",
+      "sha256": "69c3e1dfcce6eb1c6cff98e42d298a107e676b7c725291f941c9758babb9e44f"
+    },
+    "vendor/QIHSE/include/qihse_fabric_index.h": {
+      "bytes": 6419,
+      "reviewed_baseline": "unchanged",
+      "sha256": "c0996dd90605be5a7da9dabe645b429eb0a40f623c9b02132b9c9f042ce12549"
+    },
+    "vendor/QIHSE/include/qihse_federation.h": {
+      "bytes": 71530,
+      "reviewed_baseline": "unchanged",
+      "sha256": "a9f13fb1a8bd4fcc9763cad03273668b82bb5c9c3f51e00ee325f74cbf3c3dab"
+    },
+    "vendor/QIHSE/include/qihse_federation_mtls.h": {
+      "bytes": 9949,
+      "reviewed_baseline": "unchanged",
+      "sha256": "bb9164b589b50f2128f771e1a176bbb8faf36ef87defb08fb70a2deef33495c3"
+    },
+    "vendor/QIHSE/include/qihse_federation_rejoin.h": {
+      "bytes": 4992,
+      "reviewed_baseline": "unchanged",
+      "sha256": "a6c20d724c75a4ce89f1c700f58903587ae867830de2e849fbf4808b9f601612"
+    },
+    "vendor/QIHSE/include/qihse_federation_repl.h": {
+      "bytes": 8941,
+      "reviewed_baseline": "unchanged",
+      "sha256": "65ff69a077df95fb2cbc197524c107ea397e0c078f95fefb318ee48997f26bda"
+    },
+    "vendor/QIHSE/include/qihse_federation_sim.h": {
+      "bytes": 7755,
+      "reviewed_baseline": "unchanged",
+      "sha256": "2cf7da2325912700382ebae730a3216032476220f0f61c27cbfd208fb473cf8c"
+    },
+    "vendor/QIHSE/include/qihse_federation_transport.h": {
+      "bytes": 9988,
+      "reviewed_baseline": "unchanged",
+      "sha256": "c898318903ced852f7da2608b6e5d61801ce0740a5aeb5f9fc8bc1437815964a"
+    },
+    "vendor/QIHSE/include/qihse_fts.h": {
+      "bytes": 2544,
+      "reviewed_baseline": "unchanged",
+      "sha256": "ecbc5acf0644057aac81788e4ff7e5c6764be80806d46e1b81f3fa6ea1b4afe7"
+    },
+    "vendor/QIHSE/include/qihse_fusion.h": {
+      "bytes": 4486,
+      "reviewed_baseline": "unchanged",
+      "sha256": "79201cb4f106ce3731e8de9ed557ccc73b08518af5d10f770ba82a4624628a9a"
+    },
+    "vendor/QIHSE/include/qihse_graph_algo.h": {
+      "bytes": 2492,
+      "reviewed_baseline": "unchanged",
+      "sha256": "25b87222c99df5471d6bd225b5fabdfc640bef73a97ed41b23d758f168d76439"
+    },
+    "vendor/QIHSE/include/qihse_graph_ingest.h": {
+      "bytes": 5656,
+      "reviewed_baseline": "unchanged",
+      "sha256": "1712f994c28836cd3ba3eb6b5cd6a5833064404ec6047e1e1082ce51976faf13"
+    },
+    "vendor/QIHSE/include/qihse_graph_store.h": {
+      "bytes": 5926,
+      "reviewed_baseline": "unchanged",
+      "sha256": "33a4a8b95887064d3ccc19de56d9ce278067ef9c05c4f89712ba1db3df1b3139"
+    },
+    "vendor/QIHSE/include/qihse_graph_vector.h": {
+      "bytes": 1926,
+      "reviewed_baseline": "unchanged",
+      "sha256": "c9b3a44ee9e1a6ecd0135f1c767f6438d021231959945c20e7bdf943f987ba55"
+    },
+    "vendor/QIHSE/include/qihse_hash_index.h": {
+      "bytes": 3184,
+      "reviewed_baseline": "unchanged",
+      "sha256": "8bcc20c44080924c029400754a22d0733d04803859588316ed1ab704d222b696"
+    },
+    "vendor/QIHSE/include/qihse_hetero.h": {
+      "bytes": 10610,
+      "reviewed_baseline": "unchanged",
+      "sha256": "3b6670178543753276cd5f278448df89e08495ea5a62d926f4b8214de9b90d0c"
+    },
+    "vendor/QIHSE/include/qihse_hnsw.h": {
+      "bytes": 6704,
+      "reviewed_baseline": "unchanged",
+      "sha256": "65e894b0a23e035b00f5c4c6d2abeb4695366c3399568f510e60e4915009e4bc"
+    },
+    "vendor/QIHSE/include/qihse_http_api.h": {
+      "bytes": 1988,
+      "reviewed_baseline": "unchanged",
+      "sha256": "91b35a1cb55110063761ac27c8ed47a50b2535d48267d1ccc511a06d3c8e9e85"
+    },
+    "vendor/QIHSE/include/qihse_index_manager.h": {
+      "bytes": 6574,
+      "reviewed_baseline": "unchanged",
+      "sha256": "6643bebc1b595d1ed984e6b470ffad380f0e0d12d4833f974ea8b33a87f99956"
+    },
+    "vendor/QIHSE/include/qihse_index_scan.h": {
+      "bytes": 3183,
+      "reviewed_baseline": "unchanged",
+      "sha256": "ff7e1680f92fe4eebf312769a100c2cd59629a3f40e9dc2e39e09be1992951a8"
+    },
+    "vendor/QIHSE/include/qihse_influx_api.h": {
+      "bytes": 1685,
+      "reviewed_baseline": "unchanged",
+      "sha256": "f501442e96c7f11e181e3658acf5e7fdc9bc1b8f401d3a66d560e254703e4fb3"
+    },
+    "vendor/QIHSE/include/qihse_ingest_guard.h": {
+      "bytes": 1670,
+      "reviewed_baseline": "unchanged",
+      "sha256": "1a62e5429f54c56b19efd0d1d1cd5e145b916372053fa418a3d4f79a0cd67bb9"
+    },
+    "vendor/QIHSE/include/qihse_instr.h": {
+      "bytes": 12914,
+      "reviewed_baseline": "unchanged",
+      "sha256": "1ef4b8ed0245122f4f80d0bde46d7c304fe7c9679476757799936e571d56519a"
+    },
+    "vendor/QIHSE/include/qihse_join_executor.h": {
+      "bytes": 2934,
+      "reviewed_baseline": "unchanged",
+      "sha256": "abe758f129a0bb9eba321738b30179d1013a4348a4ffa038bca0fbb0ed3daca9"
+    },
+    "vendor/QIHSE/include/qihse_keystone.h": {
+      "bytes": 12379,
+      "reviewed_baseline": "unchanged",
+      "sha256": "b0e5438d06879bc11eb6a23697edfb804e240c84caff287190dcd85f51585e60"
+    },
+    "vendor/QIHSE/include/qihse_kv_store.h": {
+      "bytes": 9679,
+      "reviewed_baseline": "unchanged",
+      "sha256": "c34d58f7a073d1565a88ef636a84a4f437a896e59906974cfa031bc48bfd5415"
+    },
+    "vendor/QIHSE/include/qihse_lua_injector.h": {
+      "bytes": 1465,
+      "reviewed_baseline": "unchanged",
+      "sha256": "22484792e8b07cd099b5bb90c2c3375e0a955aff0b1bafd1b53d55593cfeae3a"
+    },
+    "vendor/QIHSE/include/qihse_math.h": {
+      "bytes": 9084,
+      "reviewed_baseline": "unchanged",
+      "sha256": "bc1016752fbddfc6539c22b38601b22ca4ba2be408620d019e9eb8a6c4e4434f"
+    },
+    "vendor/QIHSE/include/qihse_metrics.h": {
+      "bytes": 10406,
+      "reviewed_baseline": "unchanged",
+      "sha256": "d0a65674595509034c8d7e7fe8e60f5f787eb26adb18ec23aa99dbe1b84be0b9"
+    },
+    "vendor/QIHSE/include/qihse_ml_optimizer.h": {
+      "bytes": 8982,
+      "reviewed_baseline": "unchanged",
+      "sha256": "44a96a63538a4d8e7b56f539301a941b89ca34cb6bb3ddd84cc87eb752aac90a"
+    },
+    "vendor/QIHSE/include/qihse_mongo_wire.h": {
+      "bytes": 12427,
+      "reviewed_baseline": "unchanged",
+      "sha256": "31c0649de6e4b58ac0a5393bb096587fc97082e697e134042426e6ab3e06c776"
+    },
+    "vendor/QIHSE/include/qihse_mvcc.h": {
+      "bytes": 7771,
+      "reviewed_baseline": "unchanged",
+      "sha256": "7142657140f6b53bc3551116c95f7993d545b54f5c428a210cbe2baec3ff6b15"
+    },
+    "vendor/QIHSE/include/qihse_operations.h": {
+      "bytes": 13144,
+      "reviewed_baseline": "unchanged",
+      "sha256": "b72517378c5eb6cff6ba4480a810616d436e37f79c98778a628fb8ef28413cab"
+    },
+    "vendor/QIHSE/include/qihse_optimizer.h": {
+      "bytes": 5486,
+      "reviewed_baseline": "unchanged",
+      "sha256": "5d14b41fb5aecd34fd0b496dc289a82c9cf7663e3a93c2321ea3cc0f8d512b74"
+    },
+    "vendor/QIHSE/include/qihse_optimizer_governance.h": {
+      "bytes": 23394,
+      "reviewed_baseline": "unchanged",
+      "sha256": "7f7be25c62d6837159d8f5db101de675e3e4ec028d13564c7335b893150c6841"
+    },
+    "vendor/QIHSE/include/qihse_overlay.h": {
+      "bytes": 10683,
+      "reviewed_baseline": "unchanged",
+      "sha256": "b455a86adb6d22eef14463ca453df1c368c379b0686e5498d0c2f2440bf14586"
+    },
+    "vendor/QIHSE/include/qihse_parallel_query.h": {
+      "bytes": 8980,
+      "reviewed_baseline": "unchanged",
+      "sha256": "0d0073a5f09b1cc17d528593c2e69006a49bddf933c5736c5cb02d45e0ff8984"
+    },
+    "vendor/QIHSE/include/qihse_pg_wire.h": {
+      "bytes": 1286,
+      "reviewed_baseline": "unchanged",
+      "sha256": "3a365ea2dac10b443789f96d7a2b7b6113bae70eec058108428f242085fbd296"
+    },
+    "vendor/QIHSE/include/qihse_platform.h": {
+      "bytes": 3757,
+      "reviewed_baseline": "unchanged",
+      "sha256": "c07d68e3681b57040002503e0deb61c8b9f052dae4e2135817ee331f53952b11"
+    },
+    "vendor/QIHSE/include/qihse_pooler.h": {
+      "bytes": 14339,
+      "reviewed_baseline": "unchanged",
+      "sha256": "27ac01122b80848cea02139840054d17b935e15563eb8b2b328276528d91c81f"
+    },
+    "vendor/QIHSE/include/qihse_protocol_translate.h": {
+      "bytes": 1964,
+      "reviewed_baseline": "unchanged",
+      "sha256": "3195e76b7207f91435db87612d8b9d9c2f2a09a5d9dd323133008a68c2c4aeb6"
+    },
+    "vendor/QIHSE/include/qihse_qkp.h": {
+      "bytes": 6351,
+      "reviewed_baseline": "unchanged",
+      "sha256": "37a8bc4ff0d420a6d774e6ced9a692349efc8be1d45ce7ac4b12490a43dbbdc8"
+    },
+    "vendor/QIHSE/include/qihse_qql_parser.h": {
+      "bytes": 937,
+      "reviewed_baseline": "unchanged",
+      "sha256": "c5eee4858853b578505f67d18081149f7cf426b124a634d7f5674f767b521005"
+    },
+    "vendor/QIHSE/include/qihse_quantization.h": {
+      "bytes": 12421,
+      "reviewed_baseline": "unchanged",
+      "sha256": "4351033acbc63f566aaf7ce1c58b4f7a9e5dff32400a4b8ad946a20370f3e5a9"
+    },
+    "vendor/QIHSE/include/qihse_quota.h": {
+      "bytes": 2444,
+      "reviewed_baseline": "unchanged",
+      "sha256": "564a4effd3e239e797c968f04b4c8dcca784242b05e1b5cfd380880f70d7498b"
+    },
+    "vendor/QIHSE/include/qihse_rate_limit.h": {
+      "bytes": 1888,
+      "reviewed_baseline": "unchanged",
+      "sha256": "6ee3538d4dc63fedcb647dca0bf6c20948258ced35ff9a51fe125ee46d488acd"
+    },
+    "vendor/QIHSE/include/qihse_read_replica.h": {
+      "bytes": 1095,
+      "reviewed_baseline": "unchanged",
+      "sha256": "5478d83e96f0f449a05b12f7c858033fa1abb8fc79327927700a6e6a0c1fe65c"
+    },
+    "vendor/QIHSE/include/qihse_recovery.h": {
+      "bytes": 3249,
+      "reviewed_baseline": "unchanged",
+      "sha256": "26e7a7f773007e453b8f76c38ee5a1dc532d651a93d57ecc7adfc932524d5885"
+    },
+    "vendor/QIHSE/include/qihse_recursive_search.h": {
+      "bytes": 1537,
+      "reviewed_baseline": "unchanged",
+      "sha256": "c3f8523aeb4f4a9fc521c5dd70f580898caf832f3151fd8c41a3d12079608a21"
+    },
+    "vendor/QIHSE/include/qihse_repl.h": {
+      "bytes": 5241,
+      "reviewed_baseline": "unchanged",
+      "sha256": "e0b07c35e90a1acc6acb765d1e703c2ae90e607e855d2ed4788e1d95103490c1"
+    },
+    "vendor/QIHSE/include/qihse_resp_cluster.h": {
+      "bytes": 1234,
+      "reviewed_baseline": "unchanged",
+      "sha256": "4c79e50574a50a6fbd4b411c31cf36e7ea715beb7039de2c899dfbfc6b6055c5"
+    },
+    "vendor/QIHSE/include/qihse_resp_wire.h": {
+      "bytes": 11003,
+      "reviewed_baseline": "unchanged",
+      "sha256": "587a4b9fcb18510c3ba2a9ab51f8147a3759920256f2fe4658f1940a00d627e6"
+    },
+    "vendor/QIHSE/include/qihse_routing_persistence.h": {
+      "bytes": 4985,
+      "reviewed_baseline": "unchanged",
+      "sha256": "50a87b6a250ad440181a56e72f3917758b8063ae4bafc6cd14c6bcd3b9ff7568"
+    },
+    "vendor/QIHSE/include/qihse_runtime_trust.h": {
+      "bytes": 9131,
+      "reviewed_baseline": "unchanged",
+      "sha256": "5abb60c1bbebb0f528f5a4df000ecec2610e3e2cb52ef039e51deefb19f88474"
+    },
+    "vendor/QIHSE/include/qihse_schema.h": {
+      "bytes": 2248,
+      "reviewed_baseline": "unchanged",
+      "sha256": "6ce68567550d0c62c6a7234f40e277d0fd97f5b7d81542d47ebbea58b8e5138b"
+    },
+    "vendor/QIHSE/include/qihse_search.h": {
+      "bytes": 7455,
+      "reviewed_baseline": "unchanged",
+      "sha256": "48ec3ba5404f7de82a1b1aa4108581064d91e2b34d87f621c76108d02cea0ae6"
+    },
+    "vendor/QIHSE/include/qihse_security_audit.h": {
+      "bytes": 9053,
+      "reviewed_baseline": "unchanged",
+      "sha256": "9041279f21de74acc316cebfe35e30142a68e09f81ed168e01faa862fd2bd6a4"
+    },
+    "vendor/QIHSE/include/qihse_sort_executor.h": {
+      "bytes": 1236,
+      "reviewed_baseline": "unchanged",
+      "sha256": "0cf4a7468483dbe8badb0ecc4c817e7ee2f73a4c81e26eb3c512b4168f6c69d9"
+    },
+    "vendor/QIHSE/include/qihse_spatial.h": {
+      "bytes": 1563,
+      "reviewed_baseline": "unchanged",
+      "sha256": "6efc8ed909625d1716cb1f178581aff2d189c95f3ace7e39caaa4cc99fe7f860"
+    },
+    "vendor/QIHSE/include/qihse_sql_extensions.h": {
+      "bytes": 7638,
+      "reviewed_baseline": "unchanged",
+      "sha256": "52305fc143dd701cf40edba2ecebf48d83eb7fad551d476aacf750a9b7254ead"
+    },
+    "vendor/QIHSE/include/qihse_sql_parser.h": {
+      "bytes": 21342,
+      "reviewed_baseline": "unchanged",
+      "sha256": "9053ff82861e4e25bfcaa544e28c058feb88916255bdf042a89f2d35892a5d26"
+    },
+    "vendor/QIHSE/include/qihse_subscription.h": {
+      "bytes": 2992,
+      "reviewed_baseline": "unchanged",
+      "sha256": "60dcb04b83273894185c64e65739017e4d9d15cb8b038d10ebb08925856042eb"
+    },
+    "vendor/QIHSE/include/qihse_supply_chain.h": {
+      "bytes": 19452,
+      "reviewed_baseline": "unchanged",
+      "sha256": "26e9b54ccbcfad720e153e9fc1e3f78e4855db03a9db90878ac506915fa7fe9a"
+    },
+    "vendor/QIHSE/include/qihse_system_guard.h": {
+      "bytes": 1707,
+      "reviewed_baseline": "unchanged",
+      "sha256": "00d30ddde618c922b27c60b64ad938d1ea19e2eb4264fcc6c9f3c3759645eb2b"
+    },
+    "vendor/QIHSE/include/qihse_table_store.h": {
+      "bytes": 5921,
+      "reviewed_baseline": "unchanged",
+      "sha256": "175cf8be0a8d6930ddd3913ae96e65fc4ac7c17636f7e660f594b2de79784610"
+    },
+    "vendor/QIHSE/include/qihse_task_queue.h": {
+      "bytes": 4270,
+      "reviewed_baseline": "unchanged",
+      "sha256": "4467992b8157e4e91a02faf93fad5ddbc159e0fe0c9e065628a5f6980e724efa"
+    },
+    "vendor/QIHSE/include/qihse_task_scheduler.h": {
+      "bytes": 2242,
+      "reviewed_baseline": "unchanged",
+      "sha256": "4d63b58eb2958de88c5f30944cfeb178ce8ae3f85e6b22aab8971ca309fb6dcd"
+    },
+    "vendor/QIHSE/include/qihse_task_worker.h": {
+      "bytes": 2041,
+      "reviewed_baseline": "unchanged",
+      "sha256": "1dd3a42b04832921a28fada3427607cf81403c9c6a8b89579b2ce4d19de4ac41"
+    },
+    "vendor/QIHSE/include/qihse_temporal.h": {
+      "bytes": 1726,
+      "reviewed_baseline": "unchanged",
+      "sha256": "d460b89cadea1fd9cd5bfc925f4666142310d965c5bd007ba5204798c4160ac3"
+    },
+    "vendor/QIHSE/include/qihse_timeseries.h": {
+      "bytes": 3276,
+      "reviewed_baseline": "unchanged",
+      "sha256": "5e45ba0d3f1b9c6cfc1f83d66a57e19221ffc8a639dd483f45220f64319e53b9"
+    },
+    "vendor/QIHSE/include/qihse_tracing.h": {
+      "bytes": 1420,
+      "reviewed_baseline": "unchanged",
+      "sha256": "326fb63fd450373d61a260f79654c082cdcbf1fb4357238e0c1a840e0f9428c9"
+    },
+    "vendor/QIHSE/include/qihse_trinary_trie.h": {
+      "bytes": 2792,
+      "reviewed_baseline": "unchanged",
+      "sha256": "05d78ca190472f0e26dd1173646a0ba9395d2a68e10333febd59f439d6133057"
+    },
+    "vendor/QIHSE/include/qihse_txn.h": {
+      "bytes": 8942,
+      "reviewed_baseline": "unchanged",
+      "sha256": "79ac7b2bb9f2912733b68325334d920d79fb2ad9190dc0e659b2efe8d78ed836"
+    },
+    "vendor/QIHSE/include/qihse_uma.h": {
+      "bytes": 7723,
+      "reviewed_baseline": "unchanged",
+      "sha256": "5a2f1cb96e06cb8385cf2ec32b660cf1a700706fd8017689d5255ae8294ad668"
+    },
+    "vendor/QIHSE/include/qihse_uwp.h": {
+      "bytes": 4805,
+      "reviewed_baseline": "unchanged",
+      "sha256": "6eef603c1ca76f18018566dc4e366c636383f0ccc7b4539aed42f5a341c39f03"
+    },
+    "vendor/QIHSE/include/qihse_uwp_graph_index.h": {
+      "bytes": 1086,
+      "reviewed_baseline": "unchanged",
+      "sha256": "6f47bb35c17ae93ef3de0d4459529ad816ce80c9422f3fe853bde2994e834578"
+    },
+    "vendor/QIHSE/include/qihse_uwp_metrics.h": {
+      "bytes": 2854,
+      "reviewed_baseline": "unchanged",
+      "sha256": "fce2213f861e3e9acff0f97f37a8682a3cd377b527b252156f0b278eed029f43"
+    },
+    "vendor/QIHSE/include/qihse_uwp_repl_pool.h": {
+      "bytes": 1073,
+      "reviewed_baseline": "unchanged",
+      "sha256": "051a904df7fb75cf1dd45515089b6399372502ef4124beac716fc6a2aa70e570"
+    },
+    "vendor/QIHSE/include/qihse_uwp_sql_txn_schema.h": {
+      "bytes": 3019,
+      "reviewed_baseline": "unchanged",
+      "sha256": "6a8284c3e25c8e74e488955fb09ea2160b3731b62e10ca7507c20665a35890bc"
+    },
+    "vendor/QIHSE/include/qihse_uwp_tls.h": {
+      "bytes": 9518,
+      "reviewed_baseline": "unchanged",
+      "sha256": "1c9a7a89b69219989b88843e9b0fab8a6d5030a5dcb209a4c816b18fe2cff4a0"
+    },
+    "vendor/QIHSE/include/qihse_vector_db.h": {
+      "bytes": 39521,
+      "reviewed_baseline": "unchanged",
+      "sha256": "a44cf9aa5aca09ff618caab4530406869eb7be75a24d6e12a1ac5d7cb2a86f46"
+    },
+    "vendor/QIHSE/include/qihse_wal.h": {
+      "bytes": 6820,
+      "reviewed_baseline": "modified",
+      "reviewed_baseline_sha256": "8d52c110b0fee9ed77d805b314cbf7c97bead1c3d222e5c29309510162571996",
+      "sha256": "763028aa7ae1dc9d0d070a4e502a58544201a1ecad29ec558ebc547cf81d2cbd"
+    },
+    "vendor/QIHSE/include/qihse_window_executor.h": {
+      "bytes": 2658,
+      "reviewed_baseline": "unchanged",
+      "sha256": "e412b939c1771420536ad1207919fdf7acf2be24b577210f80e6c6b62ad3f60c"
+    },
+    "vendor/QIHSE/persistence/qihse_container.c": {
+      "bytes": 27185,
+      "reviewed_baseline": "unchanged",
+      "sha256": "01ab56d6b9441c2ae4a73210d13147976afcd4477185f93d8a531d551ebe9abc"
+    },
+    "vendor/QIHSE/persistence/qihse_container.d": {
+      "bytes": 367,
+      "reviewed_baseline": "unchanged",
+      "sha256": "8f18a5d7c3b7ae85b4cc7628b9d8f40d8463524b9fba98b5b56a14a7bc9fd602"
+    },
+    "vendor/QIHSE/persistence/qihse_container.h": {
+      "bytes": 7347,
+      "reviewed_baseline": "unchanged",
+      "sha256": "83bd7d9d65879a083b7b53f1b8c6157590924e475b579d9927420375611aa19d"
+    },
+    "vendor/QIHSE/persistence/qihse_container.o": {
+      "bytes": 24504,
+      "reviewed_baseline": "unchanged",
+      "sha256": "576d1d0d238405191241d869a9a7d82cea18e81d02d2cf553cb56c8180a685d6"
+    },
+    "vendor/QIHSE/persistence/qihse_file.h": {
+      "bytes": 1318,
+      "reviewed_baseline": "unchanged",
+      "sha256": "8d857d552b7afda9347a88ed7b2f070d5c00713421b324a6fb079400ad5f7c65"
+    },
+    "vendor/QIHSE/persistence/qihse_file_posix.c": {
+      "bytes": 8687,
+      "reviewed_baseline": "unchanged",
+      "sha256": "d30a6065ec1c6cbdd8431091ae01c908ac4bd7bdd12192518f8bd9fbdbd6e44d"
+    },
+    "vendor/QIHSE/persistence/qihse_file_posix.d": {
+      "bytes": 168,
+      "reviewed_baseline": "unchanged",
+      "sha256": "ae6c6325f5330f7fce8583b9b659012c32b805fdde7b3bea02bafee2d5915177"
+    },
+    "vendor/QIHSE/persistence/qihse_file_posix.o": {
+      "bytes": 7000,
+      "reviewed_baseline": "unchanged",
+      "sha256": "7da2cfed68239bcb9c64429af501c0db241c695c7165efd1f3adcfe12f591fb2"
+    },
+    "vendor/QIHSE/persistence/qihse_persist_format.c": {
+      "bytes": 15894,
+      "reviewed_baseline": "unchanged",
+      "sha256": "d1fd985a4904ed848f2595c5adf690690839419dcc43ec59946cf9950ddbde74"
+    },
+    "vendor/QIHSE/persistence/qihse_persist_format.d": {
+      "bytes": 145,
+      "reviewed_baseline": "unchanged",
+      "sha256": "91c6868b69b451ebd71c58d6b08b89a23bdee1a9192a5ca6c24f196bb26253fd"
+    },
+    "vendor/QIHSE/persistence/qihse_persist_format.h": {
+      "bytes": 3904,
+      "reviewed_baseline": "unchanged",
+      "sha256": "8795e8872b98ca91839e1c5c69e6a39c80c6c6c7c0eea710c2d61cd7afd34d61"
+    },
+    "vendor/QIHSE/persistence/qihse_persist_format.o": {
+      "bytes": 7704,
+      "reviewed_baseline": "unchanged",
+      "sha256": "972aecbac510cd66ac0f2536361eea3a9afddc5a3e56ce3d2e44390e095e6a1a"
+    },
+    "vendor/QIHSE/persistence/qihse_pqc_crypto.c": {
+      "bytes": 22707,
+      "reviewed_baseline": "unchanged",
+      "sha256": "3e9a49320b4f09691e90fec1aa604af4f67919c4eb431e8599bdc4c75b5b2165"
+    },
+    "vendor/QIHSE/persistence/qihse_pqc_crypto.d": {
+      "bytes": 129,
+      "reviewed_baseline": "unchanged",
+      "sha256": "7d89b77eed4a2bcebb2991551ebbfb6da1c21d3c8c6ce2c9c0b86a9810ed131f"
+    },
+    "vendor/QIHSE/persistence/qihse_pqc_crypto.h": {
+      "bytes": 8683,
+      "reviewed_baseline": "unchanged",
+      "sha256": "e926ccb6ca7fc71b99d4ae2f5cd888e15374499b29eae7b6a0ce2acf86b70e19"
+    },
+    "vendor/QIHSE/persistence/qihse_pqc_crypto.o": {
+      "bytes": 22368,
+      "reviewed_baseline": "unchanged",
+      "sha256": "4c5f5ef4af26e0534c921c2c8bf94ad12317ce067490d7d178918387938c6d89"
+    },
+    "vendor/QIHSE/persistence/qihse_sqlite_vfs.c": {
+      "bytes": 36224,
+      "reviewed_baseline": "unchanged",
+      "sha256": "de9a27a14e3bdd50a72ea5517bf15c9df599749c475efc79fdf49f0b1e4d442b"
+    },
+    "vendor/QIHSE/persistence/qihse_sqlite_vfs.d": {
+      "bytes": 794,
+      "reviewed_baseline": "unchanged",
+      "sha256": "49f60ba1cf433609cdd2241b24ff9d4877236f5ad7cb9ae350aeec2d4b3d0c92"
+    },
+    "vendor/QIHSE/persistence/qihse_sqlite_vfs.h": {
+      "bytes": 2715,
+      "reviewed_baseline": "unchanged",
+      "sha256": "f35729a80dfe7c0db742e87f15a2e852632fdf08cb8e87d99cb1080058b53725"
+    },
+    "vendor/QIHSE/persistence/qihse_sqlite_vfs.o": {
+      "bytes": 14680,
+      "reviewed_baseline": "unchanged",
+      "sha256": "5190c86f3456ea6ef9d6cfdf8d70b6f592eb92189402b2e1b6b002b006654735"
+    },
+    "vendor/QIHSE/persistence/qihse_vector_store.c": {
+      "bytes": 38476,
+      "reviewed_baseline": "unchanged",
+      "sha256": "8be1c90b9da60990b9645873e1c1d25360c6fbc3d26a2b13509e8646e126260e"
+    },
+    "vendor/QIHSE/persistence/qihse_vector_store.d": {
+      "bytes": 460,
+      "reviewed_baseline": "unchanged",
+      "sha256": "bc998b20f062be7609c15ebc879f83ebf88b4beb96a1b6ba224ac6a60f7156d0"
+    },
+    "vendor/QIHSE/persistence/qihse_vector_store.h": {
+      "bytes": 4061,
+      "reviewed_baseline": "unchanged",
+      "sha256": "62044b241bc1a5b3852f8b7715c061fe6430d2e0cf59122ee9de2ebd86a4bcd4"
+    },
+    "vendor/QIHSE/persistence/qihse_vector_store.o": {
+      "bytes": 19312,
+      "reviewed_baseline": "unchanged",
+      "sha256": "b6a11880e74e2a8c70c4da39adf6f4dc28d6b2eace7585cdcf3ff647ae2c827f"
+    },
+    "vendor/QIHSE/persistence/qihse_vfs_page_cache.c": {
+      "bytes": 7160,
+      "reviewed_baseline": "unchanged",
+      "sha256": "cb25b89c048ff6c6a44eb9ffb7380c6fa2bcf54895f6918fb411f78df1874068"
+    },
+    "vendor/QIHSE/persistence/qihse_vfs_page_cache.d": {
+      "bytes": 485,
+      "reviewed_baseline": "unchanged",
+      "sha256": "04f0deec717e656cb46c354632713fea05d87a052a37cc2a4047c174b1cd800a"
+    },
+    "vendor/QIHSE/persistence/qihse_vfs_page_cache.h": {
+      "bytes": 3070,
+      "reviewed_baseline": "unchanged",
+      "sha256": "47c0e9252bcab3bc3ef48b2e1721193bd92820ca18701c7b84fb137c922b317d"
+    },
+    "vendor/QIHSE/persistence/qihse_vfs_page_cache.o": {
+      "bytes": 4016,
+      "reviewed_baseline": "unchanged",
+      "sha256": "307f1c358fe50d0cb411d3bb893de063c04caab1c72c0686abe749f9f11c9109"
+    },
+    "vendor/QIHSE/persistence/qihse_vfs_wal.c": {
+      "bytes": 9485,
+      "reviewed_baseline": "unchanged",
+      "sha256": "67e9f66af6e294dd724d57f8c726912907db4620aeccbc2498d59fa0877c4e45"
+    },
+    "vendor/QIHSE/persistence/qihse_vfs_wal.d": {
+      "bytes": 206,
+      "reviewed_baseline": "unchanged",
+      "sha256": "597f3f20fd97fe5e4001045e23703e8bdb5c91e25480581a38ae83497843fa5d"
+    },
+    "vendor/QIHSE/persistence/qihse_vfs_wal.h": {
+      "bytes": 4047,
+      "reviewed_baseline": "unchanged",
+      "sha256": "239c045915ff4af73a6f64663b7597f035b010e0b03a3950ec73f0fe0da4d643"
+    },
+    "vendor/QIHSE/persistence/qihse_vfs_wal.o": {
+      "bytes": 4616,
+      "reviewed_baseline": "unchanged",
+      "sha256": "bb69a68c98dbfd3a25e2055b4382eee0978a1d1cbb18baf47d2fa6272bb2f73c"
+    },
+    "vendor/QIHSE/src/frieze/qihse_btree.c": {
+      "bytes": 31644,
+      "reviewed_baseline": "unchanged",
+      "sha256": "e3e35b897fb2e8f36435f44403f33aa87b0c94f483fe579350590afbdeda2617"
+    },
+    "vendor/QIHSE/src/tractable/qihse_table_store.c": {
+      "bytes": 14499,
+      "reviewed_baseline": "unchanged",
+      "sha256": "e892a9b9a3d41e65c3daad9ddc9d2bd839bbae76b0cc5bd4abaffaeb35132be3"
+    },
+    "vendor/QIHSE/src/tractable/qihse_wal.c": {
+      "bytes": 26783,
+      "reviewed_baseline": "modified",
+      "reviewed_baseline_sha256": "4202bb899da654d4881d5ac6cc579bd143e5b09b6966167298f9fa524a88e949",
+      "sha256": "f0561d2a56a572c3bd5f1fc5857c87cbad519bad98f883853c5a94be0a77804b"
+    }
+  }
+}

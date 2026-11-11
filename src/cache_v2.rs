@@ -118,7 +118,14 @@ impl SearchCacheV2 {
             .collect()
     }
 
-    /// Store results for a query. Converts paths to file IDs.
+    fn resolve_file_id(&self, display_path: &str) -> Option<u32> {
+        self.file_path_index.get(display_path).copied().or_else(|| {
+            let canonical = std::fs::canonicalize(display_path).ok()?;
+            self.file_path_index.get(canonical.to_str()?).copied()
+        })
+    }
+
+    /// Store results for a query. Converts display paths to canonical file IDs.
     /// Paths must all resolve to file IDs. An incomplete result invalidates
     /// any existing entry for this query.
     pub fn store_results(
@@ -137,7 +144,7 @@ impl SearchCacheV2 {
         // Convert paths to file IDs
         let file_ids = file_paths
             .iter()
-            .map(|p| self.file_path_index.get(p).copied())
+            .map(|p| self.resolve_file_id(p))
             .collect::<Option<Vec<u32>>>();
         let Some(file_ids) = file_ids else {
             if let Some(idx) = self.index.remove(&key) {
@@ -566,6 +573,20 @@ mod tests {
             file_list: None,
             file_path_index: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn display_aliases_resolve_to_canonical_file_ids() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let canonical = std::fs::canonicalize(dir.join("Cargo.toml")).unwrap();
+        let alias = format!("{}/./Cargo.toml", dir.display());
+        let mut cache = make_test_cache();
+        cache
+            .file_path_index
+            .insert(canonical.to_str().unwrap().into(), 7);
+        assert_eq!(cache.resolve_file_id(&alias), Some(7));
+        cache.store_results("needle", 0, 1, &[alias]);
+        assert_eq!(cache.entries[0].file_ids, vec![7]);
     }
 
     #[test]

@@ -157,8 +157,19 @@ pub mod ffi {
             doc_id: u64,
         ) -> i32;
         pub fn tgrep_word_index_save(handle: *mut c_void, path: *const std::ffi::c_char) -> i32;
+        pub fn tgrep_word_index_save_for_segment(
+            handle: *mut c_void,
+            path: *const std::ffi::c_char,
+            generation: u64,
+            segment_fingerprint: u64,
+        ) -> i32;
         // mmap-based load (returns qwi_mmap_t handle, not a btree)
         pub fn tgrep_word_index_load(path: *const std::ffi::c_char) -> *mut c_void;
+        pub fn tgrep_word_index_load_for_segment(
+            path: *const std::ffi::c_char,
+            generation: u64,
+            segment_fingerprint: u64,
+        ) -> *mut c_void;
         pub fn tgrep_word_index_unload(handle: *mut c_void);
         pub fn tgrep_word_index_search(
             handle: *mut c_void,
@@ -168,6 +179,14 @@ pub mod ffi {
             max_results: usize,
         ) -> usize;
         pub fn tgrep_word_index_size(handle: *const c_void) -> usize;
+        pub fn tgrep_word_index_import_block(
+            builder: *mut c_void,
+            mapped: *const c_void,
+            block: usize,
+            old_ids: *const u32,
+            count: usize,
+            first_document: u32,
+        ) -> i32;
 
         // Phase 9: Anchor seeding + batch search
         pub fn tgrep_keystone_anchor_table_create() -> *mut c_void;
@@ -840,7 +859,10 @@ impl Wal {
         let c_path = path_c(directory)?;
         let handle = unsafe { ffi::tgrep_wal_create(c_path.as_ptr()) };
         if handle.is_null() {
-            Err("qihse_wal_create returned null".to_string())
+            Err(format!(
+                "qihse_wal_create failed: {}",
+                std::io::Error::last_os_error()
+            ))
         } else {
             Ok(Wal { handle })
         }
@@ -1087,8 +1109,38 @@ impl WordIndexBuilder {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        self.save_for_segment(path, 0, 0)
+    }
+
+    /// Copy all checked word postings from an immutable snapshot, remapping
+    /// sparse source IDs to the dense range starting at `first_document`.
+    /// Any failure invalidates this unpublished builder; discard it.
+    pub(crate) fn import_snapshot(
+        &mut self,
+        source: &MmapWordIndex,
+        old_ids: &[u32],
+        first_document: u32,
+        checkpoint: impl FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        source.import_or_validate(self.handle, old_ids, first_document, checkpoint)
+    }
+
+    /// Bind the compact sidecar to the segment generation and metadata checksum.
+    pub fn save_for_segment(
+        &self,
+        path: &Path,
+        generation: u64,
+        segment_fingerprint: u64,
+    ) -> Result<(), String> {
         let path_c = path_c(path)?;
-        let rc = unsafe { ffi::tgrep_word_index_save(self.handle, path_c.as_ptr()) };
+        let rc = unsafe {
+            ffi::tgrep_word_index_save_for_segment(
+                self.handle,
+                path_c.as_ptr(),
+                generation,
+                segment_fingerprint,
+            )
+        };
         if rc != 0 {
             Err(format!("word_index_save failed (rc={})", rc))
         } else {
@@ -1105,19 +1157,75 @@ impl Drop for WordIndexBuilder {
     }
 }
 
-/// Search-time wrapper: mmaps the flat sorted .qwi file and binary searches.
-/// No heap allocation for entries — only the pages touched by the search
-/// are paged in from disk.
+/// Validate QWI v3 metadata and only the payload blocks touched by a query.
+/// Unprotected legacy QWI is rejected so callers can fall back safely.
 pub struct MmapWordIndex {
     handle: *mut c_void,
 }
 
 impl MmapWordIndex {
+    pub(crate) fn validate_documents(
+        &self,
+        old_ids: &[u32],
+        checkpoint: impl FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        self.import_or_validate(std::ptr::null_mut(), old_ids, 0, checkpoint)
+    }
+
+    fn import_or_validate(
+        &self,
+        builder: *mut c_void,
+        old_ids: &[u32],
+        first_document: u32,
+        mut checkpoint: impl FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if old_ids.windows(2).any(|ids| ids[0] >= ids[1])
+            || old_ids.len() as u64 > u64::from(u32::MAX) + 1 - u64::from(first_document)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid word-index document remapping",
+            ));
+        }
+        // QWI v3 stores exactly 512 entries per block except the final block.
+        let blocks = self.size().div_ceil(512);
+        for block in 0..blocks {
+            checkpoint()?;
+            let rc = unsafe {
+                ffi::tgrep_word_index_import_block(
+                    builder,
+                    self.handle,
+                    block,
+                    old_ids.as_ptr(),
+                    old_ids.len(),
+                    first_document,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "word-index import failed: corrupt payload, unknown document, or allocation failure",
+                ));
+            }
+        }
+        checkpoint()
+    }
+
     pub fn load(path: &Path) -> Result<Self, String> {
+        Self::load_for_segment(path, 0, 0)
+    }
+
+    pub fn load_for_segment(
+        path: &Path,
+        generation: u64,
+        segment_fingerprint: u64,
+    ) -> Result<Self, String> {
         let path_c = path_c(path)?;
-        let handle = unsafe { ffi::tgrep_word_index_load(path_c.as_ptr()) };
+        let handle = unsafe {
+            ffi::tgrep_word_index_load_for_segment(path_c.as_ptr(), generation, segment_fingerprint)
+        };
         if handle.is_null() {
-            Err("word_index_load returned null".into())
+            Err("word index is legacy, corrupt, unreadable, or bound to another segment".into())
         } else {
             Ok(MmapWordIndex { handle })
         }
@@ -1132,7 +1240,7 @@ impl MmapWordIndex {
         // for every query. Grow only when the result buffer fills; a full buffer
         // may mean either an exact fit or that more matches remain, so probe at
         // a larger capacity until a call returns fewer results than it can hold.
-        let mut capacity = max_results.min(4096).max(1);
+        let mut capacity = max_results.clamp(1, 4096);
         loop {
             let mut out = Vec::new();
             out.try_reserve_exact(capacity)
@@ -1147,6 +1255,9 @@ impl MmapWordIndex {
                     capacity,
                 )
             };
+            if count == usize::MAX {
+                return Err("word-index payload failed integrity validation".into());
+            }
             if count > capacity {
                 return Err("word-index search returned more results than requested".into());
             }
@@ -1314,6 +1425,7 @@ impl OptimizationDatabase {
     }
 
     /// Record performance for a data signature.
+    #[allow(clippy::too_many_arguments)] // Mirrors the existing native optimizer ABI.
     pub fn record(
         &mut self,
         sig: &DataSignature,
@@ -1567,8 +1679,7 @@ impl SearchCache {
             return Vec::new();
         }
         let mut result = Vec::with_capacity(out_count);
-        for i in 0..out_count {
-            let e = &entries[i];
+        for e in entries.iter().take(out_count) {
             let pattern = if e.pattern.is_null() {
                 String::new()
             } else {
@@ -2186,6 +2297,35 @@ mod tests {
         assert_eq!(results[0], 2);
         assert!(loaded.search(b"missing", 64).unwrap().is_empty());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_qihse_word_index_binding_and_payload_errors_reach_rust() {
+        let path = std::env::temp_dir().join(format!(
+            "tgrep_qwi_bound_{}_{}.qwi",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut index = WordIndexBuilder::create().unwrap();
+        index.add(b"alpha", 9).unwrap();
+        index.save_for_segment(&path, 41, 123).unwrap();
+        assert!(MmapWordIndex::load_for_segment(&path, 42, 123).is_err());
+        assert!(MmapWordIndex::load_for_segment(&path, 41, 456).is_err());
+        let loaded = MmapWordIndex::load_for_segment(&path, 41, 123).unwrap();
+        assert_eq!(loaded.search(b"alpha", 2).unwrap(), [9]);
+        drop(loaded);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let blocks = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+        bytes[56 + 24 * blocks + 7] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let loaded = MmapWordIndex::load_for_segment(&path, 41, 123).unwrap();
+        assert!(loaded.search(b"alpha", 2).is_err());
+        assert!(loaded.search(b"absent", 2).unwrap().is_empty());
+        drop(loaded);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

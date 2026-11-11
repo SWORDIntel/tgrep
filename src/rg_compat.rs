@@ -15,6 +15,8 @@
 // (set by the installer's wrapper script).
 
 use std::collections::HashSet;
+use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::exit;
@@ -105,7 +107,7 @@ fn find_real_rg() -> Option<PathBuf> {
 }
 
 /// Delegate to the real rg binary, preserving all arguments and stdio.
-fn delegate_to_rg(args: &[String]) -> ! {
+fn delegate_to_rg(args: &[OsString]) -> ! {
     let rg_path = find_real_rg().unwrap_or_else(|| {
         eprintln!("tgrep: cannot find real ripgrep binary (set TGREP_REAL_RG)");
         exit(2);
@@ -536,43 +538,52 @@ fn index_exists() -> bool {
 
 /// Entry point for rg-compat mode.
 /// Called when tgrep is invoked as `rg` (via wrapper or symlink).
-pub fn run_as_rg(args: &[String]) -> ! {
+pub fn run_as_rg(args: &[OsString]) -> ! {
     // args[0] is the program name; rg args start at index 1
-    let rg_args: Vec<String> = if args.is_empty() {
-        Vec::new()
-    } else {
-        args[1..].to_vec()
+    let raw_args = args.get(1..).unwrap_or_default();
+    // Ripgrep owns terminal headings, line numbers, and color defaults.
+    if std::io::stdout().is_terminal() {
+        delegate_to_rg(raw_args);
+    }
+    // Parsing may use UTF-8, but delegation must preserve original bytes.
+    let rg_args: Vec<String> = match raw_args
+        .iter()
+        .map(|arg| arg.to_str().map(str::to_owned))
+        .collect()
+    {
+        Some(args) => args,
+        None => delegate_to_rg(raw_args),
     };
 
     // 1. --help, --version, -h, -V → always delegate to real rg
     for arg in &rg_args {
         if arg == "--help" || arg == "-h" {
-            delegate_to_rg(&rg_args);
+            delegate_to_rg(raw_args);
         }
         if arg == "--version" || arg == "-V" {
-            delegate_to_rg(&rg_args);
+            delegate_to_rg(raw_args);
         }
         // Special rg commands that we don't handle
         if arg == "--files" || arg == "--type-list" {
-            delegate_to_rg(&rg_args);
+            delegate_to_rg(raw_args);
         }
     }
 
     // 2. Check for unsupported flags → delegate to real rg
     if !check_supported_flags(&rg_args) || !supports_rg_config() {
-        delegate_to_rg(&rg_args);
+        delegate_to_rg(raw_args);
     }
 
     // 3. Check if an index exists
     if !index_exists() {
-        delegate_to_rg(&rg_args);
+        delegate_to_rg(raw_args);
     }
 
     // 4. Parse args and decide whether to use tgrep
     let (config, use_tgrep) = parse_rg_args(&rg_args);
 
     if !use_tgrep || config.pattern.is_empty() {
-        delegate_to_rg(&rg_args);
+        delegate_to_rg(raw_args);
     }
 
     // 5. Run tgrep indexed search

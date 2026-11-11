@@ -49,6 +49,7 @@ class Fixture:
             "XDG_CACHE_HOME": str(self.home / ".cache"),
             "TMPDIR": str(self.root / "tmp"),
             "PATH": f"{self.tools}:/usr/bin:/bin",
+            "TGREP_FAKE_HOST_TRIPLE": "x86_64-unknown-linux-gnu",
             "TGREP_SHELL_FIXTURE": str(self.settings_path),
             "TGREP_TEST_MARKER": str(self.root / "injection-marker"),
             "TGREP_FAKE_QUERY_LOG": str(self.root / "queries.bin"),
@@ -56,7 +57,7 @@ class Fixture:
             "TGREP_FAKE_SIBLING_SENTINEL": str(self.root / "checkout/target/sentinel"),
         }
         for name in ("readlink", "which", "zfs", "zpool", "sudo", "sync", "cargo",
-                     "install", "mkdir", "rm", "touch"):
+                     "install", "mkdir", "rm", "touch", "rustc"):
             self.wrapper(self.tools / name, name)
         if group == "packaging":
             for name in ("dpkg", "dpkg-architecture", "dpkg-shlibdeps", "dpkg-deb",
@@ -131,7 +132,7 @@ class Fixture:
     printf '\000'
 } >> "$TGREP_FAKE_QUERY_LOG"
 if [ "$role" = wrong-tgrep ]; then rm -f -- "$TGREP_FAKE_SIBLING_SENTINEL"; fi
-if [ "$1" = --version ]; then printf 'ripgrep synthetic\n'; exit 0; fi
+if [ "$1" = --version ]; then printf 'ripgrep 15.1.0\n'; exit 0; fi
 mode="$TGREP_FAKE_SEARCH_MODE"
 if [ "$1" = cache ]; then
     [ "$mode" != cache_error ] || exit 2
@@ -318,7 +319,8 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(len(hashes), 2)
                 self.assertTrue(all(len(value) == 64 for value in hashes))
                 self.assertEqual(hashes[0], hashlib.sha256(
-                    (fixture.repo / "target/release/tgrep").read_bytes()).hexdigest())
+                    (fixture.repo / "target" / fixture.env["TGREP_FAKE_HOST_TRIPLE"] /
+                     "release/tgrep").read_bytes()).hexdigest())
                 self.assertEqual(fixture.home_snapshot(), before)
 
     def test_committed_binaries_with_configuration_failure_are_reported(self):
@@ -359,6 +361,31 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue((sibling / "target/sentinel").exists())
         self.assertFalse(fixture.events("wrong-compile"))
 
+    def test_custom_cargo_output_is_installed_instead_of_stale_default(self):
+        fixture = self.fixture()
+        custom = fixture.root / "cargo output with spaces\n"
+        fixture.env["TGREP_FAKE_TARGET_DIRECTORY"] = str(custom)
+        stale = fixture.repo / "target/release/tgrep"
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"stale artifact must never be installed\n")
+        before = fixture.home_snapshot()
+        self.assert_success(fixture.install())
+        actual = custom / fixture.env["TGREP_FAKE_HOST_TRIPLE"] / "release/tgrep"
+        self.assertEqual((fixture.bin / "tgrep").read_bytes(), actual.read_bytes())
+        self.assertNotEqual((fixture.bin / "tgrep").read_bytes(), stale.read_bytes())
+        self.assertEqual(fixture.home_snapshot(), before)
+
+    def test_cross_target_is_rejected_before_build_or_publication(self):
+        fixture = self.fixture()
+        fixture.env["CARGO_BUILD_TARGET"] = "aarch64-unknown-linux-gnu"
+        before = fixture.home_snapshot()
+        result = fixture.install()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("CARGO_BUILD_TARGET", result.stderr)
+        self.assertFalse(fixture.events("compile"))
+        self.assertFalse(fixture.bin.exists())
+        self.assertEqual(fixture.home_snapshot(), before)
+
 
 class CompileTests(unittest.TestCase):
     def test_clean_targets_physical_newline_checkout(self):
@@ -382,8 +409,71 @@ class CompileTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-msse4.2", [event.get("simd_flags") for event in fixture.events("cargo")])
 
+    def test_custom_target_directory_and_explicit_native_host(self):
+        fixture = Fixture(self, "compile")
+        custom = fixture.root / "cargo target with spaces\n"
+        fixture.env["TGREP_FAKE_TARGET_DIRECTORY"] = str(custom)
+        result = fixture.run("--release", "--simd", "scalar", "--jobs", "1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        expected = custom / fixture.env["TGREP_FAKE_HOST_TRIPLE"] / "release/tgrep"
+        self.assertTrue(expected.is_file())
+        self.assertIn(str(expected), result.stdout)
+        build = next(event for event in fixture.events("cargo") if event["args"][0] == "build")
+        self.assertEqual(build["args"][build["args"].index("--target") + 1],
+                         fixture.env["TGREP_FAKE_HOST_TRIPLE"])
+        self.assertFalse((fixture.repo / "target/release/tgrep").exists())
+
+    def test_cross_target_is_rejected_before_clean_or_build(self):
+        fixture = Fixture(self, "compile")
+        fixture.env["CARGO_BUILD_TARGET"] = "aarch64-unknown-linux-gnu"
+        sentinel = fixture.repo / "target/sentinel"
+        sentinel.parent.mkdir(parents=True)
+        sentinel.write_text("preserve build artifacts\n")
+        result = fixture.run("--clean", "--simd", "scalar")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("CARGO_BUILD_TARGET", result.stderr)
+        self.assertFalse(fixture.events("cargo"))
+        self.assertEqual(sentinel.read_text(), "preserve build artifacts\n")
+
 
 class RunnerTests(unittest.TestCase):
+    def test_path_discovery_skips_tgrep_wrapper(self):
+        fixture = Fixture(self, "runner")
+        fixture.env.pop("RG_BIN")
+        fixture.env.pop("TGREP_REAL_RG", None)
+        wrapper = fixture.wrapper(fixture.root / "wrapper-tools/rg", "rg")
+        wrapper.write_text(wrapper.read_text().replace("#!/bin/sh\n", "#!/bin/sh\n# TGREP_REAL_RG wrapper\n", 1))
+        fixture.env["PATH"] = f"{wrapper.parent}:{fixture.env['PATH']}"
+        result = fixture.run("1", "relative-state", "relative-corpus")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(event["invoked"] == str(wrapper) for event in fixture.events("rg")))
+        self.assertTrue(any(event["invoked"] == str(fixture.tools / "rg") for event in fixture.events("rg")))
+
+    def test_invalid_baseline_or_missing_python_fails_before_results(self):
+        for prerequisite in ("wrapper", "identity", "python"):
+            with self.subTest(prerequisite=prerequisite):
+                fixture = Fixture(self, "runner")
+                if prerequisite == "wrapper":
+                    wrapper = fixture.tools / "rg"
+                    wrapper.write_text(wrapper.read_text().replace("#!/bin/sh\n", "#!/bin/sh\n# TGREP_REAL_RG wrapper\n", 1))
+                elif prerequisite == "identity":
+                    fixture.env["RG_BIN"] = str(fixture.repo / "target/release/tgrep")
+                else:
+                    fixture.env["PYTHON_BIN"] = str(fixture.root / "missing-python")
+                result = fixture.run("1", "relative-state", "relative-corpus")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertFalse((fixture.script.parent / "benchmark_results.csv").exists())
+
+    def test_custom_tgrep_and_xdg_state_defaults(self):
+        fixture = Fixture(self, "runner")
+        custom = fixture.wrapper(fixture.root / "custom output/tgrep", "tgrep")
+        fixture.env["TGREP_BIN"] = str(custom)
+        fixture.env.pop("TGREP_STATE_DIR", None)
+        result = fixture.run("1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(fixture.state), result.stdout)
+        self.assertTrue(all(event["invoked"] == str(custom) for event in fixture.events("tgrep")))
+
     def test_physical_paths_keep_caller_relative_corpus(self):
         fixture = Fixture(self, "runner", checkout="checkout\n", benchmarks="benchmarks\n")
         sibling = fixture.sibling()

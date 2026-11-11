@@ -8,6 +8,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::native::{self, KeystoneIndex, Wal};
 use crate::store::{self, DocRecord, SegmentWriter};
 
+mod compaction;
+
 // ── File list cache ─────────────────────────────────────────────────
 
 /// Metadata for a single file, stored in the file list cache.
@@ -33,11 +35,9 @@ pub struct FileListCache {
 
 /// Save the file list cache to the state directory.
 pub fn save_file_list_cache(state_dir: &Path, cache: &FileListCache) -> std::io::Result<()> {
-    let json = serde_json::to_string(cache)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string(cache).map_err(std::io::Error::other)?;
     let path = state_dir.join("file_list_cache.json");
-    native::atomic_write(&path, json.as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    native::atomic_write(&path, json.as_bytes()).map_err(std::io::Error::other)?;
     Ok(())
 }
 
@@ -88,7 +88,7 @@ fn ensure_state_dirs(state_dir: &Path) -> std::io::Result<()> {
         mk(&state_dir.join("segments"))?;
         mk(&state_dir.join("tmp"))?;
         mk(&state_dir.join("wal"))?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(unix))]
     {
@@ -255,6 +255,7 @@ impl WriterLock {
         let lock_path = state_dir.join("writer.lock");
         let file = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(&lock_path)?;
         // Try exclusive lock (non-blocking)
@@ -314,11 +315,9 @@ fn now_unix_secs() -> u64 {
 }
 
 fn write_build_state(state_dir: &Path, bs: &BuildState) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(bs)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(bs).map_err(std::io::Error::other)?;
     let path = state_dir.join("build.json");
-    native::atomic_write(&path, json.as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    native::atomic_write(&path, json.as_bytes()).map_err(std::io::Error::other)?;
     Ok(())
 }
 
@@ -918,15 +917,23 @@ fn validate_build_options(threads: usize, max_memory: &str, io_limit: &str) -> s
 fn for_each_discovered_file(
     root: &Path,
     threads: usize,
+    excluded_state: Option<&Path>,
     mut consume: impl FnMut(PathBuf) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    let excluded_state = excluded_state.map(Path::to_path_buf);
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
+        .add_custom_ignore_filename(".rgignore")
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .parents(true)
         .threads(threads)
+        .filter_entry(move |entry| {
+            !excluded_state
+                .as_ref()
+                .is_some_and(|state| entry.path().starts_with(state))
+        })
         .build_parallel();
 
     std::thread::scope(|scope| {
@@ -969,6 +976,93 @@ mod resource_tests {
     use super::tests::Scratch;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn nested_state_is_excluded_on_initial_and_replacement_builds() {
+        let scratch = Scratch::new();
+        let root = scratch.corpus("home", "source.txt");
+        let state = root.join(".local/state/tgrep");
+        let alias = scratch.0.join("state-alias");
+        fs::create_dir_all(&state).unwrap();
+        std::os::unix::fs::symlink(&state, &alias).unwrap();
+        for configured_state in [&state, &alias, &state] {
+            run_build(
+                &[root.to_str().unwrap().into()],
+                2,
+                "512MiB",
+                "1GiB/s",
+                configured_state,
+            )
+            .unwrap();
+            let manifest = store::read_manifest(&state).unwrap();
+            assert_eq!(manifest.segments.len(), 1);
+            let reader =
+                store::SegmentReader::open(&state.join("segments").join(&manifest.segments[0]))
+                    .unwrap();
+            assert_eq!(reader.doc_count(), 1);
+            assert_eq!(reader.get_doc(0).unwrap().path, b"source.txt");
+            let cache = load_file_list_cache(&state).unwrap();
+            assert_eq!(cache.files.len(), 1);
+            assert_eq!(
+                cache.files[0].path,
+                root.join("source.txt").to_str().unwrap()
+            );
+            assert!(!state.join("segments").read_dir().unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "thi")
+            }));
+        }
+    }
+
+    #[test]
+    fn bom_encoded_text_remains_scan_only_and_binary_tokens_are_indexed() {
+        let scratch = Scratch::new();
+        let root = scratch.corpus("encoding", "plain.txt");
+        fs::write(root.join("little.txt"), b"\xff\xfen\0e\0e\0d\0l\0e\0").unwrap();
+        fs::write(root.join("big.txt"), b"\xfe\xff\0n\0e\0e\0d\0l\0e").unwrap();
+        fs::write(root.join("binary.txt"), b"needle\0tail").unwrap();
+        let state = scratch.state();
+        run_build(
+            &[root.to_str().unwrap().into()],
+            1,
+            "512MiB",
+            "1GiB/s",
+            &state,
+        )
+        .unwrap();
+        let manifest = store::read_manifest(&state).unwrap();
+        let segment = state.join("segments").join(&manifest.segments[0]);
+        let reader = store::SegmentReader::open(&segment).unwrap();
+        let mut docs: Vec<_> = reader.iter_docs().map(|doc| doc.path).collect();
+        docs.sort();
+        assert_eq!(docs, vec![b"binary.txt".to_vec(), b"plain.txt".to_vec()]);
+        let qwi = native::MmapWordIndex::load_for_segment(
+            &segment.with_extension("qwi"),
+            reader.generation(),
+            reader.metadata_fingerprint(),
+        )
+        .unwrap();
+        assert_eq!(qwi.search(b"needle", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn discovery_respects_rgignore() {
+        let scratch = Scratch::new();
+        let root = scratch.corpus("ignore", "visible.txt");
+        fs::write(root.join("ignored.txt"), b"needle").unwrap();
+        fs::write(root.join(".rgignore"), b"ignored.txt\n").unwrap();
+        let mut files = Vec::new();
+        for_each_discovered_file(&root, 1, None, |path| {
+            files.push(path);
+            Ok(())
+        })
+        .unwrap();
+        assert!(files.contains(&root.join("visible.txt")));
+        assert!(!files.contains(&root.join("ignored.txt")));
+    }
 
     #[test]
     fn memory_reservations_cover_file_and_flush_temporary_work() {
@@ -1015,7 +1109,7 @@ mod resource_tests {
     }
 
     #[test]
-    fn compact_reindexes_roots_and_collects_old_segments_under_writer_lock() {
+    fn compact_keeps_a_single_valid_snapshot_without_reindexing() {
         let scratch = Scratch::new();
         let root = scratch.corpus("compact", "one.txt");
         let state_dir = scratch.state();
@@ -1029,15 +1123,13 @@ mod resource_tests {
         .unwrap();
         let old_manifest = store::read_manifest(&state_dir).unwrap();
         let old_segments = old_manifest.segments.clone();
-        replace_current_index_at("compact", &state_dir).unwrap();
+        compaction::compact_at(&state_dir, "512MiB", "32MiB/s").unwrap();
         let manifest = store::read_manifest(&state_dir).unwrap();
         assert_eq!(manifest.roots, old_manifest.roots);
+        assert_eq!(manifest.segments, old_segments);
         assert!(old_segments
             .iter()
-            .all(|old| !manifest.segments.contains(old)));
-        assert!(old_segments
-            .iter()
-            .all(|old| !state_dir.join("segments").join(old).exists()));
+            .all(|old| state_dir.join("segments").join(old).exists()));
         assert!(WriterLock::acquire(&state_dir).is_ok());
     }
 
@@ -1298,7 +1390,7 @@ mod resource_tests {
             fs::write(root.join(format!("file-{i}.txt")), b"content").unwrap();
         }
         let mut received = 0;
-        let error = for_each_discovered_file(&root, 4, |_| {
+        let error = for_each_discovered_file(&root, 4, None, |_| {
             received += 1;
             std::thread::sleep(std::time::Duration::from_millis(20));
             Err(std::io::Error::other("consumer stopped"))
@@ -1356,6 +1448,7 @@ fn run_build_checked(
         })
         .collect::<std::io::Result<_>>()?;
     ensure_state_dirs(state_dir)?;
+    let canonical_state = fs::canonicalize(state_dir)?;
     let _lock = WriterLock::acquire(state_dir)?;
     if let Some(expected_roots) = expected_current_roots {
         let current_roots = current_index_roots(state_dir)?;
@@ -1450,14 +1543,9 @@ fn run_build_checked(
     let mut generation = first_generation;
     let mut all_segment_names: Vec<String> = Vec::new();
 
-    let mut keystone =
-        KeystoneIndex::new(4096).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut keystone = KeystoneIndex::new(4096).map_err(std::io::Error::other)?;
 
-    let mut hash_index = native::HashIndex::create(4096)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-    let mut qwi_index = native::WordIndexBuilder::create()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut qwi_index = native::WordIndexBuilder::create().map_err(std::io::Error::other)?;
 
     let mut doc_records: Vec<DocRecord> = Vec::new();
     let mut batch_source_bytes: u64 = 0;
@@ -1476,7 +1564,7 @@ fn run_build_checked(
             ));
         }
 
-        for_each_discovered_file(&root_path, threads, |path| {
+        for_each_discovered_file(&root_path, threads, Some(&canonical_state), |path| {
             let meta = match fs::metadata(&path) {
                 Ok(m) => m,
                 Err(e) => {
@@ -1498,6 +1586,13 @@ fn run_build_checked(
 
             let (content, meta) = read_source_file(&path)?;
             let file_size = content.len() as u64;
+
+            // grep-searcher decodes UTF-16 BOM text. Raw-byte trigrams cannot
+            // safely exclude a match in that decoded text, so leave it unindexed.
+            if content.starts_with(b"\xff\xfe") || content.starts_with(b"\xfe\xff") {
+                io_pacer.pace()?;
+                return Ok(());
+            }
 
             // Get relative path from root
             let rel_path = path.strip_prefix(&root_path).unwrap_or(&path);
@@ -1539,15 +1634,9 @@ fn run_build_checked(
                 )));
             }
 
-            // Tokenize file content and add unique tokens to hash index
-            // for O(1) whole-word exact-match queries.
-            // Skip binary files (NUL bytes) — rg skips them during search,
-            // so including them in the word index would produce false positives
-            // when the index-trust optimization skips content verification.
-            if !content.contains(&0u8) {
-                add_tokens_to_hash_index(&mut hash_index, &content, doc_id)?;
-                add_tokens_to_qwi_index(&mut qwi_index, &content, doc_id)?;
-            }
+            // Word candidates are always verified against live content. Binary
+            // files can contain matches, so NUL does not exclude their tokens.
+            add_tokens_to_qwi_index(&mut qwi_index, &content, doc_id)?;
             drop(content);
             io_pacer.pace()?;
 
@@ -1613,7 +1702,6 @@ fn run_build_checked(
 
                 let flush_result = flush_batch(
                     &mut keystone,
-                    &mut hash_index,
                     &mut qwi_index,
                     &doc_records,
                     generation,
@@ -1696,7 +1784,6 @@ fn run_build_checked(
         }
         let flush_result = flush_batch(
             &mut keystone,
-            &mut hash_index,
             &mut qwi_index,
             &doc_records,
             generation,
@@ -1793,15 +1880,12 @@ fn run_build_checked(
 /// Finalize KEYSTONE, visit postings, build and flush a segment.
 fn flush_batch(
     keystone: &mut KeystoneIndex,
-    hash_index: &mut native::HashIndex,
     qwi_index: &mut native::WordIndexBuilder,
     doc_records: &[DocRecord],
     generation: u64,
     state_dir: &Path,
 ) -> std::io::Result<String> {
-    keystone
-        .finalize()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    keystone.finalize().map_err(std::io::Error::other)?;
 
     // Collect postings from KEYSTONE visitor
     let postings = collect_postings(keystone)?;
@@ -1817,32 +1901,16 @@ fn flush_batch(
     writer.set_postings(postings);
 
     let segments_dir = state_dir.join("segments");
-    writer.flush(&segments_dir)?;
+    let fingerprint = writer.flush(&segments_dir)?;
 
     let seg_name = format!("seg_{:08}.tgs", generation);
 
-    // Finalize and save hash index alongside the segment
-    if let Err(e) = hash_index.finalize() {
-        eprintln!("tgrep: warning: hash index finalize failed: {}", e);
-    } else {
-        let hash_path = segments_dir.join(format!("seg_{:08}.thi", generation));
-        if let Err(e) = hash_index.save(&hash_path) {
-            eprintln!("tgrep: warning: hash index save failed: {}", e);
-            if let Err(remove) = fs::remove_file(&hash_path) {
-                if remove.kind() != std::io::ErrorKind::NotFound {
-                    return Err(remove);
-                }
-            }
-        }
-    }
-
-    // Save QIHSE btree word index alongside the segment
-    // (empty segments with only binary files produce no .qwi file — this is fine)
+    // Save the optional word sidecar bound to the exact segment metadata.
     let qwi_path = segments_dir.join(format!("seg_{:08}.qwi", generation));
-    if let Err(e) = qwi_index.save(&qwi_path) {
+    if let Err(e) = qwi_index.save_for_segment(&qwi_path, generation, fingerprint) {
         eprintln!(
             "tgrep: ERROR: qwi word index save failed for seg_{:08}: {} \
-             (word searches will fall back to slower .thi hash index)",
+             (word searches will use trigram or streaming fallback)",
             generation, e
         );
         if let Err(remove) = fs::remove_file(&qwi_path) {
@@ -1854,16 +1922,10 @@ fn flush_batch(
 
     // Reset KEYSTONE for next batch
     // (We create a new index since KEYSTONE doesn't have a reset API)
-    *keystone =
-        KeystoneIndex::new(4096).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-    // Reset hash index for next batch
-    *hash_index = native::HashIndex::create(4096)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    *keystone = KeystoneIndex::new(4096).map_err(std::io::Error::other)?;
 
     // Reset QIHSE word index for next batch
-    *qwi_index = native::WordIndexBuilder::create()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    *qwi_index = native::WordIndexBuilder::create().map_err(std::io::Error::other)?;
 
     Ok(seg_name)
 }
@@ -1873,42 +1935,8 @@ fn collect_postings(idx: &KeystoneIndex) -> std::io::Result<BTreeMap<u32, Vec<u3
     idx.collect_postings().map_err(std::io::Error::other)
 }
 
-/// Tokenize file content and add unique tokens to the hash index.
-/// Tokens are sequences of ASCII word characters (alphanumeric + underscore).
-/// Each unique token in the file is added with the file's doc_id.
-fn add_tokens_to_hash_index(
-    hash: &mut native::HashIndex,
-    content: &[u8],
-    doc_id: u32,
-) -> std::io::Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    let mut start = None;
-    for (i, &b) in content.iter().enumerate() {
-        let is_word = b.is_ascii_alphanumeric() || b == b'_';
-        if is_word {
-            if start.is_none() {
-                start = Some(i);
-            }
-        } else if let Some(s) = start {
-            let token = &content[s..i];
-            if token.len() >= 2 && seen.insert(token.to_vec()) {
-                hash.add(token, doc_id).map_err(std::io::Error::other)?;
-            }
-            start = None;
-        }
-    }
-    if let Some(s) = start {
-        let token = &content[s..];
-        if token.len() >= 2 && seen.insert(token.to_vec()) {
-            hash.add(token, doc_id).map_err(std::io::Error::other)?;
-        }
-    }
-    Ok(())
-}
-
 /// Tokenize file content and add unique tokens to the QIHSE word index.
-/// Same tokenization as add_tokens_to_hash_index, but inserts into the
-/// persistent B+ tree backed by QIHSE.
+/// Tokens are ASCII alphanumeric/underscore runs, deduplicated per document.
 fn add_tokens_to_qwi_index(
     qwi: &mut native::WordIndexBuilder,
     content: &[u8],
@@ -1955,7 +1983,7 @@ fn replace_current_index(action: &str) -> std::io::Result<()> {
 }
 
 fn replace_current_index_at(action: &str, state_dir: &Path) -> std::io::Result<()> {
-    let roots = current_index_roots(&state_dir)?;
+    let roots = current_index_roots(state_dir)?;
     eprintln!(
         "tgrep: {action} performs a full source reindex of {} root(s)",
         roots.len()
@@ -2101,9 +2129,7 @@ pub fn refresh() -> std::io::Result<()> {
 }
 
 pub fn compact() -> std::io::Result<()> {
-    eprintln!("tgrep: compact rebuilds the indexed roots into a fresh segment set before cleanup");
-    replace_current_index("compact")?;
-    Ok(())
+    compaction::compact_at(&default_state_dir(), "auto", "auto")
 }
 
 pub fn rebuild() -> std::io::Result<()> {

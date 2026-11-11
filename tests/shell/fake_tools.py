@@ -13,19 +13,26 @@ tool, invoked, *arguments = sys.argv[1:]
 event = {"tool": tool, "args": arguments, "cwd": os.getcwd()}
 if tool == "cargo":
     event["simd_flags"] = os.environ.get("TGREP_SIMD_FLAGS")
+    target_directory = Path(os.environ.get("TGREP_FAKE_TARGET_DIRECTORY", str(Path.cwd() / "target")))
     if arguments[0] == "metadata":
         print(json.dumps({"packages": [{"name": "tgrep", "version": "1.2.3",
                                        "license": os.environ.get("TGREP_FAKE_LICENSE",
                                                                  "AGPL-3.0-only")}],
-                          "target_directory": str(Path.cwd() / "target")}))
+                          "target_directory": str(target_directory)}))
     elif "--release" in arguments:
-        target = Path.cwd() / "target/release/tgrep"
+        target = target_directory
+        if "--target" in arguments:
+            target /= arguments[arguments.index("--target") + 1]
+        target /= "release/tgrep"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("synthetic release artifact, never executed\n")
     elif arguments[0] == "clean":
         (Path.cwd() / "target/sentinel").unlink(missing_ok=True)
     else:
-        target = Path.cwd() / "target/debug/tgrep"
+        target = target_directory
+        if "--target" in arguments:
+            target /= arguments[arguments.index("--target") + 1]
+        target /= "debug/tgrep"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("synthetic debug artifact, never executed\n")
 elif tool == "tgrep":

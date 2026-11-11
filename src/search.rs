@@ -132,7 +132,7 @@ pub enum QueryPlan {
     /// All literal trigrams were found in the index; we can intersect
     /// postings to get a candidate set.
     Indexed { grams: Vec<u32> },
-    /// Whole-word search via hash index (O(1) token lookup).
+    /// Whole-word search via the checked word-hash sidecar.
     /// Only used when --word-regexp is set and the pattern is a single word.
     HashIndex { token: Vec<u8> },
     /// No usable literal trigrams (pattern too short, regex-only, etc.)
@@ -169,8 +169,8 @@ pub fn plan_query(
         }
     };
 
-    // Hash index fast path: if --word-regexp is set and the pattern is a
-    // single word (all word characters), use the hash index for O(1) lookup.
+    // Word sidecar fast path: if --word-regexp is set and the pattern is a
+    // single word (all word characters), use the checked word-hash index.
     let exact_literal = fixed
         || regex_syntax::Parser::new()
             .parse(pattern)
@@ -305,6 +305,60 @@ fn load_index_snapshot(
     (manifest, roots)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct IndexCostEstimate {
+    documents: u64,
+    source_bytes: u64,
+    candidate_upper_bound: u64,
+}
+
+impl IndexCostEstimate {
+    fn prefers_streaming(self) -> bool {
+        self.documents >= 128
+            && self.source_bytes <= self.documents.saturating_mul(64 * 1024)
+            && self.candidate_upper_bound.saturating_mul(2) >= self.documents
+    }
+}
+
+/// Use checked dictionary frequencies without decoding postings. The bound
+/// can overestimate matches; this policy only broadens live verification.
+fn estimate_index_cost(
+    readers: &[SegmentReader],
+    plan: &QueryPlan,
+    source_bytes: u64,
+) -> Option<IndexCostEstimate> {
+    let token_grams;
+    let grams = match plan {
+        QueryPlan::Indexed { grams } => grams.as_slice(),
+        QueryPlan::HashIndex { token } => {
+            token_grams = extract_unique_trigrams(token);
+            token_grams.as_slice()
+        }
+        QueryPlan::Streaming => return None,
+    };
+    if readers.is_empty() || grams.is_empty() {
+        return None;
+    }
+    let mut estimate = IndexCostEstimate {
+        documents: 0,
+        source_bytes,
+        candidate_upper_bound: 0,
+    };
+    for reader in readers {
+        estimate.documents = estimate
+            .documents
+            .saturating_add(u64::from(reader.doc_count()));
+        let upper_bound = grams
+            .iter()
+            .map(|gram| reader.document_frequency(*gram))
+            .min()?;
+        estimate.candidate_upper_bound = estimate
+            .candidate_upper_bound
+            .saturating_add(upper_bound as u64);
+    }
+    Some(estimate)
+}
+
 // ── Search entry point ──────────────────────────────────────────────
 
 pub fn run_search(config: SearchConfig) {
@@ -352,6 +406,10 @@ pub fn run_search(config: SearchConfig) {
         case_insensitive,
         config.word_regexp,
     );
+    if config.indexed_only && matches!(plan, QueryPlan::Streaming) {
+        eprintln!("tgrep: --indexed-only does not support this query; live scanning is required");
+        exit(2);
+    }
 
     // Load the manifest and open segments
     let state_dir = default_state_dir();
@@ -372,10 +430,22 @@ pub fn run_search(config: SearchConfig) {
     let segments_dir = state_dir.join("segments");
 
     let mut readers: Vec<SegmentReader> = Vec::new();
-    if let Some(manifest) = manifest.as_ref().filter(|_| can_use_index) {
+    if let Some(manifest) = manifest
+        .as_ref()
+        .filter(|_| can_use_index && !matches!(plan, QueryPlan::Streaming))
+    {
         for name in &manifest.segments {
-            match SegmentReader::open(&segments_dir.join(name)) {
-                Ok(reader) => readers.push(reader),
+            match SegmentReader::open_for_search(&segments_dir.join(name)) {
+                Ok(reader) if reader.supports_safe_pruning() => readers.push(reader),
+                Ok(_) => {
+                    eprintln!("tgrep: legacy index requires rebuilding; scanning source files");
+                    if config.indexed_only {
+                        exit(2);
+                    }
+                    readers.clear();
+                    plan = QueryPlan::Streaming;
+                    break;
+                }
                 Err(error) => {
                     eprintln!("tgrep: failed to read index segment {}: {}", name, error);
                     if config.indexed_only {
@@ -388,10 +458,14 @@ pub fn run_search(config: SearchConfig) {
             }
         }
     }
+    // This pass is already required for root binding. Reuse it for cost
+    // metadata instead of decoding every document table a second time.
+    let mut indexed_source_bytes = 0u64;
     if readers.iter().any(|reader| {
-        reader
-            .iter_docs()
-            .any(|doc| doc.root_id as usize >= indexed_roots.len())
+        reader.iter_docs().any(|doc| {
+            indexed_source_bytes = indexed_source_bytes.saturating_add(doc.byte_length);
+            doc.root_id as usize >= indexed_roots.len()
+        })
     }) {
         eprintln!("tgrep: index records refer to unavailable root metadata");
         if config.indexed_only {
@@ -399,6 +473,14 @@ pub fn run_search(config: SearchConfig) {
         }
         readers.clear();
         plan = QueryPlan::Streaming;
+    }
+
+    let cost_estimate = estimate_index_cost(&readers, &plan, indexed_source_bytes);
+    let cost_prefers_streaming =
+        !config.indexed_only && cost_estimate.is_some_and(IndexCostEstimate::prefers_streaming);
+    if cost_prefers_streaming {
+        plan = QueryPlan::Streaming;
+        readers.clear();
     }
 
     // Phase 11: Search-result cache (v2: grouped entries with file IDs).
@@ -411,7 +493,11 @@ pub fn run_search(config: SearchConfig) {
         config.fixed_strings,
     );
     let cache_path = state_dir.join("search_cache.qsc");
-    let mut cache = crate::cache_v2::SearchCacheV2::create().ok();
+    let mut cache = if config.files_with_matches && !matches!(plan, QueryPlan::Streaming) {
+        crate::cache_v2::SearchCacheV2::create().ok()
+    } else {
+        None
+    };
     if let Some(ref mut cache) = cache {
         let _ = cache.load(cache_path.to_str().unwrap_or(""));
     }
@@ -430,6 +516,19 @@ pub fn run_search(config: SearchConfig) {
     }
 
     if config.explain {
+        if let Some(estimate) = cost_estimate {
+            eprintln!(
+                "tgrep: cost estimate = up to {}/{} candidates, {} indexed source bytes{}",
+                estimate.candidate_upper_bound,
+                estimate.documents,
+                estimate.source_bytes,
+                if cost_prefers_streaming {
+                    "; streaming preferred"
+                } else {
+                    ""
+                }
+            );
+        }
         let features = crate::native::detect_cpu_features();
         let mut feature_parts = Vec::new();
         if features & 0x01 != 0 {
@@ -461,35 +560,6 @@ pub fn run_search(config: SearchConfig) {
                 for g in grams {
                     eprintln!("  {:06x}", g);
                 }
-                // Phase 10: Show optimization DB status in explain mode
-                let opt_db_path = state_dir.join("optimization.qdb");
-                let mut opt_db = crate::native::OptimizationDatabase::create(
-                    1000,
-                    Some(opt_db_path.to_str().unwrap_or("")),
-                )
-                .unwrap_or_else(|_| {
-                    crate::native::OptimizationDatabase::create(1000, None).unwrap()
-                });
-                let total_postings: usize = readers
-                    .iter()
-                    .map(|r| {
-                        grams
-                            .iter()
-                            .map(|g| r.read_postings(*g).len())
-                            .sum::<usize>()
-                    })
-                    .sum();
-                let sig = crate::native::compute_query_signature(grams, total_postings);
-                if let Some(cfg) = opt_db.get_config(&sig, 5) {
-                    eprintln!("tgrep: optimization = threads={} backend={} pipeline={} dims={} speedup={:.2}x samples={}",
-                        cfg.optimal_threads, cfg.optimal_backend, cfg.best_pipeline,
-                        cfg.optimal_dimensions, cfg.avg_speedup, cfg.samples);
-                } else {
-                    eprintln!(
-                        "tgrep: optimization = no recommendation yet (learning, {} entries)",
-                        opt_db.count()
-                    );
-                }
             }
             QueryPlan::HashIndex { token } => {
                 eprintln!(
@@ -500,11 +570,14 @@ pub fn run_search(config: SearchConfig) {
             QueryPlan::Streaming => {
                 if case_insensitive {
                     eprintln!("tgrep: plan = streaming (case-insensitive, trigram index is case-sensitive)");
+                } else if cost_prefers_streaming {
+                    eprintln!("tgrep: plan = streaming (broad query over small indexed files)");
                 } else {
                     eprintln!("tgrep: plan = streaming (no safe index plan)");
                 }
             }
         }
+        eprintln!("tgrep: usable index segments = {}", readers.len());
         return;
     }
 
@@ -515,6 +588,7 @@ pub fn run_search(config: SearchConfig) {
         .case_smart(smart_case)
         .fixed_strings(config.fixed_strings)
         .word(config.word_regexp)
+        .line_terminator(Some(b'\n'))
         .multi_line(true);
 
     let matcher = match builder.build_many(&patterns) {
@@ -525,48 +599,6 @@ pub fn run_search(config: SearchConfig) {
         }
     };
 
-    // Phase 10: Initialize the QIHSE optimization DB.
-    // Records per-query performance and recommends optimal thread/backend
-    // config for future searches with similar data signatures.
-    let opt_db_path = state_dir.join("optimization.qdb");
-    // Ensure the state directory exists so save() can write the file.
-    let _ = std::fs::create_dir_all(&state_dir);
-    let mut opt_db =
-        crate::native::OptimizationDatabase::create(1000, Some(opt_db_path.to_str().unwrap_or("")))
-            .unwrap_or_else(|e| {
-                if config.explain {
-                    eprintln!("tgrep: warning: optimization DB init failed: {}", e);
-                }
-                crate::native::OptimizationDatabase::create(1000, None).unwrap()
-            });
-
-    // Phase 10: Consult the optimization DB for recommended config.
-    let opt_config = if let QueryPlan::Indexed { grams } = &plan {
-        let total_postings: usize = readers
-            .iter()
-            .map(|r| {
-                grams
-                    .iter()
-                    .map(|g| r.read_postings(*g).len())
-                    .sum::<usize>()
-            })
-            .sum();
-        let sig = crate::native::compute_query_signature(grams, total_postings);
-        opt_db.get_config(&sig, 5)
-    } else {
-        None
-    };
-
-    if config.explain {
-        if let Some(ref cfg) = opt_config {
-            eprintln!("tgrep: optimization = threads={} backend={} pipeline={} dims={} speedup={:.2}x samples={}",
-                cfg.optimal_threads, cfg.optimal_backend, cfg.best_pipeline,
-                cfg.optimal_dimensions, cfg.avg_speedup, cfg.samples);
-        } else {
-            eprintln!("tgrep: optimization = no recommendation yet (learning)");
-        }
-    }
-
     let (visible_files, walk_errors) = match collect_all_files(&paths, walk_hidden, &globs, threads)
     {
         Ok(result) => result,
@@ -575,59 +607,80 @@ pub fn run_search(config: SearchConfig) {
             exit(2);
         }
     };
+    // Resolve visible identities once, only when pruning or cache ordering
+    // needs them. Display spellings remain separate from canonical identities.
+    let indexed_plan = !matches!(plan, QueryPlan::Streaming);
+    let mut path_identities = std::collections::HashMap::new();
     let mut visible_map: std::collections::HashMap<PathBuf, Vec<PathBuf>> =
         std::collections::HashMap::new();
-    for path in &visible_files {
-        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-        visible_map.entry(canonical).or_default().push(path.clone());
+    if indexed_plan || !cached_hints.is_empty() {
+        path_identities.reserve(visible_files.len());
+        for path in &visible_files {
+            let canonical = canonical_identity(path, &mut path_identities);
+            if indexed_plan {
+                visible_map.entry(canonical).or_default().push(path.clone());
+            }
+        }
     }
+    let mut unchanged_indexed_paths = None;
 
-    // Compute the candidate set from indexed segments
-    let indexed_candidates: Vec<(PathBuf, u64)> = match &plan {
+    // A corrupt accessed posting is not evidence of absence. Ordinary search
+    // falls back to live scanning; the benchmark-only mode reports an error.
+    let candidates = match &plan {
         QueryPlan::Indexed { grams } => intersect_postings(&readers, grams, &indexed_roots),
         QueryPlan::HashIndex { token } => {
-            // Prefer the mmap-backed QWI sidecar. For ordinary (>= 3 byte)
-            // words, fall back directly to trigram postings instead of loading
-            // legacy `.thi` hash tables into memory; those sidecars can be
-            // hundreds of MiB. Very short tokens have no trigrams, so use the
-            // legacy hash index only for that case before scanning unchanged
-            // indexed paths.
-            qihse_word_index_candidates(&readers, &segments_dir, token, &indexed_roots)
-                .or_else(|| {
-                    let grams = extract_unique_trigrams(token);
-                    if grams.is_empty() {
-                        hash_index_candidates(&readers, &segments_dir, token, &indexed_roots)
-                    } else {
-                        Some(intersect_postings(&readers, &grams, &indexed_roots))
-                    }
-                })
-                .unwrap_or_else(|| {
-                    let unchanged = collect_unchanged_indexed_paths(&readers, &indexed_roots);
-                    visible_files
-                        .iter()
-                        .filter(|p| {
-                            let canonical = fs::canonicalize(p).unwrap_or_else(|_| (*p).clone());
-                            unchanged.contains(&canonical)
-                        })
-                        .map(|p| (p.clone(), 0))
-                        .collect()
-                })
+            if let Some(candidates) =
+                qihse_word_index_candidates(&readers, &segments_dir, token, &indexed_roots)
+            {
+                Ok(candidates)
+            } else {
+                let grams = extract_unique_trigrams(token);
+                if !grams.is_empty() {
+                    intersect_postings(&readers, &grams, &indexed_roots)
+                } else {
+                    // Short tokens have no trigrams. Legacy THI sidecars are
+                    // unbound to segment metadata and cannot establish absence.
+                    // Verify every unchanged indexed file instead.
+                    let unchanged = unchanged_indexed_paths.get_or_insert_with(|| {
+                        collect_unchanged_indexed_paths(
+                            &readers,
+                            &indexed_roots,
+                            &mut path_identities,
+                        )
+                    });
+                    Ok(visible_map
+                        .keys()
+                        .filter(|path| unchanged.contains(*path))
+                        .map(|path| (path.clone(), 0))
+                        .collect())
+                }
+            }
         }
-        QueryPlan::Streaming => Vec::new(),
+        QueryPlan::Streaming => Ok(Vec::new()),
+    };
+    let indexed_candidates = match candidates {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            eprintln!("tgrep: index postings unavailable: {error}");
+            if config.indexed_only {
+                exit(2);
+            }
+            readers.clear();
+            plan = QueryPlan::Streaming;
+            Vec::new()
+        }
     };
 
-    // Build a set of ALL indexed file paths (not just candidates).
-    // This lets us skip scanning indexed non-candidates — we know they
-    // don't contain all trigrams, so they can't match the pattern.
-    // Only needed for indexed plan with streaming fallback.
+    // Only unchanged indexed files can be excluded by a negative index result.
     let need_indexed_paths = !config.indexed_only
         && (matches!(plan, QueryPlan::Indexed { .. })
             || matches!(plan, QueryPlan::HashIndex { .. }))
         && !readers.is_empty()
         && !indexed_roots.is_empty();
-
     let indexed_paths: std::collections::HashSet<PathBuf> = if need_indexed_paths {
-        collect_unchanged_indexed_paths(&readers, &indexed_roots)
+        unchanged_indexed_paths.unwrap_or_else(|| {
+            collect_unchanged_indexed_paths(&readers, &indexed_roots, &mut path_identities)
+        })
     } else {
         std::collections::HashSet::new()
     };
@@ -635,21 +688,27 @@ pub fn run_search(config: SearchConfig) {
     let indexed_candidates = expand_visible_aliases(
         indexed_candidates
             .into_iter()
-            .map(|(path, _)| fs::canonicalize(&path).unwrap_or(path)),
+            .map(|(path, _)| canonical_identity(&path, &mut path_identities)),
         &visible_map,
     );
     let indexed_candidate_count = indexed_candidates.len();
     let mut all_files = indexed_candidates;
     if !config.indexed_only {
         all_files.extend(visible_files.into_iter().filter(|path| {
-            let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-            matches!(plan, QueryPlan::Streaming) || !indexed_paths.contains(&canonical)
+            matches!(plan, QueryPlan::Streaming)
+                || !indexed_paths.contains(path_identities.get(path).unwrap_or(path))
         }));
     }
     let mut seen = std::collections::HashSet::new();
     all_files.retain(|path| seen.insert(path.as_os_str().to_os_string()));
-    let hints: std::collections::HashSet<&str> = cached_hints.iter().map(String::as_str).collect();
-    all_files.sort_by_key(|path| !hints.contains(path.to_string_lossy().as_ref()));
+    if !cached_hints.is_empty() {
+        let hints: std::collections::HashSet<&str> =
+            cached_hints.iter().map(String::as_str).collect();
+        all_files.sort_by_cached_key(|path| {
+            let canonical = path_identities.get(path).unwrap_or(path);
+            !hints.contains(canonical.to_string_lossy().as_ref())
+        });
+    }
 
     // Debug: list files that would be searched
     if config.list_files {
@@ -679,8 +738,7 @@ pub fn run_search(config: SearchConfig) {
     }
 
     // Parallel search (only for files that need verification)
-    let search_start = std::time::Instant::now();
-    let (match_found, matched_paths, search_errors) = parallel_search(
+    let (match_found, matched_paths, search_errors, completed) = parallel_search(
         &all_files,
         &matcher,
         config.line_number,
@@ -689,71 +747,29 @@ pub fn run_search(config: SearchConfig) {
         config.quiet,
         threads,
     );
-    let search_elapsed = search_start.elapsed();
 
     // Phase 11: Store results in cache for future lookups.
     // Only cache -l (files_with_matches) mode results.
-    if config.files_with_matches {
+    if config.files_with_matches && !config.quiet && !search_errors && completed {
         if let Some(ref mut cache) = cache {
             let path_strings: Vec<String> = matched_paths
                 .iter()
-                .map(|p| p.to_string_lossy().to_string())
+                .map(|path| {
+                    path_identities
+                        .get(path)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .to_string()
+                })
                 .collect();
             cache.store_results(&pattern, cache_flags, manifest_generation, &path_strings);
             let _ = cache.save(cache_path.to_str().unwrap_or(""));
         }
     }
 
-    // Phase 10: Record performance for this query signature.
-    // Only for indexed queries where we have a meaningful data signature.
-    if let QueryPlan::Indexed { grams } = &plan {
-        let total_postings: usize = readers
-            .iter()
-            .map(|r| {
-                grams
-                    .iter()
-                    .map(|g| r.read_postings(*g).len())
-                    .sum::<usize>()
-            })
-            .sum();
-        let sig = crate::native::compute_query_signature(grams, total_postings);
-        // Speedup vs baseline (rough heuristic: indexed search vs full scan).
-        // Confidence is 1.0 for exact-match verification.
-        let speedup = if !all_files.is_empty() && indexed_candidate_count > 0 {
-            (all_files.len() as f64) / (indexed_candidate_count.max(1) as f64)
-        } else {
-            1.0
-        };
-        let backend = if crate::native::detect_cpu_features() & 0x01 != 0 {
-            1
-        } else {
-            0
-        };
-        opt_db.record(
-            &sig,
-            1, // pipeline: balanced
-            grams.len(),
-            speedup,
-            1.0, // confidence
-            threads as i32,
-            backend,
-        );
-        // Save the DB so future searches benefit
-        let _ = opt_db.save();
-    }
-
-    if config.explain {
-        eprintln!(
-            "tgrep: search took {:.3}ms",
-            search_elapsed.as_secs_f64() * 1000.0
-        );
-    }
-
     // Match ripgrep exit codes: 0 = match found, 1 = no match, 2 = error
-    if walk_errors || search_errors {
-        if !(config.quiet && match_found) {
-            exit(2);
-        }
+    if (walk_errors || search_errors) && !(config.quiet && match_found) {
+        exit(2);
     }
     if match_found {
         exit(0);
@@ -762,11 +778,161 @@ pub fn run_search(config: SearchConfig) {
     }
 }
 
+/// A completed file retains at most 1 MiB of formatted output in memory. Larger
+/// results spill to an anonymous file so the receiver can still print each
+/// file contiguously. This does not bound grep-searcher's input/line buffers.
+const FILE_OUTPUT_MEMORY_LIMIT: usize = 1024 * 1024;
+
+enum FileOutput {
+    Memory(Vec<u8>),
+    Spilled(io::BufWriter<fs::File>),
+}
+
+impl FileOutput {
+    fn new() -> Self {
+        Self::Memory(Vec::new())
+    }
+
+    fn write_to(&mut self, writer: &mut impl Write) -> io::Result<()> {
+        use std::io::{Read, Seek};
+
+        match self {
+            Self::Memory(bytes) => writer.write_all(bytes),
+            Self::Spilled(spool) => {
+                spool.flush()?;
+                let file = spool.get_mut();
+                file.rewind()?;
+                let mut buffer = [0; 64 * 1024];
+                loop {
+                    let count = match file.read(&mut buffer) {
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        result => result?,
+                    };
+                    if count == 0 {
+                        return Ok(());
+                    }
+                    writer.write_all(&buffer[..count])?;
+                }
+            }
+        }
+    }
+}
+
+impl Write for FileOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Memory(buffer) if bytes.len() <= FILE_OUTPUT_MEMORY_LIMIT - buffer.len() => {
+                let required = buffer.len() + bytes.len();
+                if required > buffer.capacity() {
+                    // Vec's normal geometric growth may exceed our byte cap.
+                    let capacity = required
+                        .max(buffer.capacity().saturating_mul(2))
+                        .min(FILE_OUTPUT_MEMORY_LIMIT);
+                    buffer.reserve_exact(capacity - buffer.len());
+                }
+                buffer.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            Self::Memory(buffer) => {
+                let mut file = create_output_spool(&std::env::temp_dir())?;
+                file.write_all(buffer)?;
+                // Release the old allocation before allocating the bounded
+                // spool buffer or writing a potentially very large new chunk.
+                *buffer = Vec::new();
+                *self = Self::Spilled(io::BufWriter::with_capacity(64 * 1024, file));
+                self.write(bytes)
+            }
+            Self::Spilled(file) => file.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Memory(_) => Ok(()),
+            Self::Spilled(file) => file.flush(),
+        }
+    }
+}
+
+/// Search contents are never written to a named temporary file. O_TMPFILE is
+/// preferable; the portable Unix fallback unlinks a securely created empty
+/// file before handing its descriptor to the output writer.
+fn create_output_spool(directory: &Path) -> io::Result<fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(file) = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_TMPFILE | libc::O_CLOEXEC)
+            .open(directory)
+        {
+            return Ok(file);
+        }
+    }
+
+    create_unlinked_output_spool(directory)
+}
+
+fn create_unlinked_output_spool(directory: &Path) -> io::Result<fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let template = directory.join(".tgrep-output-XXXXXX");
+    let mut template = std::ffi::CString::new(template.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "temporary path contains NUL"))?
+        .into_bytes_with_nul();
+    #[cfg(target_os = "linux")]
+    let descriptor = unsafe { libc::mkostemp(template.as_mut_ptr().cast(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    let descriptor = unsafe { libc::mkstemp(template.as_mut_ptr().cast()) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { fs::File::from_raw_fd(descriptor) };
+    if unsafe { libc::unlink(template.as_ptr().cast()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[cfg(not(target_os = "linux"))]
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// Stop output production promptly even when one input read contains many
+/// matches. Interrupted is unsuitable here: write_all would retry forever.
+struct CancellableOutput<'a> {
+    output: &'a mut FileOutput,
+    cancelled: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Write for CancellableOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        self.output.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FileOutputOptions {
+    files_with_matches: bool,
+    count: bool,
+    quiet: bool,
+}
+
 /// Result of searching a single file.
 struct FileResult {
     _path: PathBuf,
     matched: bool,
-    output: Vec<u8>,
+    output: FileOutput,
     error: Option<String>,
 }
 
@@ -816,8 +982,9 @@ fn prefetch_setting_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value == Some(std::ffi::OsStr::new("1"))
 }
 
-/// Search files in parallel using scoped threads.
-/// Returns (true if any match was found, list of matching file paths).
+/// Search files with a bounded queue of completed per-file output spools.
+/// The caller receives matches while workers run, rather than retaining the
+/// entire corpus output. Display paths are preserved for printing and caching.
 fn parallel_search(
     files: &[PathBuf],
     matcher: &grep_regex::RegexMatcher,
@@ -826,209 +993,179 @@ fn parallel_search(
     count: bool,
     quiet: bool,
     num_threads: usize,
-) -> (bool, Vec<PathBuf>, bool) {
+) -> (bool, Vec<PathBuf>, bool, bool) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
     if files.is_empty() {
-        return (false, Vec::new(), false);
+        return (false, Vec::new(), false, true);
     }
+    let found = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(false);
+    let next_file = AtomicUsize::new(0);
+    let nthreads = num_threads.max(1).min(files.len()).min(64);
+    let output_options = FileOutputOptions {
+        files_with_matches,
+        count,
+        quiet,
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel(nthreads * 2);
+    let mut matched_paths = Vec::new();
+    let mut errors = false;
+    let mut completed = true;
 
-    // For quiet mode, use atomic flag for early exit
-    let found = std::sync::atomic::AtomicBool::new(false);
-    let found_ref = &found;
-
-    // Determine thread count (at least 1)
-    let nthreads = num_threads.max(1).min(files.len());
-
-    if nthreads == 1 {
-        // Single-threaded fast path
-        let results = search_chunk(
-            files,
-            matcher,
-            line_number,
-            files_with_matches,
-            count,
-            quiet,
-            found_ref,
-        );
-        let matched_paths: Vec<PathBuf> = results
-            .iter()
-            .filter(|r| r.matched)
-            .map(|r| r._path.clone())
-            .collect();
-        let errors = output_results(&results, files_with_matches, count, quiet);
-        return (
-            found.load(std::sync::atomic::Ordering::Relaxed),
-            matched_paths,
-            errors,
-        );
-    }
-
-    // Split files into chunks
-    let chunk_size = (files.len() + nthreads - 1) / nthreads;
-    let chunks: Vec<&[PathBuf]> = files.chunks(chunk_size).collect();
-
-    let results: Vec<Vec<FileResult>> = std::thread::scope(|s| {
-        let handles: Vec<_> = chunks
-            .iter()
-            .map(|chunk| {
-                s.spawn(move || {
-                    search_chunk(
-                        chunk,
+    std::thread::scope(|scope| {
+        for _ in 0..nthreads {
+            let sender = sender.clone();
+            let found = &found;
+            let cancelled = &cancelled;
+            let next_file = &next_file;
+            scope.spawn(move || {
+                let mut searcher = SearcherBuilder::new()
+                    .line_number(line_number)
+                    .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
+                    .build();
+                loop {
+                    if cancelled.load(Ordering::Relaxed) || (quiet && found.load(Ordering::Relaxed))
+                    {
+                        break;
+                    }
+                    let index = next_file.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = files.get(index) else {
+                        break;
+                    };
+                    let result = search_file(
+                        path,
                         matcher,
-                        line_number,
-                        files_with_matches,
-                        count,
-                        quiet,
-                        found_ref,
-                    )
-                })
-            })
-            .collect();
+                        &mut searcher,
+                        output_options,
+                        found,
+                        cancelled,
+                    );
+                    if sender.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
 
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        for mut result in receiver {
+            if let Some(error) = &result.error {
+                eprintln!("tgrep: {error}");
+                errors = true;
+            }
+            if result.matched {
+                matched_paths.push(result._path);
+            }
+            if !quiet && (result.matched || count) {
+                if let Err(error) = result.output.write_to(&mut out).and_then(|_| out.flush()) {
+                    cancelled.store(true, Ordering::Relaxed);
+                    completed = false;
+                    // A consumer such as head has finished normally. Stop the
+                    // remaining reads and writers without an EPIPE diagnostic.
+                    if error.kind() != io::ErrorKind::BrokenPipe {
+                        eprintln!("tgrep: output: {error}");
+                        errors = true;
+                    }
+                    break;
+                }
+            }
+        }
+        // Dropping the receiver also releases workers blocked on a full queue.
     });
 
-    // Merge results in order (chunks are already in file order)
-    let mut all_results: Vec<FileResult> = Vec::with_capacity(files.len());
-    for chunk_results in results {
-        all_results.extend(chunk_results);
-    }
-
-    let matched_paths: Vec<PathBuf> = all_results
-        .iter()
-        .filter(|r| r.matched)
-        .map(|r| r._path.clone())
-        .collect();
-
-    let errors = output_results(&all_results, files_with_matches, count, quiet);
     (
-        found.load(std::sync::atomic::Ordering::Relaxed),
+        found.load(Ordering::Relaxed),
         matched_paths,
         errors,
+        completed,
     )
 }
 
-/// Search a chunk of files in a single thread.
-fn search_chunk(
-    files: &[PathBuf],
-    matcher: &grep_regex::RegexMatcher,
-    line_number: bool,
-    files_with_matches: bool,
-    count: bool,
+/// Check cancellation at each input read, including files with no matches.
+/// The searcher still performs its ordinary decoding and binary detection.
+struct CancellableReader<'a> {
+    file: fs::File,
+    cancelled: &'a std::sync::atomic::AtomicBool,
+    found: &'a std::sync::atomic::AtomicBool,
     quiet: bool,
-    found: &std::sync::atomic::AtomicBool,
-) -> Vec<FileResult> {
-    let mut results = Vec::with_capacity(files.len());
-
-    // Reuse a single Searcher for all files in this chunk
-    let mut searcher = SearcherBuilder::new()
-        .line_number(line_number)
-        .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
-        .build();
-
-    for path in files {
-        // Early exit for quiet mode
-        if quiet && found.load(std::sync::atomic::Ordering::Relaxed) {
-            results.push(FileResult {
-                _path: path.clone(),
-                matched: false,
-                output: Vec::new(),
-                error: None,
-            });
-            continue;
-        }
-
-        let mut output_buf: Vec<u8> = Vec::new();
-        let mut error = None;
-
-        let matched = if files_with_matches || count || quiet {
-            // Use Summary printer writing to a buffer
-            let kind = if quiet {
-                SummaryKind::Quiet
-            } else if count {
-                SummaryKind::Count
-            } else {
-                SummaryKind::PathWithMatch
-            };
-
-            let mut printer = SummaryBuilder::new()
-                .kind(kind)
-                .build_no_color(&mut output_buf);
-
-            let mut sink = printer.sink_with_path(matcher, path);
-            let result = searcher.search_path(matcher, path, &mut sink);
-            if let Err(e) = &result {
-                error = Some(format!("{}: {}", path.display(), e));
-            }
-            if result.is_ok() {
-                let m = sink.has_match();
-                if m {
-                    found.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                m
-            } else {
-                false
-            }
-        } else {
-            // Use Standard printer writing to a buffer
-            let mut printer = grep_printer::StandardBuilder::new().build_no_color(&mut output_buf);
-
-            let mut sink = printer.sink_with_path(matcher, path);
-            let result = searcher.search_path(matcher, path, &mut sink);
-            if let Err(e) = &result {
-                error = Some(format!("{}: {}", path.display(), e));
-            }
-            if result.is_ok() {
-                let m = sink.has_match();
-                if m {
-                    found.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                m
-            } else {
-                false
-            }
-        };
-
-        results.push(FileResult {
-            _path: path.clone(),
-            matched,
-            output: output_buf,
-            error,
-        });
-    }
-
-    results
 }
 
-/// Output results in order.
-fn output_results(
-    results: &[FileResult],
-    _files_with_matches: bool,
-    count: bool,
-    quiet: bool,
-) -> bool {
-    let mut errors = false;
-    for result in results {
-        if let Some(error) = &result.error {
-            eprintln!("tgrep: {}", error);
-            errors = true;
+impl io::Read for CancellableReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use std::sync::atomic::Ordering;
+        if self.cancelled.load(Ordering::Relaxed)
+            || (self.quiet && self.found.load(Ordering::Relaxed))
+        {
+            return Ok(0);
         }
+        io::Read::read(&mut self.file, buffer)
     }
-    if quiet {
-        return errors;
-    }
+}
 
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
-    for r in results {
-        if r.matched || count {
-            if let Err(error) = out.write_all(&r.output) {
-                eprintln!("tgrep: stdout: {}", error);
-                return true;
-            }
+fn search_file(
+    path: &Path,
+    matcher: &grep_regex::RegexMatcher,
+    searcher: &mut grep_searcher::Searcher,
+    options: FileOutputOptions,
+    found: &std::sync::atomic::AtomicBool,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> FileResult {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return FileResult {
+                _path: path.to_path_buf(),
+                matched: false,
+                output: FileOutput::new(),
+                error: Some(format!("{}: {error}", path.display())),
+            };
         }
+    };
+    let reader = CancellableReader {
+        file,
+        cancelled,
+        found,
+        quiet: options.quiet,
+    };
+    let mut output = FileOutput::new();
+    let mut writer = CancellableOutput {
+        output: &mut output,
+        cancelled,
+    };
+    let (matched, result) = if options.files_with_matches || options.count || options.quiet {
+        let kind = if options.quiet {
+            SummaryKind::Quiet
+        } else if options.count {
+            SummaryKind::Count
+        } else {
+            SummaryKind::PathWithMatch
+        };
+        let mut printer = SummaryBuilder::new().kind(kind).build_no_color(&mut writer);
+        let mut sink = printer.sink_with_path(matcher, path);
+        let result = searcher.search_reader(matcher, reader, &mut sink);
+        (sink.has_match(), result)
+    } else {
+        let mut printer = grep_printer::StandardBuilder::new().build_no_color(&mut writer);
+        let mut sink = printer.sink_with_path(matcher, path);
+        let result = searcher.search_reader(matcher, reader, &mut sink);
+        (sink.has_match(), result)
+    };
+    let result = result.and_then(|_| writer.flush());
+    let matched = matched && result.is_ok();
+    if matched {
+        found.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    errors
+    FileResult {
+        _path: path.to_path_buf(),
+        matched,
+        output,
+        error: result
+            .err()
+            .map(|error| format!("{}: {error}", path.display())),
+    }
 }
 
 // ── Posting intersection ────────────────────────────────────────────
@@ -1039,9 +1176,9 @@ fn intersect_postings(
     readers: &[SegmentReader],
     grams: &[u32],
     indexed_roots: &[String],
-) -> Vec<(PathBuf, u64)> {
+) -> io::Result<Vec<(PathBuf, u64)>> {
     if readers.is_empty() || grams.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut candidates: Vec<(PathBuf, u64)> = Vec::new();
@@ -1051,7 +1188,7 @@ fn intersect_postings(
         let mut posting_lists: Vec<Vec<u32>> = Vec::with_capacity(grams.len());
         let mut any_empty = false;
         for &g in grams {
-            let p = reader.read_postings(g);
+            let p = reader.try_read_postings(g)?;
             if p.is_empty() {
                 any_empty = true;
                 break;
@@ -1071,6 +1208,12 @@ fn intersect_postings(
 
         // Map doc IDs to paths (bulk lookup for efficiency)
         let docs = reader.get_docs_bulk(&result);
+        if docs.iter().any(Option::is_none) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "postings refer to a missing document",
+            ));
+        }
         for doc in docs.into_iter().flatten() {
             let root_idx = doc.root_id as usize;
             if root_idx < indexed_roots.len() {
@@ -1082,131 +1225,12 @@ fn intersect_postings(
         }
     }
 
-    candidates
+    Ok(candidates)
 }
 
-/// Look up whole-token candidates via the per-segment hash indexes.
-/// Each segment has a sidecar `.thi` file containing the hash index.
+/// Look up whole-token candidates via checked, segment-bound QWI sidecars.
+/// Each `.qwi` contains sorted word-hash/document-ID entries.
 /// Returns (path, byte_length) pairs for files containing the token.
-fn hash_index_candidates(
-    readers: &[SegmentReader],
-    segments_dir: &Path,
-    token: &[u8],
-    indexed_roots: &[String],
-) -> Option<Vec<(PathBuf, u64)>> {
-    if readers.is_empty() || token.is_empty() {
-        return None;
-    }
-
-    // Parallel load + search across segments to avoid serial I/O bottleneck.
-    // Each segment's .thi file is loaded and searched independently.
-    use std::sync::Mutex;
-    use std::thread;
-
-    let token_owned = token.to_vec();
-    let segments_dir = segments_dir.to_path_buf();
-    let indexed_roots: Vec<String> = indexed_roots.to_vec();
-
-    // Collect (reader_index, hash_path) pairs that have hash index sidecars
-    let work: Vec<(usize, std::path::PathBuf)> = readers
-        .iter()
-        .enumerate()
-        .filter_map(|(i, reader)| {
-            let seg_name = reader.segment_name();
-            let hash_path = segments_dir.join(format!("{}.thi", seg_name));
-            if hash_path.exists() {
-                Some((i, hash_path))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if work.len() != readers.len() || work.is_empty() {
-        return None;
-    }
-
-    // Chunk work across threads (4 threads, like the search itself)
-    let num_threads = 4usize.min(work.len());
-    let chunk_size = (work.len() + num_threads - 1) / num_threads;
-    let chunks: Vec<Vec<(usize, std::path::PathBuf)>> =
-        work.chunks(chunk_size).map(|c| c.to_vec()).collect();
-
-    let results = Mutex::new(Vec::new());
-    let errors = Mutex::new(Vec::new());
-
-    thread::scope(|s| {
-        for chunk in &chunks {
-            let results = &results;
-            let errors = &errors;
-            let readers = readers;
-            let indexed_roots = &indexed_roots;
-            let token_owned = &token_owned;
-            s.spawn(move || {
-                let mut local = Vec::new();
-                for (reader_idx, hash_path) in chunk {
-                    let hash_index = match crate::native::HashIndex::load(hash_path) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            errors.lock().unwrap().push(e);
-                            continue;
-                        }
-                    };
-                    let doc_ids = match hash_index.search_all(token_owned) {
-                        Ok(ids) => ids,
-                        Err(error) => {
-                            errors.lock().unwrap().push(error);
-                            continue;
-                        }
-                    };
-                    if doc_ids.is_empty() {
-                        continue;
-                    }
-                    let reader = &readers[*reader_idx];
-                    let docs = reader.get_docs_bulk(&doc_ids);
-                    if docs.iter().any(Option::is_none) {
-                        errors
-                            .lock()
-                            .unwrap()
-                            .push("word index refers to a missing document".to_string());
-                        continue;
-                    }
-                    for doc in docs.into_iter().flatten() {
-                        let root_idx = doc.root_id as usize;
-                        if root_idx < indexed_roots.len() {
-                            let root = PathBuf::from(&indexed_roots[root_idx]);
-                            use std::os::unix::ffi::OsStringExt;
-                            let full_path =
-                                root.join(std::ffi::OsString::from_vec(doc.path.to_vec()));
-                            local.push((full_path, doc.byte_length));
-                        }
-                    }
-                }
-                results.lock().unwrap().extend(local);
-            });
-        }
-    });
-
-    let errors = errors.into_inner().unwrap();
-    let complete = errors.is_empty();
-    for e in errors {
-        eprintln!("tgrep: warning: hash index unavailable: {}", e);
-    }
-
-    if complete {
-        Some(results.into_inner().unwrap())
-    } else {
-        None
-    }
-}
-
-/// Look up whole-token candidates via the per-segment QIHSE B+ tree indexes.
-/// Each segment has a sidecar `.qwi` file containing the persistent B+ tree.
-/// Returns (path, byte_length) pairs for files containing the token.
-///
-/// This is the QIHSE-backed alternative to the KEYSTONE `.thi` hash index.
-/// It is preferred when `.qwi` files are present because the B+ tree format
-/// is more compact and supports prefix scans natively.
 fn qihse_word_index_candidates(
     readers: &[SegmentReader],
     segments_dir: &Path,
@@ -1244,7 +1268,7 @@ fn qihse_word_index_candidates(
     }
 
     let num_threads = 4usize.min(work.len());
-    let chunk_size = (work.len() + num_threads - 1) / num_threads;
+    let chunk_size = work.len().div_ceil(num_threads);
     let chunks: Vec<Vec<(usize, std::path::PathBuf)>> =
         work.chunks(chunk_size).map(|c| c.to_vec()).collect();
 
@@ -1255,13 +1279,16 @@ fn qihse_word_index_candidates(
         for chunk in &chunks {
             let results = &results;
             let errors = &errors;
-            let readers = readers;
             let indexed_roots = &indexed_roots;
             let token_owned = &token_owned;
             s.spawn(move || {
                 let mut local = Vec::new();
                 for (reader_idx, qwi_path) in chunk {
-                    let qwi = match crate::native::MmapWordIndex::load(qwi_path) {
+                    let qwi = match crate::native::MmapWordIndex::load_for_segment(
+                        qwi_path,
+                        readers[*reader_idx].generation(),
+                        readers[*reader_idx].metadata_fingerprint(),
+                    ) {
                         Ok(h) => h,
                         Err(e) => {
                             errors.lock().unwrap().push(e);
@@ -1270,7 +1297,7 @@ fn qihse_word_index_candidates(
                     };
                     // Hard cap: qwi.size() tracks the file's entry count, but the
                     // usable output is doc ids (u32). Bound the C-side buffer too.
-                    let max_results = qwi.size().min(1 << 22).max(1);
+                    let max_results = qwi.size().saturating_add(1).clamp(1, 1 << 22);
                     let doc_ids_u64 = match qwi.search(token_owned, max_results) {
                         Ok(ids) => ids,
                         Err(error) => {
@@ -1433,6 +1460,7 @@ fn collect_all_files(
 
         let mut builder = ignore::WalkBuilder::new(root);
         builder
+            .add_custom_ignore_filename(".rgignore")
             .hidden(hidden)
             .git_ignore(true)
             .git_global(true)
@@ -1474,6 +1502,7 @@ fn collect_all_files(
 fn collect_unchanged_indexed_paths(
     readers: &[SegmentReader],
     indexed_roots: &[String],
+    path_identities: &mut std::collections::HashMap<PathBuf, PathBuf>,
 ) -> std::collections::HashSet<PathBuf> {
     let mut paths = std::collections::HashSet::new();
     for reader in readers {
@@ -1491,7 +1520,7 @@ fn collect_unchanged_indexed_paths(
                         && meta.mtime() * 1_000_000_000 + meta.mtime_nsec() == doc.mtime_ns
                         && meta.ctime() * 1_000_000_000 + meta.ctime_nsec() == doc.ctime_ns
                     {
-                        paths.insert(fs::canonicalize(&full_path).unwrap_or(full_path));
+                        paths.insert(canonical_identity(&full_path, path_identities));
                     }
                 }
             }
@@ -1500,11 +1529,174 @@ fn collect_unchanged_indexed_paths(
     paths
 }
 
+/// Reuse identity resolution within one live search. Remembering the resolved
+/// spelling too lets absolute indexed paths share the work done for aliases.
+/// This memo never substitutes for current metadata or content verification.
+fn canonical_identity(
+    path: &Path,
+    identities: &mut std::collections::HashMap<PathBuf, PathBuf>,
+) -> PathBuf {
+    if let Some(canonical) = identities.get(path) {
+        return canonical.clone();
+    }
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    identities.insert(path.to_path_buf(), canonical.clone());
+    identities
+        .entry(canonical.clone())
+        .or_insert_with(|| canonical.clone());
+    canonical
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_policy_requires_a_broad_small_file_index() {
+        let broad = IndexCostEstimate {
+            documents: 128,
+            source_bytes: 128 * 1024,
+            candidate_upper_bound: 64,
+        };
+        assert!(broad.prefers_streaming());
+        assert!(!IndexCostEstimate {
+            documents: 127,
+            ..broad
+        }
+        .prefers_streaming());
+        assert!(!IndexCostEstimate {
+            candidate_upper_bound: 63,
+            ..broad
+        }
+        .prefers_streaming());
+        assert!(!IndexCostEstimate {
+            source_bytes: 128 * 64 * 1024 + 1,
+            ..broad
+        }
+        .prefers_streaming());
+    }
+
+    #[test]
+    fn file_output_spills_at_a_fixed_byte_limit_without_losing_bytes() {
+        let mut output = FileOutput::new();
+        let first = vec![b'a'; FILE_OUTPUT_MEMORY_LIMIT];
+        for bytes in first.chunks(65_521) {
+            output.write_all(bytes).unwrap();
+            let FileOutput::Memory(buffer) = &output else {
+                panic!("spilled before reaching the configured limit");
+            };
+            assert!(buffer.capacity() <= FILE_OUTPUT_MEMORY_LIMIT);
+        }
+        output.write_all(b"b").unwrap();
+        assert!(matches!(&output, FileOutput::Spilled(_)));
+        let tail = vec![b'c'; FILE_OUTPUT_MEMORY_LIMIT * 2 + 17];
+        output.write_all(&tail).unwrap();
+        let mut actual = Vec::new();
+        output.write_to(&mut actual).unwrap();
+        assert_eq!(actual.len(), first.len() + 1 + tail.len());
+        assert_eq!(&actual[..first.len()], first);
+        assert_eq!(actual[first.len()], b'b');
+        assert_eq!(&actual[first.len() + 1..], tail);
+
+        // A single printer write larger than the cap bypasses the memory
+        // buffer rather than briefly allocating the entire output chunk.
+        let mut direct = FileOutput::new();
+        direct.write_all(&tail).unwrap();
+        assert!(matches!(&direct, FileOutput::Spilled(_)));
+        let mut copied = Vec::new();
+        direct.write_to(&mut copied).unwrap();
+        assert_eq!(copied, tail);
+    }
+
+    #[test]
+    fn output_spools_are_private_unlinked_and_close_on_exec() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        for create in [create_output_spool, create_unlinked_output_spool] {
+            let file = create(&std::env::temp_dir()).unwrap();
+            let metadata = file.metadata().unwrap();
+            assert_eq!(metadata.nlink(), 0);
+            assert_eq!(metadata.mode() & 0o777, 0o600);
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+        assert!(create_output_spool(Path::new("/dev/null")).is_err());
+        assert!(create_unlinked_output_spool(Path::new("/dev/null")).is_err());
+    }
+
+    #[test]
+    fn file_output_propagates_spool_and_destination_errors() {
+        struct BrokenPipe;
+        impl Write for BrokenPipe {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for bytes in [vec![b'a'; 16], vec![b'b'; FILE_OUTPUT_MEMORY_LIMIT + 1]] {
+            let mut output = FileOutput::new();
+            output.write_all(&bytes).unwrap();
+            assert_eq!(
+                output.write_to(&mut BrokenPipe).unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
+
+        let write_only = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let mut unreadable = FileOutput::Spilled(io::BufWriter::new(write_only));
+        assert!(unreadable.write_to(&mut Vec::new()).is_err());
+
+        #[cfg(target_os = "linux")]
+        {
+            let full = fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap();
+            let mut unwritable = FileOutput::Spilled(io::BufWriter::with_capacity(1, full));
+            assert_eq!(
+                unwritable
+                    .write_all(b"not saved")
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ENOSPC)
+            );
+
+            let full = fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap();
+            let mut buffered = FileOutput::Spilled(io::BufWriter::with_capacity(64 * 1024, full));
+            buffered.write_all(b"buffered but not saved").unwrap();
+            assert_eq!(
+                buffered.flush().unwrap_err().raw_os_error(),
+                Some(libc::ENOSPC)
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_output_stops_before_allocating_or_spilling() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let mut output = FileOutput::new();
+        let mut writer = CancellableOutput {
+            output: &mut output,
+            cancelled: &cancelled,
+        };
+        assert_eq!(
+            writer.write_all(b"not written").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(matches!(output, FileOutput::Memory(bytes) if bytes.is_empty()));
+    }
 
     #[test]
     fn speculative_prefetch_is_opt_in() {
@@ -1650,7 +1842,7 @@ mod tests {
     #[test]
     fn test_extract_regex_literal_no_literal() {
         let lit = extract_regex_literal(".");
-        assert!(lit.is_none() || lit.as_ref().map_or(true, |s| s.is_empty()));
+        assert!(lit.as_ref().is_none_or(|s| s.is_empty()));
     }
 
     #[test]

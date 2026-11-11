@@ -8,6 +8,8 @@
 //   ./target/release/bench_suite /rpool/scratch/tgrep_corpus 10
 //   ./target/release/bench_suite /rpool/scratch/tgrep_corpus 10 --indexed-only
 
+mod common;
+
 use std::env;
 use std::process::Command;
 use std::time::Instant;
@@ -241,7 +243,7 @@ fn csv_field(value: &str) -> String {
 
 fn median(sorted: &[u64]) -> u64 {
     let middle = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         sorted[middle - 1] + (sorted[middle] - sorted[middle - 1]) / 2
     } else {
         sorted[middle]
@@ -268,10 +270,8 @@ fn run_pattern(
     pat: &BenchPattern,
     path: &str,
     trials: usize,
-    tgrep_bin: &str,
-    state_dir: &str,
+    tools: &common::BenchmarkTools<'_>,
     indexed_only: bool,
-    rg_bin: &str,
     cold_cache: bool,
 ) -> Result<PatternResult, String> {
     let mut tgrep_times = Vec::new();
@@ -279,8 +279,8 @@ fn run_pattern(
     let mut t_count = 0;
     let mut r_count = 0;
     for trial in 1..=trials {
-        let mut tgrep_cmd = Command::new(tgrep_bin);
-        tgrep_cmd.env("TGREP_STATE_DIR", state_dir).arg("-l");
+        let mut tgrep_cmd = Command::new(tools.tgrep);
+        tgrep_cmd.env("TGREP_STATE_DIR", tools.state).arg("-l");
         if indexed_only {
             tgrep_cmd.arg("--indexed-only");
         }
@@ -289,7 +289,7 @@ fn run_pattern(
             .arg("--")
             .arg(pat.pattern)
             .arg(path);
-        let mut rg_cmd = Command::new(rg_bin);
+        let mut rg_cmd = Command::new(tools.ripgrep);
         rg_cmd
             .arg("--threads=4")
             .arg("-l")
@@ -404,11 +404,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let tgrep_bin = env::var("TGREP_BIN").unwrap_or_else(|_| "./target/release/tgrep".to_string());
-    let state_dir = env::var("TGREP_STATE_DIR").unwrap_or_else(|_| {
-        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/.local/share/tgrep", home)
-    });
+    let tgrep_bin = common::tgrep_binary()?;
+    let state_dir = tgrep::build::default_state_dir();
 
     let mode_label = if indexed_only { "indexed-only" } else { "full" };
     let cache_label = if cold_cache {
@@ -416,15 +413,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         "uncontrolled filesystem cache; repeated process runs"
     };
-    let rg_bin = env::var("RG_BIN").unwrap_or_else(|_| "/usr/bin/rg".into());
+    let rg_bin = common::ripgrep_binary(&tgrep_bin)?;
+    let tools = common::BenchmarkTools {
+        tgrep: &tgrep_bin,
+        ripgrep: &rg_bin,
+        state: &state_dir,
+    };
 
     eprintln!("=== tgrep Phase 11 Benchmark Suite ===");
     eprintln!("  path:       {}", path);
     eprintln!("  trials:     {}", trials);
     eprintln!("  mode:       {}", mode_label);
     eprintln!("  cache:      {}", cache_label);
-    eprintln!("  tgrep:      {}", tgrep_bin);
-    eprintln!("  state dir:  {}", state_dir);
+    eprintln!("  tgrep:      {}", tgrep_bin.display());
+    eprintln!("  state dir:  {}", state_dir.display());
     eprintln!();
 
     let patterns = default_patterns();
@@ -448,16 +450,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut results = Vec::new();
     for pat in &patterns {
         eprintln!("[{}]", pat.pattern);
-        let result = run_pattern(
-            pat,
-            path,
-            trials,
-            &tgrep_bin,
-            &state_dir,
-            indexed_only,
-            &rg_bin,
-            cold_cache,
-        )?;
+        let result = run_pattern(pat, path, trials, &tools, indexed_only, cold_cache)?;
         results.push(result);
     }
 
@@ -543,11 +536,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cat.label(),
             cat_pass,
             cat_results.len(),
-            if avg_speedup < 1.0 {
-                1.0 / avg_speedup
-            } else {
-                1.0 / avg_speedup
-            },
+            1.0 / avg_speedup,
             if cat.target() < 1.0 {
                 1.0 / cat.target()
             } else {

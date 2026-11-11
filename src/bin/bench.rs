@@ -7,8 +7,9 @@
 //   cargo run --release --bin bench -- <pattern> <path> [trials] [--extra-args...]
 //   ./target/release/bench "struct" /rpool/scratch/tgrep_corpus 10
 
+mod common;
+
 use std::env;
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
@@ -79,23 +80,21 @@ fn run_benchmark(
     pattern: &str,
     path: &str,
     trials: usize,
-    tgrep_bin: &str,
-    state_dir: &str,
+    tools: &common::BenchmarkTools<'_>,
     extra_args: &[String],
     indexed_only: bool,
-    rg_bin: &str,
 ) -> Result<Vec<BenchmarkResult>, String> {
     let mut results = Vec::new();
     for trial in 1..=trials {
-        let mut tgrep_cmd = Command::new(tgrep_bin);
+        let mut tgrep_cmd = Command::new(tools.tgrep);
         tgrep_cmd
-            .env("TGREP_STATE_DIR", state_dir)
+            .env("TGREP_STATE_DIR", tools.state)
             .arg("-l")
             .args(extra_args)
             .arg("--")
             .arg(pattern)
             .arg(path);
-        let mut rg_cmd = Command::new(rg_bin);
+        let mut rg_cmd = Command::new(tools.ripgrep);
         rg_cmd
             .arg("--threads=4")
             .arg("-l")
@@ -153,7 +152,7 @@ fn compute_stats(times: &[u64]) -> (u64, u64, u64, u64, f64) {
     let min = sorted[0];
     let max = sorted[sorted.len() - 1];
     let middle = sorted.len() / 2;
-    let median = if sorted.len() % 2 == 0 {
+    let median = if sorted.len().is_multiple_of(2) {
         sorted[middle - 1] + (sorted[middle] - sorted[middle - 1]) / 2
     } else {
         sorted[middle]
@@ -222,25 +221,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let indexed_only = extra_args.iter().any(|a| a == "--indexed-only");
     let label = if indexed_only { " (indexed-only)" } else { "" };
 
-    // Find tgrep binary
-    let tgrep_bin = env::var("TGREP_BIN").unwrap_or_else(|_| {
-        let candidate = PathBuf::from("./target/release/tgrep");
-        if candidate.exists() {
-            "./target/release/tgrep".to_string()
-        } else {
-            "./target/debug/tgrep".to_string()
-        }
-    });
+    let tgrep_bin = common::tgrep_binary()?;
+    let state_dir = tgrep::build::default_state_dir();
+    let rg_bin = common::ripgrep_binary(&tgrep_bin)?;
+    let tools = common::BenchmarkTools {
+        tgrep: &tgrep_bin,
+        ripgrep: &rg_bin,
+        state: &state_dir,
+    };
 
-    let state_dir = env::var("TGREP_STATE_DIR").unwrap_or_else(|_| {
-        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/.local/share/tgrep", home)
-    });
-    let rg_bin = env::var("RG_BIN").unwrap_or_else(|_| "/usr/bin/rg".to_string());
-
-    eprintln!("tgrep binary: {}", tgrep_bin);
-    eprintln!("ripgrep bin:  {}", rg_bin);
-    eprintln!("state dir:    {}", state_dir);
+    eprintln!("tgrep binary: {}", tgrep_bin.display());
+    eprintln!("ripgrep bin:  {}", rg_bin.display());
+    eprintln!("state dir:    {}", state_dir.display());
     eprintln!("pattern:      {}", pattern);
     eprintln!("path:         {}", path);
     eprintln!("trials:       {}", trials);
@@ -249,16 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!();
 
-    let results = run_benchmark(
-        pattern,
-        path,
-        trials,
-        &tgrep_bin,
-        &state_dir,
-        &extra_args,
-        indexed_only,
-        &rg_bin,
-    )?;
+    let results = run_benchmark(pattern, path, trials, &tools, &extra_args, indexed_only)?;
 
     // Split results by tool
     let mut tgrep_times: Vec<u64> = Vec::new();

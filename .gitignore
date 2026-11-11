@@ -6,6 +6,8 @@
 *.swp
 *~
 .DS_Store
+__pycache__/
+*.py[cod]
 
 # Keep benchmark results and graphs
 !benchmarks/*.csv

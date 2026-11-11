@@ -36,6 +36,7 @@ case "$tool" in
     probe-valid) printf 'ripgrep 15.1.0\n' ;;
     probe-failed) printf 'ripgrep 15.1.0\n'; exit 3 ;;
     probe-invalid) printf 'synthetic-other-tool 15.1.0\n' ;;
+    rustc) printf 'rustc 1.0.0 (fixture)\nhost: %s\n' "$TGREP_FAKE_HOST_TRIPLE" ;;
     dpkg) printf 'amd64\n' ;;
     dpkg-architecture) printf 'x86_64-linux-gnu\n' ;;
     dpkg-shlibdeps) printf 'shlibs:Depends=libc6 (>= 2.39)\n' ;;
@@ -64,9 +65,11 @@ case "$tool" in
             /bin/mkdir -p "$TGREP_FAKE_BIN"
             printf 'external file appeared during build\n' > "$TGREP_FAKE_BIN/rg"
         fi
-        /bin/mkdir -p "$TGREP_FAKE_REPO/target/release"
-        /bin/cp "$TGREP_FAKE_BACKEND" "$TGREP_FAKE_REPO/target/release/tgrep"
-        /bin/chmod 755 "$TGREP_FAKE_REPO/target/release/tgrep"
+        target="${TGREP_FAKE_TARGET_DIRECTORY:-$TGREP_FAKE_REPO/target}/$TGREP_FAKE_HOST_TRIPLE/release"
+        owned "$target"
+        /bin/mkdir -p "$target"
+        /bin/cp "$TGREP_FAKE_BACKEND" "$target/tgrep"
+        /bin/chmod 755 "$target/tgrep"
         ;;
     wrong-compile)
         /bin/rm -f -- "$TGREP_FAKE_SIBLING_SENTINEL"

@@ -42,6 +42,11 @@ The script detects CPU features from /proc/cpuinfo and selects the
 highest available SIMD level. KEYSTONE's runtime dispatch will then
 use the appropriate code paths at search time.
 
+Builds always target rustc's native host, overriding .cargo build.target.
+CARGO_TARGET_DIR and Cargo's configured target-directory are honored.
+The executable is <target-directory>/<host-triple>/<debug|release>/tgrep.
+Explicit CARGO_BUILD_TARGET is rejected; cross builds use Cargo directly.
+
 Environment:
   TGREP_SIMD_FLAGS  Override SIMD flags passed to cc (advanced)
 
@@ -127,6 +132,23 @@ esac
 
 SIMD_FLAGS="${TGREP_SIMD_FLAGS-$SIMD_FLAGS}"
 
+# Resolve Cargo's physical output directory before cleaning or building. An
+# explicit native --target also overrides cross-target settings in .cargo/config.
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    echo 'Error: compile.sh builds native executables; CARGO_BUILD_TARGET is unsupported.' >&2
+    exit 2
+fi
+HOST_TRIPLE=$("${RUSTC:-rustc}" -vV | awk '$1 == "host:" {print $2}')
+if [[ ! "$HOST_TRIPLE" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]]; then
+    echo 'Error: could not determine the native Rust host triple.' >&2
+    exit 2
+fi
+if ! IFS= read -r -d '' TARGET_DIR < <(cargo metadata --locked --offline --no-deps --format-version 1 | \
+    python3 -c 'import json, sys; sys.stdout.write(json.load(sys.stdin)["target_directory"] + "\0")'); then
+    echo 'Error: could not resolve Cargo target_directory.' >&2
+    exit 2
+fi
+
 # ── Clean ────────────────────────────────────────────────────────────
 
 if $CLEAN; then
@@ -147,13 +169,13 @@ fi
 export TGREP_SIMD_FLAGS="$SIMD_FLAGS"
 
 cd "$SCRIPT_DIR"
-cargo build $BUILD_ARGS --jobs "$JOBS"
+cargo build $BUILD_ARGS --locked --target "$HOST_TRIPLE" --jobs "$JOBS"
 
 # ── Verify ───────────────────────────────────────────────────────────
 
-BINARY="target/debug/tgrep"
+BINARY="$TARGET_DIR/$HOST_TRIPLE/debug/tgrep"
 if $RELEASE; then
-    BINARY="target/release/tgrep"
+    BINARY="$TARGET_DIR/$HOST_TRIPLE/release/tgrep"
 fi
 
 if [ -f "$BINARY" ]; then

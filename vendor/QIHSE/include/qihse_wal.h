@@ -13,7 +13,7 @@ extern "C" {
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
 #define QIHSE_WAL_MAGIC       0x5157414Cu  /* "QWAL" */
-#define QIHSE_WAL_FORMAT_VER  1u
+#define QIHSE_WAL_FORMAT_VER  2u
 #define QIHSE_WAL_HEADER_SIZE 32u
 #define QIHSE_WAL_DEFAULT_SEGMENT_SIZE (64u * 1024u * 1024u) /* 64 MiB */
 #define QIHSE_WAL_MAX_KEY     4096u
@@ -40,7 +40,17 @@ typedef enum qihse_wal_durability_e {
     QIHSE_WAL_DURABILITY_GROUP_COMMIT = 2
 } qihse_wal_durability_t;
 
-/* ── WAL record (on-disk format) ────────────────────────────────────────── */
+/* ── WAL record (decoded representation) ───────────────────────────────── */
+
+/* New segments have a 32-byte, little-endian v2 header:
+ * zero sentinel[8], "QWALv2\0\0"[8], version[4], segment index[8], CRC32[4].
+ * The sentinel is an invalid legacy LSN, so old readers fail closed.
+ * Records contain the fields below in little endian, followed by an independent
+ * header CRC32, then key/value bytes. The v2 checksum covers concatenated key and
+ * value bytes; the header CRC covers all preceding 30 header bytes, including
+ * that checksum and both lengths. CRCs detect accidental damage, not tampering.
+ * Headerless legacy segments remain readable but are never appended to or
+ * automatically truncated: an incomplete legacy tail has ambiguous framing. */
 
 typedef struct qihse_wal_record_s {
     uint64_t   lsn;          /* 8 bytes: monotonic log sequence number */
@@ -49,11 +59,11 @@ typedef struct qihse_wal_record_s {
     uint8_t    op_type;      /* 1 byte:  qihse_wal_op_t */
     uint32_t   key_length;   /* 4 bytes: key length */
     uint32_t   value_length; /* 4 bytes: value length (0 for DELETE) */
-    uint32_t   checksum;     /* 4 bytes: CRC32 of payload + header fields */
-    /* Followed by: key[key_length], value[value_length] */
+    uint32_t   checksum;     /* v2: payload CRC32; legacy: combined field CRCs */
 } qihse_wal_record_t;
 
-#define QIHSE_WAL_RECORD_HEADER_SIZE 30u  /* sizeof fields above (packed) */
+#define QIHSE_WAL_LEGACY_RECORD_HEADER_SIZE 30u
+#define QIHSE_WAL_RECORD_HEADER_SIZE 34u  /* fields above + header CRC32 */
 
 /* ── WAL handle (opaque) ────────────────────────────────────────────────── */
 
@@ -63,7 +73,9 @@ typedef struct qihse_wal qihse_wal_t;
 
 /* Create / open a WAL in the given directory.
  * segment_size: max size per segment file (0 = default 64 MiB).
- * durability: fsync policy. */
+ * durability: fsync policy. Complete legacy segments are read without mutation;
+ * appends transition to a new v2 segment. A torn final v2 record is repaired only
+ * after the preceding log and any complete record header have validated. */
 qihse_wal_t* qihse_wal_create(const char* directory,
                               size_t segment_size,
                               qihse_wal_durability_t durability);

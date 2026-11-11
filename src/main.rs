@@ -7,6 +7,7 @@ use tgrep::search::SearchConfig;
 #[derive(Parser)]
 #[command(
     name = "tgrep",
+    version = env!("TGREP_BUILD_VERSION"),
     about = "Persistent trigram index for repeated searches"
 )]
 struct Cli {
@@ -116,26 +117,20 @@ enum IndexSubcommands {
 }
 
 fn main() {
-    let argv: Vec<String> = match std::env::args_os().map(|arg| arg.into_string()).collect() {
-        Ok(argv) => argv,
-        Err(_) => {
-            eprintln!("tgrep: command arguments must be valid UTF-8");
-            std::process::exit(2);
-        }
-    };
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
 
     // Detect rg-compat mode: invoked as `rg` via wrapper script or symlink.
     // The installer creates a wrapper that sets TGREP_REAL_RG and execs tgrep.
     // We also detect by argv[0] ending in "rg" (but not "tgrep").
-    let prog_name = argv.first().map(|s| s.as_str()).unwrap_or("tgrep");
-    let invoked_as_rg = std::env::var("TGREP_REAL_RG").is_ok()
+    let prog_name = argv.first().and_then(|s| s.to_str()).unwrap_or("tgrep");
+    let invoked_as_rg = std::env::var_os("TGREP_REAL_RG").is_some()
         || (prog_name.ends_with("rg") && !prog_name.ends_with("tgrep"));
 
     if invoked_as_rg {
         tgrep::rg_compat::run_as_rg(&argv);
     }
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(argv);
 
     match cli.command {
         Some(Commands::Index { action }) => {

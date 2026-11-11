@@ -2,22 +2,17 @@ use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
 
 use crate::native;
 
 // ── Constants ───────────────────────────────────────────────────────
 
 pub const SEGMENT_MAGIC: u32 = 0x54475331; // "TGS1"
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 pub const FOOTER_MAGIC: u32 = 0x5447464E; // "TGFN" (tgrep footer)
 pub const POSTING_BLOCK_SIZE: usize = 128;
 
-/// Segments are immutable once committed; verify each file identity once per
-/// process instead of checksumming on every open (a search opens hundreds).
 type SegmentIdentity = (u64, u64, u64, i64, i64, i64, i64);
-static CHECKSUM_VERIFIED: LazyLock<Mutex<std::collections::HashSet<SegmentIdentity>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 // ── Structs ─────────────────────────────────────────────────────────
 
@@ -119,9 +114,13 @@ impl SegmentWriter {
     ///   [Path index]  sorted (root_id, path) -> file_table_index, binary searchable
     ///   [Dictionary]  per gram: gram(4) + doc_freq(4) + posting_offset(8)
     ///   [Postings]     per gram: blocks of POSTING_BLOCK_SIZE, delta-varint encoded
-    ///   [Block index]  per block: max_doc_id(4) + encoded_len(4) + checksum(4)
-    ///   [Footer]       metadata_checksum(8) + footer_magic(4) + doc_count(4)
-    pub fn flush(&self, segments_dir: &Path) -> io::Result<()> {
+    ///   [Footer]       metadata_crc32(8, zero extended) + footer_magic(4) + doc_count(4)
+    /// Version 2 omits the redundant block index. Its offset equals the footer
+    /// offset. Metadata is verified at open; each accessed posting block has a
+    /// CRC32 covering its header fields and encoded payload.
+    /// Returns the metadata fingerprint for binding optional sidecars to this
+    /// document/dictionary snapshot without rereading the segment.
+    pub fn flush(&self, segments_dir: &Path) -> io::Result<u64> {
         let segment_name = format!("seg_{:08}.tgs", self.generation);
         let target_path = segments_dir.join(&segment_name);
 
@@ -152,9 +151,7 @@ impl SegmentWriter {
         // Dictionary: gram(4) + doc_freq(4) + posting_offset(8) per entry
         let dict_size: u64 = (self.postings.len() as u64) * (4 + 4 + 8);
 
-        // Postings + block index: compute after encoding
-        // We'll encode postings and block index together
-        let (postings_data, block_index_data, posting_offsets) = self.encode_postings();
+        let (postings_data, posting_offsets) = self.encode_postings();
 
         // ── Compute offsets ────────────────────────────────────────
         let file_table_offset = header_size as u64;
@@ -162,7 +159,7 @@ impl SegmentWriter {
         let dictionary_offset = path_index_offset + path_index_size;
         let postings_offset = dictionary_offset + dict_size;
         let block_index_offset = postings_offset + postings_data.len() as u64;
-        let footer_offset = block_index_offset + block_index_data.len() as u64;
+        let footer_offset = block_index_offset;
 
         // Reserve the complete image once; the footer is 8 + 4 + 4 bytes.
         let image_size = footer_offset
@@ -217,12 +214,8 @@ impl SegmentWriter {
         // ── Write postings ────────────────────────────────────────
         buf.extend_from_slice(&postings_data);
 
-        // ── Write block index ──────────────────────────────────────
-        buf.extend_from_slice(&block_index_data);
-
         // ── Write footer ───────────────────────────────────────────
-        // Simple checksum: XOR of all 8-byte chunks (not cryptographic, just integrity)
-        let checksum = simple_checksum(&buf);
+        let checksum = u64::from(crc32(&buf[..postings_offset as usize]));
         buf.extend_from_slice(&checksum.to_le_bytes());
         buf.extend_from_slice(&FOOTER_MAGIC.to_le_bytes());
         buf.extend_from_slice(&(self.docs.len() as u32).to_le_bytes());
@@ -231,45 +224,22 @@ impl SegmentWriter {
         }
 
         // ── Atomic write to disk ──────────────────────────────────
-        native::atomic_write(&target_path, &buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        native::atomic_write(&target_path, &buf).map_err(io::Error::other)?;
 
-        Ok(())
+        Ok(checksum)
     }
 
     /// Encode all postings across all grams and their dictionary offsets.
-    fn encode_postings(&self) -> (Vec<u8>, Vec<u8>, Vec<u64>) {
+    fn encode_postings(&self) -> (Vec<u8>, Vec<u64>) {
         let mut postings_buf = Vec::new();
-        let mut block_index_buf = Vec::new();
         let mut posting_offsets = Vec::with_capacity(self.postings.len());
 
-        for (_, doc_ids) in &self.postings {
+        for doc_ids in self.postings.values() {
             posting_offsets.push(postings_buf.len() as u64);
-            let gram_data = self.encode_gram_postings(doc_ids);
-            // Extract block headers from gram_data and append to block index
-            // Block format: max_doc_id(4) + encoded_len(4) + checksum(4) + deltas
-            let mut offset = 0;
-            let block_data = &gram_data;
-            while offset < block_data.len() {
-                if offset + 12 > block_data.len() {
-                    break;
-                }
-                let max_id = u32::from_le_bytes(block_data[offset..offset + 4].try_into().unwrap());
-                let enc_len =
-                    u32::from_le_bytes(block_data[offset + 4..offset + 8].try_into().unwrap());
-                let block_checksum =
-                    u32::from_le_bytes(block_data[offset + 8..offset + 12].try_into().unwrap());
-
-                block_index_buf.extend_from_slice(&max_id.to_le_bytes());
-                block_index_buf.extend_from_slice(&enc_len.to_le_bytes());
-                block_index_buf.extend_from_slice(&block_checksum.to_le_bytes());
-
-                offset += 12 + enc_len as usize;
-            }
-            postings_buf.extend_from_slice(block_data);
+            postings_buf.extend_from_slice(&self.encode_gram_postings(doc_ids));
         }
 
-        (postings_buf, block_index_buf, posting_offsets)
+        (postings_buf, posting_offsets)
     }
 
     /// Encode a single gram's posting list into blocks.
@@ -295,8 +265,7 @@ impl SegmentWriter {
                 encode_varint_u32(d, &mut encoded);
             }
 
-            // Checksum: simple XOR of delta values
-            let checksum: u32 = deltas.iter().fold(0u32, |acc, &d| acc ^ d);
+            let checksum = posting_crc32(max_id, encoded.len() as u32, &encoded);
 
             // Block header
             buf.extend_from_slice(&max_id.to_le_bytes());
@@ -315,9 +284,11 @@ impl SegmentWriter {
 pub struct SegmentReader {
     data: memmap2::Mmap,
     header: ParsedHeader,
+    doc_ids: Vec<u32>,
 }
 
 struct ParsedHeader {
+    version: u16,
     generation: u64,
     _profile_hash: u64,
     doc_count: u32,
@@ -345,6 +316,16 @@ impl SegmentReader {
     /// Map an immutable segment. Publishers must replace files atomically; in-place
     /// writes/truncation while a reader exists violate the mapping lifetime contract.
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_checked(path, true)
+    }
+
+    /// Validate metadata at open and validate only accessed posting blocks for
+    /// version 2. Legacy segments retain complete validation on every open.
+    pub fn open_for_search(path: &Path) -> io::Result<Self> {
+        Self::open_checked(path, false)
+    }
+
+    fn open_checked(path: &Path, validate_all: bool) -> io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -378,8 +359,9 @@ impl SegmentReader {
         }
         let footer = offsets[5];
         if footer.checked_add(16) != Some(len)
-            || (offsets[3] - offsets[2]) % 16 != 0
-            || (offsets[5] - offsets[4]) % 12 != 0
+            || !(offsets[3] - offsets[2]).is_multiple_of(16)
+            || !(offsets[5] - offsets[4]).is_multiple_of(12)
+            || (header.version == 2 && offsets[4] != offsets[5])
             || header.doc_count as usize > (offsets[1] - offsets[0]) / 52
         {
             return Err(invalid("section size"));
@@ -390,31 +372,39 @@ impl SegmentReader {
             return Err(invalid("footer"));
         }
         let stored = u64::from_le_bytes(data[footer..footer + 8].try_into().unwrap());
-        let reader = Self { data, header };
-        #[cfg(unix)]
-        let key = segment_identity(&before);
-        #[cfg(unix)]
-        let verified = CHECKSUM_VERIFIED.lock().unwrap().contains(&key);
-        #[cfg(not(unix))]
-        let verified = false;
-        if !verified {
-            if simple_checksum(&reader.data[..footer]) != stored {
-                return Err(invalid("segment checksum mismatch"));
+        let computed = if header.version == 1 {
+            simple_checksum(&data[..footer])
+        } else {
+            u64::from(crc32(&data[..offsets[3]]))
+        };
+        if computed != stored {
+            return Err(invalid("segment checksum mismatch"));
+        }
+        let mut reader = Self {
+            data,
+            header,
+            doc_ids: Vec::new(),
+        };
+        reader.doc_ids = reader.validate_metadata_tables()?;
+        if validate_all || reader.header.version == 1 {
+            let start = reader.header.dictionary_offset as usize;
+            let end = reader.header.postings_offset as usize;
+            for entry in (start..end).step_by(16) {
+                reader.read_dictionary_postings(entry)?;
             }
-            reader.validate_tables()?;
         }
         #[cfg(unix)]
         {
-            if segment_identity(&file.metadata()?) != key {
+            if segment_identity(&file.metadata()?) != segment_identity(&before) {
                 return Err(invalid("segment changed while opening"));
             }
-            CHECKSUM_VERIFIED.lock().unwrap().insert(key);
         }
         Ok(reader)
     }
 
-    fn validate_tables(&self) -> io::Result<()> {
+    fn validate_metadata_tables(&self) -> io::Result<Vec<u32>> {
         let mut records = std::collections::HashMap::new();
+        let mut doc_ids = Vec::new();
         let mut record_offset = self.header.file_table_offset as usize;
         let mut previous_id = None;
         for doc in self.iter_docs() {
@@ -422,6 +412,7 @@ impl SegmentReader {
                 return Err(invalid("document order"));
             }
             previous_id = Some(doc.local_id);
+            doc_ids.push(doc.local_id);
             let path_start = record_offset + 12;
             records.insert(doc.local_id, (doc.root_id, path_start, doc.path.len()));
             record_offset = path_start + doc.path.len() + 40;
@@ -471,27 +462,30 @@ impl SegmentReader {
         let start = self.header.dictionary_offset as usize;
         let end = self.header.postings_offset as usize;
         let mut previous_gram = None;
-        let mut next_posting = 0u64;
+        let mut previous_posting = None;
+        let posting_bytes = self.header.block_index_offset - self.header.postings_offset;
         for offset in (start..end).step_by(16) {
             let gram = u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap());
             let frequency =
                 u32::from_le_bytes(self.data[offset + 4..offset + 8].try_into().unwrap());
             let posting =
                 u64::from_le_bytes(self.data[offset + 8..offset + 16].try_into().unwrap());
-            if previous_gram.is_some_and(|previous| gram <= previous) || posting != next_posting {
+            if previous_gram.is_some_and(|previous| gram <= previous)
+                || previous_posting.is_some_and(|previous| posting <= previous)
+                || (previous_posting.is_none() && posting != 0)
+                || posting >= posting_bytes
+                || frequency == 0
+                || frequency > self.header.doc_count
+            {
                 return Err(invalid("dictionary order or posting offset"));
             }
-            let (docs, next) = self.decode_postings_checked(posting, frequency)?;
-            if docs.iter().any(|id| !records.contains_key(id)) {
-                return Err(invalid("posting document"));
-            }
             previous_gram = Some(gram);
-            next_posting = next;
+            previous_posting = Some(posting);
         }
-        if next_posting != self.header.block_index_offset - self.header.postings_offset {
+        if start == end && posting_bytes != 0 {
             return Err(invalid("posting section length"));
         }
-        Ok(())
+        Ok(doc_ids)
     }
 
     /// Return the segment file name (e.g. "seg_00000001.tgs") based on generation.
@@ -514,13 +508,14 @@ impl SegmentReader {
             ));
         }
         let version = u16::from_le_bytes(data[4..6].try_into().unwrap());
-        if version != FORMAT_VERSION {
+        if !matches!(version, 1 | FORMAT_VERSION) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported version {}", version),
             ));
         }
         Ok(ParsedHeader {
+            version,
             generation: u64::from_le_bytes(data[6..14].try_into().unwrap()),
             _profile_hash: u64::from_le_bytes(data[14..22].try_into().unwrap()),
             doc_count: u32::from_le_bytes(data[22..26].try_into().unwrap()),
@@ -535,6 +530,19 @@ impl SegmentReader {
 
     pub fn generation(&self) -> u64 {
         self.header.generation
+    }
+    /// Detects accidental sidecar/state mixing, not forgery by a state writer.
+    pub fn metadata_fingerprint(&self) -> u64 {
+        let footer = self.header.footer_offset as usize;
+        u64::from_le_bytes(self.data[footer..footer + 8].try_into().unwrap())
+    }
+    pub fn format_version(&self) -> u16 {
+        self.header.version
+    }
+    /// Version 2 builders exclude UTF-16 source bytes that grep-searcher decodes.
+    /// Version 1 has no such ingestion provenance and cannot safely prune.
+    pub fn supports_safe_pruning(&self) -> bool {
+        self.header.version >= 2
     }
     pub fn doc_count(&self) -> u32 {
         self.header.doc_count
@@ -654,14 +662,32 @@ impl SegmentReader {
         None
     }
 
-    /// Read the posting list for a trigram. Returns sorted doc IDs.
+    /// Compatibility helper for fully validated readers. Searches must use
+    /// `try_read_postings` so corruption is not mistaken for an absent gram.
     pub fn read_postings(&self, gram: u32) -> Vec<u32> {
-        // Binary search the dictionary for the gram
+        self.try_read_postings(gram).unwrap_or_default()
+    }
+
+    /// Read and validate a posting list, preserving integrity errors.
+    pub fn try_read_postings(&self, gram: u32) -> io::Result<Vec<u32>> {
+        match self.dictionary_entry(gram) {
+            Some(entry) => self.read_dictionary_postings(entry),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Return the frequency from integrity-checked metadata without decoding
+    /// posting blocks. This is a planning estimate, not a candidate list.
+    pub fn document_frequency(&self, gram: u32) -> u32 {
+        self.dictionary_entry(gram)
+            .map(|entry| u32::from_le_bytes(self.data[entry + 4..entry + 8].try_into().unwrap()))
+            .unwrap_or(0)
+    }
+
+    fn dictionary_entry(&self, gram: u32) -> Option<usize> {
+        // Binary search the integrity-checked dictionary for the gram.
         let dict_start = self.header.dictionary_offset as usize;
         let dict_entry_size = 16; // gram(4) + doc_freq(4) + posting_offset(8)
-        let _num_entries = self.header.doc_count; // upper bound, not exact
-                                                  // Actually, we don't know the exact number of dictionary entries without
-                                                  // computing (postings_offset - dictionary_offset) / entry_size.
         let dict_end = self.header.postings_offset as usize;
         let dict_len = dict_end.saturating_sub(dict_start);
         let actual_entries = dict_len / dict_entry_size;
@@ -678,23 +704,32 @@ impl SegmentReader {
             );
             match entry_gram.cmp(&gram) {
                 std::cmp::Ordering::Equal => {
-                    let doc_freq = u32::from_le_bytes(
-                        self.data[entry_offset + 4..entry_offset + 8]
-                            .try_into()
-                            .unwrap(),
-                    );
-                    let posting_offset = u64::from_le_bytes(
-                        self.data[entry_offset + 8..entry_offset + 16]
-                            .try_into()
-                            .unwrap(),
-                    );
-                    return self.decode_postings(posting_offset, doc_freq);
+                    return Some(entry_offset);
                 }
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid - 1,
             }
         }
-        Vec::new()
+        None
+    }
+
+    fn read_dictionary_postings(&self, entry: usize) -> io::Result<Vec<u32>> {
+        let frequency = u32::from_le_bytes(self.data[entry + 4..entry + 8].try_into().unwrap());
+        let posting = u64::from_le_bytes(self.data[entry + 8..entry + 16].try_into().unwrap());
+        let end = if entry + 16 < self.header.postings_offset as usize {
+            u64::from_le_bytes(self.data[entry + 24..entry + 32].try_into().unwrap())
+        } else {
+            self.header.block_index_offset - self.header.postings_offset
+        };
+        let (docs, consumed) = self.decode_postings_checked(posting, frequency)?;
+        if consumed != end
+            || docs
+                .iter()
+                .any(|id| self.doc_ids.binary_search(id).is_err())
+        {
+            return Err(invalid("posting section length or document"));
+        }
+        Ok(docs)
     }
 
     fn decode_postings(&self, posting_offset: u64, doc_freq: u32) -> Vec<u32> {
@@ -758,6 +793,11 @@ impl SegmentReader {
                 previous = id;
                 result.push(id);
             }
+            let checksum = if self.header.version == 1 {
+                checksum
+            } else {
+                posting_crc32(max_id, encoded_len as u32, encoded)
+            };
             if position != encoded.len() || checksum != expected_checksum || previous != max_id {
                 return Err(invalid("posting checksum or block bounds"));
             }
@@ -772,9 +812,27 @@ impl SegmentReader {
         let start = self.header.dictionary_offset as usize;
         let end = self.header.postings_offset as usize;
         self.data[start..end]
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .map(|entry| u32::from_le_bytes(entry[4..8].try_into().unwrap()) as u64)
             .sum()
+    }
+
+    /// Visit every checked posting list one at a time. Unlike the historical
+    /// materializing iterator, this propagates corruption and callback failures.
+    pub(crate) fn visit_postings(
+        &self,
+        mut visitor: impl FnMut(u32, &[u32]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let start = self.header.dictionary_offset as usize;
+        let end = self.header.postings_offset as usize;
+        for entry in (start..end).step_by(16) {
+            let gram = u32::from_le_bytes(self.data[entry..entry + 4].try_into().unwrap());
+            let documents = self.read_dictionary_postings(entry)?;
+            visitor(gram, &documents)?;
+        }
+        Ok(())
     }
 
     /// Iterate all (gram, doc_ids) pairs in the segment.
@@ -844,11 +902,9 @@ pub fn publish_manifest_with_roots(
 /// Root IDs are meaningful only within this snapshot's exact ordered roots.
 pub fn write_manifest(state_dir: &Path, manifest: &Manifest) -> io::Result<()> {
     validate_manifest(manifest)?;
-    let json = serde_json::to_string_pretty(manifest)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(manifest).map_err(io::Error::other)?;
     let manifest_path = state_dir.join("manifest.json");
-    native::atomic_write(&manifest_path, json.as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    native::atomic_write(&manifest_path, json.as_bytes()).map_err(io::Error::other)?;
     Ok(())
 }
 
@@ -967,12 +1023,52 @@ fn invalid(what: &str) -> io::Error {
     )
 }
 
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut value = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 != 0 {
+                (value >> 1) ^ 0xedb88320
+            } else {
+                value >> 1
+            };
+            bit += 1;
+        }
+        table[i] = value;
+        i += 1;
+    }
+    table
+};
+
+fn crc32_parts(parts: &[&[u8]]) -> u32 {
+    let mut value = u32::MAX;
+    for part in parts {
+        for &byte in *part {
+            value = (value >> 8) ^ CRC32_TABLE[((value ^ u32::from(byte)) & 0xff) as usize];
+        }
+    }
+    !value
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    crc32_parts(&[data])
+}
+
+fn posting_crc32(max_id: u32, encoded_len: u32, encoded: &[u8]) -> u32 {
+    crc32_parts(&[&max_id.to_le_bytes(), &encoded_len.to_le_bytes(), encoded])
+}
+
 fn simple_checksum(data: &[u8]) -> u64 {
     // chunks_exact lets the optimizer vectorize the XOR; the old per-8-byte
     // bounds-checked loop ran ~55 MB/s and stalled segment-heavy commands.
     let mut checksum: u64 = data
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .fold(0u64, |acc, c| acc ^ c);
     // Handle remaining bytes
     let i = data.len() - data.len() % 8;
@@ -998,8 +1094,8 @@ mod tests {
             byte_length: content_len,
             device: 2064,
             inode: 1000000 + id as u64,
-            mtime_ns: 1700000000_000_000_000 + id as i64 * 1000,
-            ctime_ns: 1700000000_000_000_000 + id as i64 * 2000,
+            mtime_ns: 1_700_000_000_000_000_000 + id as i64 * 1000,
+            ctime_ns: 1_700_000_000_000_000_000 + id as i64 * 2000,
         }
     }
 
@@ -1201,9 +1297,94 @@ mod tests {
         let mut bytes = std::fs::read(path).unwrap();
         change(&mut bytes);
         let footer = u64::from_le_bytes(bytes[66..74].try_into().unwrap()) as usize;
-        let checksum = simple_checksum(&bytes[..footer]);
+        let checksum = if u16::from_le_bytes(bytes[4..6].try_into().unwrap()) == 1 {
+            simple_checksum(&bytes[..footer])
+        } else {
+            let end = u64::from_le_bytes(bytes[50..58].try_into().unwrap()) as usize;
+            u64::from(crc32(&bytes[..end.min(bytes.len())]))
+        };
         bytes[footer..footer + 8].copy_from_slice(&checksum.to_le_bytes());
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn v2_drops_duplicate_block_headers() {
+        assert_eq!(crc32(b"123456789"), 0xcbf43926);
+        let dir = audit_directory();
+        let path = audit_segment(&dir);
+        let reader = SegmentReader::open_for_search(&path).unwrap();
+        assert_eq!(reader.format_version(), 2);
+        assert!(reader.supports_safe_pruning());
+        assert_eq!(
+            reader.header.block_index_offset,
+            reader.header.footer_offset
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 2012);
+        drop(reader);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v2_search_validates_only_accessed_posting_blocks() {
+        let dir = audit_directory();
+        let path = audit_segment(&dir);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let posting = u64::from_le_bytes(bytes[50..58].try_into().unwrap()) as usize;
+        bytes[posting + 31 * 13 + 12] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let reader = SegmentReader::open_for_search(&path).unwrap();
+        assert_eq!(reader.document_frequency(31), 1);
+        assert_eq!(reader.document_frequency(0xabcdef), 0);
+        assert_eq!(reader.try_read_postings(0).unwrap(), [0]);
+        assert!(reader.try_read_postings(31).is_err());
+        assert!(reader.visit_postings(|_, _| Ok(())).is_err());
+        assert!(reader.try_read_postings(0xabcdef).unwrap().is_empty());
+        assert!(SegmentReader::open(&path).is_err());
+        drop(reader);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v2_metadata_corruption_cannot_produce_negative_candidates() {
+        let dir = audit_directory();
+        let path = audit_segment(&dir);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let dictionary = u64::from_le_bytes(bytes[42..50].try_into().unwrap()) as usize;
+        bytes[dictionary] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(SegmentReader::open_for_search(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_v1_is_readable_but_cannot_prune_live_text() {
+        let dir = audit_directory();
+        let path = audit_segment(&dir);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let posting = u64::from_le_bytes(bytes[50..58].try_into().unwrap()) as usize;
+        let old_footer = u64::from_le_bytes(bytes[66..74].try_into().unwrap()) as usize;
+        bytes.truncate(old_footer);
+        bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let mut headers = Vec::new();
+        for block in 0..64 {
+            let at = posting + block * 13;
+            bytes[at + 8..at + 12].copy_from_slice(&0u32.to_le_bytes());
+            headers.extend_from_slice(&bytes[at..at + 12]);
+        }
+        bytes.extend_from_slice(&headers);
+        let footer = bytes.len();
+        bytes[66..74].copy_from_slice(&(footer as u64).to_le_bytes());
+        let checksum = simple_checksum(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        bytes.extend_from_slice(&FOOTER_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let reader = SegmentReader::open_for_search(&path).unwrap();
+        assert_eq!(reader.format_version(), 1);
+        assert!(!reader.supports_safe_pruning());
+        assert_eq!(reader.try_read_postings(31).unwrap(), [0]);
+        drop(reader);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

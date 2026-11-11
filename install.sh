@@ -251,9 +251,24 @@ finish_install() {
 trap 'finish_install "$?"' EXIT
 
 cd "$SCRIPT_DIR"
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    echo 'Error: install.sh builds native executables; CARGO_BUILD_TARGET is unsupported.' >&2
+    exit 2
+fi
 echo 'Building tgrep (release mode, auto-detecting CPU features)...'
 ./compile.sh --release
-if [[ ! -f target/release/tgrep ]]; then
+HOST_TRIPLE=$("${RUSTC:-rustc}" -vV | awk '$1 == "host:" {print $2}')
+if [[ ! "$HOST_TRIPLE" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]]; then
+    echo 'Error: could not determine the native Rust host triple.' >&2
+    exit 2
+fi
+if ! IFS= read -r -d '' TARGET_DIR < <(cargo metadata --locked --offline --no-deps --format-version 1 | \
+    python3 -c 'import json, sys; sys.stdout.write(json.load(sys.stdin)["target_directory"] + "\0")'); then
+    echo 'Error: could not resolve Cargo target_directory.' >&2
+    exit 2
+fi
+BINARY="$TARGET_DIR/$HOST_TRIPLE/release/tgrep"
+if [[ ! -f "$BINARY" ]]; then
     echo 'Error: tgrep binary not found after build.' >&2
     exit 1
 fi
@@ -279,13 +294,13 @@ WRAPPER_TMP=$(mktemp)
     printf 'exec %s "$@"\n' "$(shell_quote "${FILES[0]}")"
 } > "$WRAPPER_TMP"
 RECEIPT_TMP=$(mktemp)
-file_hash target/release/tgrep > "$RECEIPT_TMP"
+file_hash "$BINARY" > "$RECEIPT_TMP"
 file_hash "$WRAPPER_TMP" >> "$RECEIPT_TMP"
 RECEIPT_READY=true
 
 mkdir -p "$BIN_DIR"
 PUBLICATION_PHASE=tgrep
-install -m 0755 target/release/tgrep "${FILES[0]}"
+install -m 0755 "$BINARY" "${FILES[0]}"
 PUBLICATION_PHASE=rg
 install -m 0755 "$WRAPPER_TMP" "${FILES[1]}"
 PUBLICATION_PHASE=receipt
